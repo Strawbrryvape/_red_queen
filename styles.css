@@ -460,3 +460,15 @@ body::before {
   color: var(--gold);
   font-style: italic;
 }
+
+/* ---------- UNDERSTUDY STATE (Groq filling Claude's seat) ---------- */
+.agent.understudy .ring {
+  opacity: 0.5;
+  border-style: dashed;
+}
+.agent.understudy .agent-name::after {
+  content: " \2022 groq";
+  color: #555;
+  text-transform: lowercase;
+  letter-spacing: 0.05em;
+}

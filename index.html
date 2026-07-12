@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://generativelanguage.googleapis.com https://api.anthropic.com https://api.moonshot.ai https://api.moonshot.cn; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; script-src 'self';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://generativelanguage.googleapis.com https://api.anthropic.com https://api.moonshot.ai https://api.moonshot.cn https://api.groq.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; script-src 'self';">
 <title>Red Queen</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -105,6 +105,9 @@
       <label>Claude API Key
         <input type="password" id="keyClaude" autocomplete="off" placeholder="sk-ant-...">
       </label>
+      <label>Groq API Key (free tier — fills Claude's seat when no Claude key)
+        <input type="password" id="keyGroq" autocomplete="off" placeholder="gsk_...">
+      </label>
       <label class="toggle-row">
         <span>Demo Mode</span>
         <input type="checkbox" id="demoToggle">
@@ -118,14 +121,7 @@
     <p class="about-text">Red Queen is a multi-agent orchestration council. Three agents — Gemini, Kimi, and Claude — deliberate on your query, and the Consensus Bar shows their synthesized answer. Built by Syntropy LLC.</p>
   </details>
 </aside>
-<script>
-// Purge any stale service worker + caches from previous deployments
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
-}
-if (window.caches) {
-  caches.keys().then(keys => keys.forEach(k => caches.delete(k)));
-}
-</script><script src="app.js"></script>
+
+<script src="app.js"></script>
 </body>
 </html>

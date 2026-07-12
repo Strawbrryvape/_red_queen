@@ -50,10 +50,11 @@
   $("keyGemini").value = settings.keyGemini || "";
   $("keyKimi").value = settings.keyKimi || "";
   $("keyClaude").value = settings.keyClaude || "";
+  $("keyGroq").value = settings.keyGroq || "";
   demoToggle.checked = !!settings.demoMode;
 
   function hasAnyKey() {
-    return !!(settings.keyGemini || settings.keyKimi || settings.keyClaude);
+    return !!(settings.keyGemini || settings.keyKimi || settings.keyClaude || settings.keyGroq);
   }
   function inDemoMode() {
     return settings.demoMode || !hasAnyKey();
@@ -63,15 +64,57 @@
   }
   refreshDemoBadge();
 
+  // ---------- Understudy state (Groq filling Claude's seat) ----------
+  function groqUnderstudy() {
+    return !settings.keyClaude && !!settings.keyGroq;
+  }
+  function seatLabel(name) {
+    if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
+    return name[0].toUpperCase() + name.slice(1);
+  }
+  function refreshUnderstudyState() {
+    const el = agents.claude;
+    if (groqUnderstudy()) {
+      el.classList.add("understudy");
+      el.title = "Claude seat — powered by Groq (Llama 3.3)";
+    } else {
+      el.classList.remove("understudy");
+      el.removeAttribute("title");
+    }
+  }
+  refreshUnderstudyState();
+
   saveSettingsBtn.addEventListener("click", () => {
     settings = {
       keyGemini: $("keyGemini").value.trim(),
       keyKimi: $("keyKimi").value.trim(),
       keyClaude: $("keyClaude").value.trim(),
+      keyGroq: $("keyGroq").value.trim(),
       demoMode: demoToggle.checked,
     };
     saveSettings(settings);
     refreshDemoBadge();
+    refreshUnderstudyState();
+
+  // ---------- Understudy state (Groq filling Claude's seat) ----------
+  function groqUnderstudy() {
+    return !settings.keyClaude && !!settings.keyGroq;
+  }
+  function seatLabel(name) {
+    if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
+    return name[0].toUpperCase() + name.slice(1);
+  }
+  function refreshUnderstudyState() {
+    const el = agents.claude;
+    if (groqUnderstudy()) {
+      el.classList.add("understudy");
+      el.title = "Claude seat — powered by Groq (Llama 3.3)";
+    } else {
+      el.classList.remove("understudy");
+      el.removeAttribute("title");
+    }
+  }
+  refreshUnderstudyState();
     saveSettingsBtn.textContent = "Saved";
     setTimeout(() => (saveSettingsBtn.textContent = "Save settings"), 1200);
   });
@@ -328,11 +371,33 @@
     return { agreed, outliers };
   }
 
+  async function callGroq(query) {
+    const res = await fetchWithRetry("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + settings.keyGroq,
+      },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        messages: [{ role: "user", content: query }],
+        max_tokens: 300,
+      }),
+    }, "Groq");
+    if (!res.ok) throw new Error(`Groq HTTP ${res.status}${res.status === 429 ? " — free-tier rate limit; circuit breaker will manage" : ""}`);
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || "";
+  }
+
   async function runLiveCouncil(query) {
     const calls = [];
     if (settings.keyGemini) calls.push({ name: "gemini", fn: callGemini });
     if (settings.keyKimi) calls.push({ name: "kimi", fn: callKimi });
-    if (settings.keyClaude) calls.push({ name: "claude", fn: callClaude });
+    if (settings.keyClaude) {
+      calls.push({ name: "claude", fn: callClaude });
+    } else if (settings.keyGroq) {
+      calls.push({ name: "claude", fn: callGroq }); // Groq understudies Claude's seat (free tier)
+    }
 
     // circuit breaker: skip agents whose quota circuit is open
     const skipped = calls.filter((c) => circuitOpen(c.name));
@@ -364,7 +429,7 @@
         resetCircuit(name);
       } else {
         const msg = r.reason?.message || "unknown error";
-        logError(`${name[0].toUpperCase() + name.slice(1)} failed: ${msg}`);
+        logError(`${seatLabel(name)} failed: ${msg}`);
         if (msg.includes("429")) tripCircuit(name, fetchWithRetry.lastRetryAfterMs);
       }
       agents[name].classList.remove("thinking");
@@ -384,7 +449,7 @@
 
     if (outliers.length > 0) {
       outliers.forEach((o) =>
-        logError(`${o.name[0].toUpperCase() + o.name.slice(1)} excluded as outlier — position diverged from majority.`)
+        logError(`${seatLabel(o.name)} excluded as outlier — position diverged from majority.`)
       );
     }
 
@@ -452,7 +517,7 @@
       consensusBar.classList.add("divided");
       consensusText.textContent = "The Council is divided — no consensus reached.";
       allAnswers.forEach((a) =>
-        logHistory(`${a.name[0].toUpperCase() + a.name.slice(1)} position (${query})`, a.text)
+        logHistory(`${seatLabel(a.name)} position (${query})`, a.text)
       );
       logHistory(query, "NO CONSENSUS — Council divided by design. Individual positions above.");
     } else {
