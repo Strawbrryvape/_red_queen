@@ -1,655 +1,474 @@
-/* Red Queen v2.1 — Command Center logic
-   Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
-   calls fail), the Council is simulated locally. The UI never shows an error
-   box on the main canvas — failures are logged quietly to the drawer. */
+/* Red Queen v2.1 â€” Minimalist Command Center */
 
-(function () {
-  "use strict";
+:root {
+  --red: #E63946;
+  --gemini: #4285F4;
+  --kimi: #00D4AA;
+  --claude: #D4A574;
+  --text: #F0F0F0;
+  --muted: #888;
+  --drawer-bg: #121212;
+  --gold: #FFD700;
+  --ease: 300ms ease;
+}
 
-  // ---------- Elements ----------
-  const $ = (id) => document.getElementById(id);
-  const consensusBar = $("consensusBar");
-  const consensusText = $("consensusText");
-  const summonBtn = $("summonBtn");
-  const bottomSheet = $("bottomSheet");
-  const sheetScrim = $("sheetScrim");
-  const queryInput = $("queryInput");
-  const sendBtn = $("sendBtn");
-  const drawer = $("drawer");
-  const drawerScrim = $("drawerScrim");
-  const menuBtn = $("menuBtn");
-  const drawerClose = $("drawerClose");
-  const historyList = $("historyList");
-  const errorList = $("errorList");
-  const demoBadge = $("demoBadge");
-  const newSessionBtn = $("newSessionBtn");
-  const saveSettingsBtn = $("saveSettings");
-  const demoToggle = $("demoToggle");
+* { margin: 0; padding: 0; box-sizing: border-box; }
 
-  const agents = {
-    gemini: $("agent-gemini"),
-    kimi: $("agent-kimi"),
-    claude: $("agent-claude"),
-  };
+html, body {
+  height: 100%;
+  overflow-x: hidden;
+}
 
-  // ---------- Settings ----------
-  const SETTINGS_KEY = "rq_settings_v21";
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  color: var(--text);
+  background: radial-gradient(ellipse at 50% 30%, #1A0505 0%, #0A0A0A 75%);
+  background-attachment: fixed;
+  position: relative;
+}
 
-  function loadSettings() {
-    try {
-      return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
-    } catch {
-      return {};
-    }
-  }
-  function saveSettings(s) {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
-  }
+/* subtle noise texture */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.05;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.6'/%3E%3C/svg%3E");
+  z-index: 1;
+}
 
-  let settings = loadSettings();
-  $("keyGemini").value = settings.keyGemini || "";
-  $("keyKimi").value = settings.keyKimi || "";
-  $("keyClaude").value = settings.keyClaude || "";
-  $("keyGroq").value = settings.keyGroq || "";
-  $("keyOpenRouter").value = settings.keyOpenRouter || "";
-  demoToggle.checked = !!settings.demoMode;
+/* ---------- HEADER ---------- */
+.topbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  z-index: 50;
+}
 
-  function hasAnyKey() {
-    return !!(settings.keyGemini || settings.keyKimi || settings.keyClaude || settings.keyGroq || settings.keyOpenRouter);
-  }
-  function inDemoMode() {
-    return settings.demoMode || !hasAnyKey();
-  }
-  function refreshDemoBadge() {
-    demoBadge.classList.toggle("hidden", !inDemoMode());
-  }
-  refreshDemoBadge();
+.wordmark {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--red);
+  letter-spacing: 0.01em;
+}
 
-  // ---------- Understudy state (Groq filling Claude's seat) ----------
-  function groqUnderstudy() {
-    return !settings.keyClaude && !!settings.keyGroq;
-  }
-  const seatProvider = {}; // per-dispatch: name -> "primary" | "groq" | "openrouter"
+.menu-btn {
+  background: none;
+  border: none;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-end;
+  gap: 5px;
+  cursor: pointer;
+  padding: 8px;
+}
+.menu-btn span {
+  display: block;
+  width: 22px;
+  height: 2px;
+  background: var(--text);
+  border-radius: 1px;
+  transition: opacity var(--ease);
+}
+.menu-btn:hover span { opacity: 0.7; }
 
-  // Consensus weight hierarchy (founder decision 2026-07-12):
-  // primaries carry full weight; free-tier voices keep the workflow
-  // alive but must not outvote Gemini Pro / Kimi / Claude.
-  const SEAT_WEIGHTS = { primary: 1.0, groq: 0.75, openrouter: 0.5 };
-  function seatWeight(name) {
-    return SEAT_WEIGHTS[seatProvider[name] || "primary"];
-  }
-  function seatLabel(name) {
-    const cap = name[0].toUpperCase() + name.slice(1);
-    if (seatProvider[name] === "openrouter") {
-      const m = (OR_SEAT_MODELS[name] || "").split("/").pop().replace(":free", "");
-      return `${cap} [fallback: OpenRouter ${m}]`;
-    }
-    if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
-    return cap;
-  }
-  function refreshUnderstudyState() {
-    const el = agents.claude;
-    if (groqUnderstudy()) {
-      el.classList.add("understudy");
-      el.title = "Claude seat — powered by Groq (Llama 3.3)";
-    } else {
-      el.classList.remove("understudy");
-      el.removeAttribute("title");
-    }
-  }
-  refreshUnderstudyState();
+/* DEMO badge */
+.demo-badge {
+  position: fixed;
+  top: 60px;
+  left: 16px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  color: var(--gold);
+  border: 1px solid rgba(255, 215, 0, 0.4);
+  border-radius: 4px;
+  padding: 2px 6px;
+  z-index: 51;
+}
+.hidden { display: none !important; }
 
-  saveSettingsBtn.addEventListener("click", () => {
-    settings = {
-      keyGemini: $("keyGemini").value.trim(),
-      keyKimi: $("keyKimi").value.trim(),
-      keyClaude: $("keyClaude").value.trim(),
-      keyGroq: $("keyGroq").value.trim(),
-      keyOpenRouter: $("keyOpenRouter").value.trim(),
-      demoMode: demoToggle.checked,
-    };
-    saveSettings(settings);
-    refreshDemoBadge();
-    refreshUnderstudyState();
+/* ---------- MAIN CANVAS ---------- */
+.canvas {
+  position: relative;
+  z-index: 2;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 96px 20px calc(48px + env(safe-area-inset-bottom));
+}
 
-  // ---------- Understudy state (Groq filling Claude's seat) ----------
-  function groqUnderstudy() {
-    return !settings.keyClaude && !!settings.keyGroq;
-  }
-  const seatProvider = {}; // per-dispatch: name -> "primary" | "groq" | "openrouter"
+/* Constellation */
+.constellation {
+  display: flex;
+  justify-content: center;
+  gap: 40px;
+}
 
-  // Consensus weight hierarchy (founder decision 2026-07-12):
-  // primaries carry full weight; free-tier voices keep the workflow
-  // alive but must not outvote Gemini Pro / Kimi / Claude.
-  const SEAT_WEIGHTS = { primary: 1.0, groq: 0.75, openrouter: 0.5 };
-  function seatWeight(name) {
-    return SEAT_WEIGHTS[seatProvider[name] || "primary"];
-  }
-  function seatLabel(name) {
-    const cap = name[0].toUpperCase() + name.slice(1);
-    if (seatProvider[name] === "openrouter") {
-      const m = (OR_SEAT_MODELS[name] || "").split("/").pop().replace(":free", "");
-      return `${cap} [fallback: OpenRouter ${m}]`;
-    }
-    if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
-    return cap;
-  }
-  function refreshUnderstudyState() {
-    const el = agents.claude;
-    if (groqUnderstudy()) {
-      el.classList.add("understudy");
-      el.title = "Claude seat — powered by Groq (Llama 3.3)";
-    } else {
-      el.classList.remove("understudy");
-      el.removeAttribute("title");
-    }
-  }
-  refreshUnderstudyState();
-    saveSettingsBtn.textContent = "Saved";
-    setTimeout(() => (saveSettingsBtn.textContent = "Save settings"), 1200);
-  });
+.agent {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
 
-  // ---------- Drawer / Sheet ----------
-  function openDrawer() {
-    drawer.classList.add("open");
-    drawerScrim.classList.remove("hidden");
-    drawer.setAttribute("aria-hidden", "false");
-  }
-  function closeDrawer() {
-    drawer.classList.remove("open");
-    drawerScrim.classList.add("hidden");
-    drawer.setAttribute("aria-hidden", "true");
-  }
-  menuBtn.addEventListener("click", openDrawer);
-  drawerClose.addEventListener("click", closeDrawer);
-  drawerScrim.addEventListener("click", closeDrawer);
+.ring {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 2px solid;
+  transition: box-shadow var(--ease), border-color var(--ease);
+}
+.ring-gemini { border-color: var(--gemini); }
+.ring-kimi   { border-color: var(--kimi); }
+.ring-claude { border-color: var(--claude); }
 
-  // swipe-right to close drawer
-  let touchStartX = null;
-  drawer.addEventListener("touchstart", (e) => (touchStartX = e.touches[0].clientX), { passive: true });
-  drawer.addEventListener("touchend", (e) => {
-    if (touchStartX !== null && e.changedTouches[0].clientX - touchStartX > 60) closeDrawer();
-    touchStartX = null;
-  }, { passive: true });
+.agent-name {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--muted);
+}
 
-  function openSheet() {
-    bottomSheet.classList.add("open");
-    sheetScrim.classList.remove("hidden");
-    bottomSheet.setAttribute("aria-hidden", "false");
-    setTimeout(() => queryInput.focus(), 320);
-  }
-  function closeSheet() {
-    bottomSheet.classList.remove("open");
-    sheetScrim.classList.add("hidden");
-    bottomSheet.setAttribute("aria-hidden", "true");
-  }
-  summonBtn.addEventListener("click", openSheet);
-  sheetScrim.addEventListener("click", closeSheet);
+/* thinking pulse â€” heartbeat, not strobe */
+@keyframes pulse-gemini {
+  0%, 100% { box-shadow: 0 0 4px 0 rgba(66,133,244,0.25); }
+  50%      { box-shadow: 0 0 18px 4px rgba(66,133,244,0.55); }
+}
+@keyframes pulse-kimi {
+  0%, 100% { box-shadow: 0 0 4px 0 rgba(0,212,170,0.25); }
+  50%      { box-shadow: 0 0 18px 4px rgba(0,212,170,0.55); }
+}
+@keyframes pulse-claude {
+  0%, 100% { box-shadow: 0 0 4px 0 rgba(212,165,116,0.25); }
+  50%      { box-shadow: 0 0 18px 4px rgba(212,165,116,0.55); }
+}
+.agent.thinking .ring-gemini { animation: pulse-gemini 2s ease-in-out infinite; }
+.agent.thinking .ring-kimi   { animation: pulse-kimi 2s ease-in-out infinite; }
+.agent.thinking .ring-claude { animation: pulse-claude 2s ease-in-out infinite; }
 
-  // ---------- Logging ----------
-  function clearEmptyNote(list) {
-    const note = list.querySelector(".empty-note");
-    if (note) note.remove();
-  }
-  function logHistory(query, answer) {
-    clearEmptyNote(historyList);
-    const li = document.createElement("li");
-    const q = document.createElement("span");
-    q.className = "q";
-    q.textContent = query;
-    li.appendChild(q);
-    li.appendChild(document.createTextNode(answer));
-    historyList.prepend(li);
-  }
-  function logError(msg) {
-    clearEmptyNote(errorList);
-    const li = document.createElement("li");
-    li.textContent = `${new Date().toLocaleTimeString()} — ${msg}`;
-    errorList.prepend(li);
-  }
+/* consensus flash then settle */
+@keyframes consensus-flash {
+  0%   { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
+  30%  { box-shadow: 0 0 24px 6px rgba(255,255,255,0.9); border-color: #fff; }
+  100% { box-shadow: 0 0 10px 2px rgba(255,255,255,0.18); }
+}
+.agent.consensus .ring {
+  animation: consensus-flash 1.2s ease-out forwards;
+}
 
-  // ---------- Agent visual states ----------
-  function setThinking(on) {
-    Object.values(agents).forEach((a) => {
-      a.classList.toggle("thinking", on);
-      a.classList.remove("consensus");
-    });
-  }
-  function flashConsensus() {
-    Object.values(agents).forEach((a) => {
-      a.classList.remove("thinking");
-      a.classList.add("consensus");
-    });
-  }
+/* ---------- CONSENSUS BAR ---------- */
+.consensus-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 24px 0;
+}
 
-  // ---------- Demo Council (local simulation) ----------
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+.consensus-bar {
+  max-width: 320px;
+  width: 100%;
+  min-height: 56px;
+  border-radius: 28px;
+  background: rgba(230, 57, 70, 0.1);
+  border: 1px solid var(--red);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px 22px;
+  text-align: center;
+  font-size: 16px;
+  color: var(--text);
+  line-height: 1.45;
+  position: relative;
+  overflow: hidden;
+  transition: min-height var(--ease);
+}
 
-  function demoConsensus(query) {
-    const q = query.toLowerCase();
-    const topic = query.replace(/[?.!]+$/, "").trim();
+.consensus-bar.is-empty span {
+  font-style: italic;
+  color: var(--muted);
+}
 
-    if (/^(hi|hey|hello|yo)\b/.test(q)) {
-      return "The Council convenes. Greetings acknowledged — state your problem and we will deliberate.";
-    }
-    if (q.includes("capital of france")) {
-      return "Unanimous consensus in one round: Paris. The Council notes this required no deliberation.";
-    }
-    if (q.includes("who are you") || q.includes("what are you")) {
-      return "We are the Council — Gemini, Kimi, and Claude — synthesized through Red Queen. Three perspectives, one answer.";
-    }
-    if (q.includes("meaning of life")) {
-      return "Split vote: Gemini says 42, Kimi says purpose is constructed, Claude says it emerges through connection. Synthesis: build something that matters.";
-    }
+/* shimmer while loading */
+.consensus-bar.loading::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, transparent 30%, rgba(240,240,240,0.12) 50%, transparent 70%);
+  background-size: 250% 100%;
+  animation: shimmer 1.8s ease-in-out infinite;
+}
+@keyframes shimmer {
+  0%   { background-position: 130% 0; }
+  100% { background-position: -30% 0; }
+}
 
-    const templates = [
-      `The Council deliberated on "${topic}". Gemini favored breadth, Kimi pushed for precision, Claude weighed the tradeoffs. Consensus: proceed, but define your success criteria first.`,
-      `Three perspectives converged on "${topic}". Synthesis: the core question is well-formed, but the Council recommends breaking it into two smaller decisions before acting.`,
-      `Deliberation complete on "${topic}". Kimi's framing carried the vote, with amendments from Claude. Consensus: the simplest viable path is the right one here.`,
-      `The Council reviewed "${topic}" in two rounds. Initial disagreement resolved on round two. Consensus: gather one more data point, then commit fully.`,
-    ];
-    return templates[Math.floor(Math.random() * templates.length)];
-  }
+/* ---------- SUMMON BUTTON ---------- */
+.summon-wrap {
+  display: flex;
+  justify-content: center;
+}
 
-  async function runDemoCouncil(query) {
-    // staggered "thinking" per agent, 2–3s each, overlapping
-    const order = ["gemini", "kimi", "claude"];
-    for (const name of order) {
-      agents[name].classList.add("thinking");
-      await sleep(600 + Math.random() * 500);
-    }
-    await sleep(1500 + Math.random() * 1000);
-    return demoConsensus(query);
-  }
+.summon-btn {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: var(--red);
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 0 24px rgba(230,57,70,0.4);
+  transition: transform var(--ease), box-shadow var(--ease);
+}
+.summon-btn:active { transform: scale(0.94); }
+.summon-btn:hover  { box-shadow: 0 0 34px rgba(230,57,70,0.6); }
 
-  // ---------- Circuit breaker (per-agent) ----------
-  // After an agent exhausts retries on 429, its circuit "opens": we skip it
-  // entirely for a cooldown period instead of burning retries, routing queries
-  // to the remaining agents. It auto-closes after cooldown for a fresh attempt.
-  const circuits = {
-    gemini: { openUntil: 0, strikes: 0 },
-    kimi:   { openUntil: 0, strikes: 0 },
-    claude: { openUntil: 0, strikes: 0 },
-  };
+/* ---------- SCRIMS ---------- */
+.scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.5);
+  z-index: 90;
+  opacity: 1;
+  transition: opacity var(--ease);
+}
 
-  function circuitOpen(name) {
-    return Date.now() < circuits[name].openUntil;
-  }
+/* ---------- BOTTOM SHEET ---------- */
+.bottom-sheet {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  background: var(--drawer-bg);
+  border-top: 1px solid #333;
+  border-radius: 20px 20px 0 0;
+  padding: 12px 20px calc(24px + env(safe-area-inset-bottom));
+  transform: translateY(105%);
+  transition: transform var(--ease);
+  z-index: 100;
+}
+.bottom-sheet.open { transform: translateY(0); }
 
-  function tripCircuit(name, retryAfterMs) {
-    const c = circuits[name];
-    c.strikes = Math.min(c.strikes + 1, 4);
-    // cooldown: 60s, doubling per consecutive strike, cap 10 min; honor Retry-After if longer
-    const cooldown = Math.max(retryAfterMs || 0, 60000 * Math.pow(2, c.strikes - 1));
-    c.openUntil = Date.now() + Math.min(cooldown, 600000);
-    const label = name[0].toUpperCase() + name.slice(1);
-    logError(`${label} circuit OPEN — quota likely exhausted. Skipping for ${Math.round((c.openUntil - Date.now()) / 1000)}s, routing to remaining agents.`);
-  }
+.sheet-handle {
+  width: 36px;
+  height: 4px;
+  background: #444;
+  border-radius: 2px;
+  margin: 0 auto 16px;
+}
 
-  function resetCircuit(name) {
-    circuits[name].strikes = 0;
-    circuits[name].openUntil = 0;
-  }
+.sheet-label {
+  display: block;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 10px;
+}
 
-  // ---------- Retry wrapper (handles HTTP 429 / transient failures) ----------
-  async function fetchWithRetry(url, options, label, maxRetries = 3) {
-    let attempt = 0;
-    for (;;) {
-      const res = await fetch(url, options);
-      if (res.status !== 429 && res.status < 500) return res;
-      if (attempt >= maxRetries) return res;
-      // honor Retry-After header if the API sends one; else exponential backoff + jitter
-      const retryAfter = parseFloat(res.headers.get("Retry-After"));
-      fetchWithRetry.lastRetryAfterMs = !isNaN(retryAfter) ? retryAfter * 1000 : 0;
-      const delay = !isNaN(retryAfter)
-        ? retryAfter * 1000
-        : Math.min(8000, 1000 * Math.pow(2, attempt)) + Math.random() * 400;
-      logError(`${label} rate-limited (HTTP ${res.status}) — retry ${attempt + 1}/${maxRetries} in ${(delay / 1000).toFixed(1)}s`);
-      await sleep(delay);
-      attempt++;
-    }
-  }
+#queryInput {
+  width: 100%;
+  background: #1C1C1C;
+  border: 1px solid #333;
+  border-radius: 12px;
+  color: var(--text);
+  font-family: 'Inter', sans-serif;
+  font-size: 16px;
+  padding: 12px 14px;
+  resize: none;
+  outline: none;
+  transition: border-color var(--ease);
+}
+#queryInput:focus { border-color: var(--red); }
 
-  // ---------- Live Council ----------
-  async function callGemini(query) {
-    const res = await fetchWithRetry(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" +
-        encodeURIComponent(settings.keyGemini),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: query }] }],
-          generationConfig: { maxOutputTokens: 300 },
-        }),
-      },
-      "Gemini"
-    );
-    if (!res.ok) throw new Error(`Gemini HTTP ${res.status}${res.status === 429 ? " — rate limit persisted after retries; check quota/tier" : ""}`);
-    const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  }
+.send-btn {
+  width: 100%;
+  margin-top: 14px;
+  background: var(--red);
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 16px;
+  font-weight: 500;
+  padding: 14px;
+  cursor: pointer;
+  transition: opacity var(--ease);
+}
+.send-btn:active { opacity: 0.85; }
 
-  async function callKimi(query) {
-    const res = await fetchWithRetry("https://api.moonshot.ai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + settings.keyKimi,
-      },
-      body: JSON.stringify({
-        model: "moonshot-v1-8k",
-        messages: [{ role: "user", content: query }],
-        max_tokens: 300,
-      }),
-    }, "Kimi");
-    if (!res.ok) throw new Error(`Kimi HTTP ${res.status}${res.status === 429 ? " — rate limit OR insufficient Moonshot balance" : ""}`);
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content || "";
-  }
+/* ---------- DRAWER ---------- */
+.drawer {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: 280px;
+  max-width: 85vw;
+  background: var(--drawer-bg);
+  border-left: 1px solid #333;
+  transform: translateX(105%);
+  transition: transform var(--ease);
+  z-index: 100;
+  overflow-y: auto;
+  padding: 16px 16px 32px;
+}
+.drawer.open { transform: translateX(0); }
 
-  async function callClaude(query) {
-    const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": settings.keyClaude,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 300,
-        messages: [{ role: "user", content: query }],
-      }),
-    }, "Claude");
-    if (!res.ok) throw new Error(`Claude HTTP ${res.status}${res.status === 429 ? " — rate limit persisted after retries" : ""}`);
-    const data = await res.json();
-    return data.content?.map((b) => b.text || "").join("") || "";
-  }
+.drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.drawer-title {
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700;
+  color: var(--red);
+  font-size: 17px;
+}
+.drawer-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 26px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 8px;
+}
 
-  // ---------- Divergence detection (no-consensus, by design) ----------
-  // Mirrors the backend consensus engine's philosophy: if the agents' answers
-  // don't sufficiently agree, Red Queen says so rather than forcing an answer.
-  const STOPWORDS = new Set("a an and are as at be but by for from has have i if in is it its of on or that the this to was we what which will with you your".split(" "));
+.drawer-action {
+  width: 100%;
+  background: rgba(230,57,70,0.12);
+  border: 1px solid var(--red);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 11px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 14px;
+  cursor: pointer;
+  margin-bottom: 16px;
+  transition: background var(--ease);
+}
+.drawer-action:active { background: rgba(230,57,70,0.25); }
+.drawer-action.subtle {
+  border-color: #333;
+  background: #1C1C1C;
+  margin-top: 8px;
+  margin-bottom: 0;
+}
 
-  function tokenize(text) {
-    return new Set(
-      text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/)
-        .filter((w) => w.length > 2 && !STOPWORDS.has(w))
-    );
-  }
+.drawer details {
+  border-top: 1px solid #262626;
+  padding: 12px 0;
+}
+.drawer summary {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.drawer summary::-webkit-details-marker { display: none; }
+.drawer summary::after {
+  content: "+";
+  float: right;
+  color: #555;
+}
+.drawer details[open] summary::after { content: "â€“"; }
 
-  function similarity(a, b) {
-    const A = tokenize(a), B = tokenize(b);
-    if (A.size === 0 || B.size === 0) return 0;
-    let inter = 0;
-    A.forEach((w) => { if (B.has(w)) inter++; });
-    return inter / (A.size + B.size - inter); // Jaccard index
-  }
+.history-list, .error-list {
+  list-style: none;
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.history-list li, .error-list li {
+  font-size: 13px;
+  line-height: 1.4;
+  background: #1A1A1A;
+  border-radius: 8px;
+  padding: 9px 11px;
+  color: #CCC;
+  word-break: break-word;
+}
+.history-list li .q { color: var(--muted); display: block; margin-bottom: 3px; font-size: 12px; }
+.error-list li { color: #C77; }
+.empty-note { color: #555 !important; background: none !important; font-style: italic; }
 
-  const AGREEMENT_THRESHOLD = 0.22; // lexical agreement floor (frontend approximation of backend's 0.7 cosine)
+.settings { margin-top: 10px; display: flex; flex-direction: column; gap: 12px; }
+.settings label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.settings input[type="password"] {
+  background: #1C1C1C;
+  border: 1px solid #333;
+  border-radius: 8px;
+  color: var(--text);
+  padding: 9px 11px;
+  font-size: 14px;
+  outline: none;
+}
+.settings input[type="password"]:focus { border-color: var(--red); }
+.toggle-row {
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px !important;
+  color: var(--text) !important;
+}
+.toggle-row input { accent-color: var(--red); width: 20px; height: 20px; }
 
-  function checkConsensus(answers) {
-    // each answer must agree with at least one other above threshold
-    if (answers.length < 2) return { agreed: answers, outliers: [] };
-    const agreed = [], outliers = [];
-    answers.forEach((a, i) => {
-      const hasAlly = answers.some((b, j) => i !== j && similarity(a.text, b.text) >= AGREEMENT_THRESHOLD);
-      (hasAlly ? agreed : outliers).push(a);
-    });
-    return { agreed, outliers };
-  }
+.about-text {
+  margin-top: 10px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #AAA;
+}
 
-  async function callGroq(query) {
-    const res = await fetchWithRetry("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + settings.keyGroq,
-      },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        messages: [{ role: "user", content: query }],
-        max_tokens: 300,
-      }),
-    }, "Groq");
-    if (!res.ok) throw new Error(`Groq HTTP ${res.status}${res.status === 429 ? " — free-tier rate limit; circuit breaker will manage" : ""}`);
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content || "";
-  }
+/* ---------- ACCESSIBILITY / MOTION ---------- */
+:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
 
-  // Per-seat fallback diversity (Kimi amendment, 2026-07-12):
-  // never let two seats share the same fallback model family, or
-  // divergence detection degrades into an echo chamber.
-  // If OpenRouter retires a :free model (HTTP 404), swap the string
-  // for any other distinct free model family — keep all three different.
-  const OR_SEAT_MODELS = {
-    gemini: "meta-llama/llama-3.3-70b-instruct:free",
-    kimi:   "openai/gpt-oss-20b:free",
-    claude: "qwen/qwen-2.5-72b-instruct:free",
-  };
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
 
-  let orQueue = Promise.resolve();
-  function serializeOR(fn) {
-    const run = orQueue.then(fn, fn);
-    orQueue = run.catch(() => {});
-    return run;
-  }
+/* ---------- DIVIDED STATE (no consensus, by design) ---------- */
+.consensus-bar.divided {
+  border-color: var(--gold);
+  background: rgba(255, 215, 0, 0.07);
+}
+.consensus-bar.divided span {
+  color: var(--gold);
+  font-style: italic;
+}
 
-  async function callOpenRouter(query, seatName) {
-    return serializeOR(() => callOpenRouterNow(query, seatName));
-  }
-
-  async function callOpenRouterNow(query, seatName) {
-    const model = OR_SEAT_MODELS[seatName] || OR_SEAT_MODELS.gemini;
-    const res = await fetchWithRetry("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + settings.keyOpenRouter,
-      },
-      body: JSON.stringify({
-        model: model,
-        messages: [{ role: "user", content: query }],
-        max_tokens: 300,
-      }),
-    }, "OpenRouter");
-    if (res.status === 404) throw new Error(`OpenRouter model ${model} unavailable (404) — swap OR_SEAT_MODELS entry for another free model family`);
-    if (!res.ok) throw new Error(`OpenRouter HTTP ${res.status}`);
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content || "";
-  }
-
-  async function runLiveCouncil(query) {
-    const calls = [];
-    if (settings.keyGemini) calls.push({ name: "gemini", fn: callGemini });
-    if (settings.keyKimi) calls.push({ name: "kimi", fn: callKimi });
-    if (settings.keyClaude) {
-      calls.push({ name: "claude", fn: callClaude });
-    } else if (settings.keyGroq) {
-      calls.push({ name: "claude", fn: callGroq }); // Groq understudies Claude's seat (free tier)
-    }
-
-    // reset per-dispatch provider tracking
-    calls.forEach((c) => { seatProvider[c.name] = (c.name === "claude" && groqUnderstudy()) ? "groq" : "primary"; });
-
-    const orAvailable = !!settings.keyOpenRouter;
-
-    // wrap each seat: primary -> OpenRouter fallback on failure.
-    // circuit-open seats route straight to fallback instead of being skipped.
-    const wrapped = calls.map((c) => ({
-      name: c.name,
-      fn: async (q) => {
-        const cap = c.name[0].toUpperCase() + c.name.slice(1);
-        if (circuitOpen(c.name)) {
-          if (!orAvailable) throw new Error(`${cap} circuit open, no fallback available`);
-          logError(`${cap} circuit open — seat routed to OpenRouter free tier.`);
-          seatProvider[c.name] = "openrouter";
-          return callOpenRouter(q, c.name);
-        }
-        try {
-          return await c.fn(q);
-        } catch (e) {
-          if ((e.message || "").includes("429")) tripCircuit(c.name, fetchWithRetry.lastRetryAfterMs);
-          if (!orAvailable) throw e;
-          logError(`${seatLabel(c.name)} primary failed (${e.message || e}) — seat falling back to OpenRouter free tier.`);
-          seatProvider[c.name] = "openrouter";
-          return callOpenRouter(q, c.name);
-        }
-      },
-    }));
-    if (wrapped.length === 0) return null;
-    calls.length = 0;
-    calls.push(...wrapped);
-
-    calls.forEach((c) => agents[c.name].classList.add("thinking"));
-
-    // stagger launches ~700ms apart to avoid same-millisecond burst tripping RPM limits
-    const staggered = calls.map((c, i) =>
-      sleep(i * 700).then(() => c.fn(query))
-    );
-    const results = await Promise.allSettled(staggered);
-
-    const answers = [];
-    results.forEach((r, i) => {
-      const name = calls[i].name;
-      if (r.status === "fulfilled" && r.value) {
-        answers.push({ name, text: r.value });
-        resetCircuit(name);
-      } else {
-        const msg = r.reason?.message || "unknown error";
-        logError(`${seatLabel(name)} failed: ${msg}`);
-      }
-      agents[name].classList.remove("thinking");
-    });
-
-    if (answers.length === 0) return null; // triggers demo fallback
-
-    if (answers.length === 1) return { text: answers[0].text.trim(), divided: false, answers };
-
-    const { agreed, outliers } = checkConsensus(answers);
-
-    // PROVISIONAL rule (Kimi amendment, 2026-07-12): consensus is verified
-    // if and only if at least one primary (1.0) voice is in the agreeing set.
-    // Any all-understudy/all-fallback agreement is workflow continuity, not verification.
-    const hasPrimaryVoice = agreed.some((a) => seatProvider[a.name] === "primary");
-    if (agreed.length >= 2 && !hasPrimaryVoice) {
-      logError("Consensus is PROVISIONAL — no primary voice (Gemini Pro / Kimi / Claude live) in the agreeing set. Treat as workflow continuity, not verified consensus.");
-    }
-    if (agreed.length < 2) {
-      // No consensus — by design, Red Queen declines to force an answer
-      logError(`Consensus round FAILED by design — ${answers.length} agents, 0 agreements above threshold. Individual positions logged to Session History.`);
-      return { text: null, divided: true, answers };
-    }
-
-    if (outliers.length > 0) {
-      outliers.forEach((o) =>
-        logError(`${seatLabel(o.name)} excluded as outlier — position diverged from majority.`)
-      );
-    }
-
-    // weighted synthesis: highest-weight agreeing voice speaks for the Council;
-    // among equal weights, shortest coherent answer wins
-    agreed.sort((a, b) => (seatWeight(b.name) - seatWeight(a.name)) || (a.text.length - b.text.length));
-    const speaker = agreed[0];
-    logError(`Consensus synthesized — speaking voice: ${seatLabel(speaker.name)} (weight ${seatWeight(speaker.name)}), ${agreed.length}/${answers.length} agents in agreement.`);
-    return { text: speaker.text.trim(), divided: false, answers };
-  }
-
-  // ---------- Dispatch ----------
-  let busy = false;
-
-  async function dispatch(query) {
-    if (busy) return;
-    busy = true;
-
-    consensusBar.classList.remove("is-empty");
-    consensusBar.classList.add("loading");
-    consensusText.textContent = "The Council is deliberating…";
-    consensusText.style.fontStyle = "italic";
-    consensusText.style.color = "#888";
-
-    let answer = null;
-    let divided = false;
-    let allAnswers = [];
-
-    if (!inDemoMode()) {
-      let result = null;
-      try {
-        result = await runLiveCouncil(query);
-      } catch (e) {
-        logError("Council dispatch failed: " + (e.message || e));
-      }
-      if (result === null) {
-        logError("All live agents failed — falling back to demo simulation.");
-        demoBadge.classList.remove("hidden");
-        answer = await runDemoCouncil(query);
-      } else {
-        divided = result.divided;
-        answer = result.text;
-        allAnswers = result.answers || [];
-      }
-    } else {
-      // demo showcase: queries mentioning "divided"/"controversial" demo the no-consensus state
-      if (/divided|controversial|disagree/.test(query.toLowerCase())) {
-        await runDemoCouncil(query);
-        divided = true;
-        allAnswers = [
-          { name: "gemini", text: "Position A — prioritize scale and reach first." },
-          { name: "kimi", text: "Position B — architecture integrity outweighs speed." },
-          { name: "claude", text: "Position C — neither is decidable without success criteria." },
-        ];
-      } else {
-        answer = await runDemoCouncil(query);
-      }
-    }
-
-    setThinking(false);
-    consensusBar.classList.remove("loading");
-    consensusText.style.fontStyle = "normal";
-    consensusText.style.color = "";
-    consensusBar.classList.remove("divided");
-
-    if (divided) {
-      // No white flash — the Council did not converge. Amber state instead.
-      consensusBar.classList.add("divided");
-      consensusText.textContent = "The Council is divided — no consensus reached.";
-      allAnswers.forEach((a) =>
-        logHistory(`${seatLabel(a.name)} position (${query})`, a.text)
-      );
-      logHistory(query, "NO CONSENSUS — Council divided by design. Individual positions above.");
-    } else {
-      flashConsensus();
-      consensusText.textContent = answer;
-      logHistory(query, answer);
-    }
-    busy = false;
-  }
-
-  sendBtn.addEventListener("click", () => {
-    const q = queryInput.value.trim();
-    if (!q) return;
-    queryInput.value = "";
-    closeSheet();
-    dispatch(q);
-  });
-
-  queryInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendBtn.click();
-    }
-  });
-
-  // ---------- New Session ----------
-  newSessionBtn.addEventListener("click", () => {
-    consensusText.textContent = "Awaiting Council Input...";
-    consensusBar.classList.add("is-empty");
-    consensusBar.classList.remove("loading");
-    historyList.innerHTML = '<li class="empty-note">No queries yet this session.</li>';
-    errorList.innerHTML = '<li class="empty-note">No errors logged.</li>';
-    Object.values(agents).forEach((a) => a.classList.remove("thinking", "consensus"));
-    closeDrawer();
-  });
-})();
+/* ---------- SHADOWED SEAT (any non-primary occupant: understudy or fallback) ---------- */
+.agent.shadowed .ring {
+  opacity: 0.5;
+  border-style: dashed;
+}
+.agent.shadowed .agent-name::after {
+  content: " \2022 " attr(data-occupant);
+  color: #555;
+  text-transform: lowercase;
+  letter-spacing: 0.05em;
+}
