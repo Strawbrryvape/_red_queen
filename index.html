@@ -118,7 +118,14 @@
     <p class="about-text">Red Queen is a multi-agent orchestration council. Three agents — Gemini, Kimi, and Claude — deliberate on your query, and the Consensus Bar shows their synthesized answer. Built by Syntropy LLC.</p>
   </details>
 </aside>
-
-<script src="app.js"></script>
+<script>
+// Purge any stale service worker + caches from previous deployments
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
+}
+if (window.caches) {
+  caches.keys().then(keys => keys.forEach(k => caches.delete(k)));
+}
+</script><script src="app.js"></script>
 </body>
 </html>
