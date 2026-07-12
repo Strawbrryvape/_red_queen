@@ -189,9 +189,27 @@
     return demoConsensus(query);
   }
 
+  // ---------- Retry wrapper (handles HTTP 429 / transient failures) ----------
+  async function fetchWithRetry(url, options, label, maxRetries = 3) {
+    let attempt = 0;
+    for (;;) {
+      const res = await fetch(url, options);
+      if (res.status !== 429 && res.status < 500) return res;
+      if (attempt >= maxRetries) return res;
+      // honor Retry-After header if the API sends one; else exponential backoff + jitter
+      const retryAfter = parseFloat(res.headers.get("Retry-After"));
+      const delay = !isNaN(retryAfter)
+        ? retryAfter * 1000
+        : Math.min(8000, 1000 * Math.pow(2, attempt)) + Math.random() * 400;
+      logError(`${label} rate-limited (HTTP ${res.status}) — retry ${attempt + 1}/${maxRetries} in ${(delay / 1000).toFixed(1)}s`);
+      await sleep(delay);
+      attempt++;
+    }
+  }
+
   // ---------- Live Council ----------
   async function callGemini(query) {
-    const res = await fetch(
+    const res = await fetchWithRetry(
       "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" +
         encodeURIComponent(settings.keyGemini),
       {
@@ -201,15 +219,16 @@
           contents: [{ parts: [{ text: query }] }],
           generationConfig: { maxOutputTokens: 300 },
         }),
-      }
+      },
+      "Gemini"
     );
-    if (!res.ok) throw new Error(`Gemini HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`Gemini HTTP ${res.status}${res.status === 429 ? " — rate limit persisted after retries; check quota/tier" : ""}`);
     const data = await res.json();
     return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
   }
 
   async function callKimi(query) {
-    const res = await fetch("https://api.moonshot.ai/v1/chat/completions", {
+    const res = await fetchWithRetry("https://api.moonshot.ai/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -220,14 +239,14 @@
         messages: [{ role: "user", content: query }],
         max_tokens: 300,
       }),
-    });
-    if (!res.ok) throw new Error(`Kimi HTTP ${res.status}`);
+    }, "Kimi");
+    if (!res.ok) throw new Error(`Kimi HTTP ${res.status}${res.status === 429 ? " — rate limit OR insufficient Moonshot balance" : ""}`);
     const data = await res.json();
     return data.choices?.[0]?.message?.content || "";
   }
 
   async function callClaude(query) {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -240,8 +259,8 @@
         max_tokens: 300,
         messages: [{ role: "user", content: query }],
       }),
-    });
-    if (!res.ok) throw new Error(`Claude HTTP ${res.status}`);
+    }, "Claude");
+    if (!res.ok) throw new Error(`Claude HTTP ${res.status}${res.status === 429 ? " — rate limit persisted after retries" : ""}`);
     const data = await res.json();
     return data.content?.map((b) => b.text || "").join("") || "";
   }
@@ -254,7 +273,11 @@
 
     calls.forEach((c) => agents[c.name].classList.add("thinking"));
 
-    const results = await Promise.allSettled(calls.map((c) => c.fn(query)));
+    // stagger launches ~700ms apart to avoid same-millisecond burst tripping RPM limits
+    const staggered = calls.map((c, i) =>
+      sleep(i * 700).then(() => c.fn(query))
+    );
+    const results = await Promise.allSettled(staggered);
 
     const answers = [];
     results.forEach((r, i) => {
