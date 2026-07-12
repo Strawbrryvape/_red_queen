@@ -1,0 +1,86 @@
+version: "3.8"
+
+# Red Queen v2 — Local Docker Mesh
+# Spins up 3 model nodes (kimi, gemini, claude) on an isolated bridge network.
+# UDP broadcast is confined to the docker network. No host port exposure.
+
+services:
+  kimi-node:
+    build: .
+    container_name: rq-kimi
+    environment:
+      - RQ_NODE_ID=kimi-node
+      - RQ_MESH_PORT=47777
+      - RQ_MESH_BCAST=172.18.255.255
+      - RQ_MESH_AUTH=true
+      - RQ_MESH_SECRET=${RQ_MESH_SECRET:-changeme-please-use-docker-secret}
+      - RQ_EXPECTED_NODES=gemini-node,claude-node
+      - RQ_ROUND_WINDOW=2.0
+      - RQ_ROUND_INTERVAL=5.0
+      - RQ_SIM_THRESHOLD=0.7
+      - RQ_MIN_NODES=2
+      - RQ_LOG_DIR=/app/logs
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - RQ_SUPABASE_TABLE=rq_consensus_log
+    networks:
+      - rq-mesh
+    volumes:
+      - ./logs/kimi:/app/logs
+    restart: unless-stopped
+    # No ports exposed to host — UDP is internal to docker network only
+
+  gemini-node:
+    build: .
+    container_name: rq-gemini
+    environment:
+      - RQ_NODE_ID=gemini-node
+      - RQ_MESH_PORT=47777
+      - RQ_MESH_BCAST=172.18.255.255
+      - RQ_MESH_AUTH=true
+      - RQ_MESH_SECRET=${RQ_MESH_SECRET:-changeme-please-use-docker-secret}
+      - RQ_EXPECTED_NODES=kimi-node,claude-node
+      - RQ_ROUND_WINDOW=2.0
+      - RQ_ROUND_INTERVAL=5.0
+      - RQ_SIM_THRESHOLD=0.7
+      - RQ_MIN_NODES=2
+      - RQ_LOG_DIR=/app/logs
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - RQ_SUPABASE_TABLE=rq_consensus_log
+    networks:
+      - rq-mesh
+    volumes:
+      - ./logs/gemini:/app/logs
+    restart: unless-stopped
+
+  claude-node:
+    build: .
+    container_name: rq-claude
+    environment:
+      - RQ_NODE_ID=claude-node
+      - RQ_MESH_PORT=47777
+      - RQ_MESH_BCAST=172.18.255.255
+      - RQ_MESH_AUTH=true
+      - RQ_MESH_SECRET=${RQ_MESH_SECRET:-changeme-please-use-docker-secret}
+      - RQ_EXPECTED_NODES=kimi-node,gemini-node
+      - RQ_ROUND_WINDOW=2.0
+      - RQ_ROUND_INTERVAL=5.0
+      - RQ_SIM_THRESHOLD=0.7
+      - RQ_MIN_NODES=2
+      - RQ_LOG_DIR=/app/logs
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - RQ_SUPABASE_TABLE=rq_consensus_log
+    networks:
+      - rq-mesh
+    volumes:
+      - ./logs/claude:/app/logs
+    restart: unless-stopped
+
+networks:
+  rq-mesh:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
