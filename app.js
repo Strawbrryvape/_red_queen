@@ -75,6 +75,14 @@
   const CEREBRAS_MODEL = "qwen-3-32b";
   const CEREBRAS_MODEL_LABEL = "Qwen 3 32B";
 
+  // Shared per-agent output budget. 300 proved too small in live testing
+  // (2026-07-12): agents asked for reasoning + a FINAL DIRECTIVE got cut off
+  // mid-sentence, guaranteeing consensus failure. Raised to 1000 per Kimi
+  // review — verbose reasoners (Qwen, gpt-oss) need headroom so truncation
+  // hits reasoning fluff, never the anchor. Clears free-tier limits with
+  // the staggered dispatch.
+  const MAX_TOKENS = 1000;
+
   // ---------- Understudy state (Groq filling Claude's seat, Cerebras filling Gemini's) ----------
   function groqUnderstudy() {
     return !settings.keyClaude && !!settings.keyGroq;
@@ -330,7 +338,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ parts: [{ text: query }] }],
-          generationConfig: { maxOutputTokens: 300 },
+          generationConfig: { maxOutputTokens: MAX_TOKENS },
         }),
       },
       "Gemini"
@@ -350,7 +358,7 @@
       body: JSON.stringify({
         model: "moonshot-v1-8k",
         messages: [{ role: "user", content: query }],
-        max_tokens: 300,
+        max_tokens: MAX_TOKENS,
       }),
     }, "Kimi");
     if (!res.ok) throw new Error(`Kimi HTTP ${res.status}${res.status === 429 ? " — rate limit OR insufficient Moonshot balance" : ""}`);
@@ -369,7 +377,7 @@
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 300,
+        max_tokens: MAX_TOKENS,
         messages: [{ role: "user", content: query }],
       }),
     }, "Claude");
@@ -383,10 +391,20 @@
   // don't sufficiently agree, Red Queen says so rather than forcing an answer.
   const STOPWORDS = new Set("a an and are as at be but by for from has have i if in is it its of on or that the this to was we what which will with you your".split(" "));
 
+  // Light suffix stemming (Kimi review, 2026-07-12): "rezone"/"rezoning",
+  // "approve"/"approval-adjacent forms" should match. Crude but symmetric —
+  // both sides of every comparison pass through the same stemmer, so
+  // imperfect stems still align. Real semantic matching stays in the
+  // backend (0.7 cosine on embeddings); the frontend is an approximation.
+  function stem(w) {
+    return w.length > 4 ? w.replace(/(ation|tion|ings?|ies|ied|ed|es|e|s)$/, "") : w;
+  }
+
   function tokenize(text) {
     return new Set(
       text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/)
         .filter((w) => w.length > 2 && !STOPWORDS.has(w))
+        .map(stem)
     );
   }
 
@@ -400,12 +418,35 @@
 
   const AGREEMENT_THRESHOLD = 0.22; // lexical agreement floor (frontend approximation of backend's 0.7 cosine)
 
+  // Structural anchor comparison (2026-07-12, after first shadow-council run):
+  // when a query asks agents to conclude with "FINAL DIRECTIVE:", long
+  // reasoning walkthroughs differ lexically even when verdicts match, and
+  // full-text Jaccard misreads agreement as division. If BOTH answers in a
+  // pair contain the anchor, compare only what follows it — the verdicts.
+  // If either lacks it (free-form answer, or truncated pre-anchor), fall
+  // back to full-text comparison as before.
+  const DIRECTIVE_ANCHOR = /FINAL DIRECTIVE:\s*([\s\S]+)/i;
+  function extractDirective(text) {
+    const m = text.match(DIRECTIVE_ANCHOR);
+    return m ? m[1].trim() : null;
+  }
+
+  function pairSimilarity(a, b) {
+    const da = extractDirective(a), db = extractDirective(b);
+    if (da && db) return similarity(da, db);
+    return similarity(a, b);
+  }
+
   function checkConsensus(answers) {
     // each answer must agree with at least one other above threshold
     if (answers.length < 2) return { agreed: answers, outliers: [] };
+    const anchored = answers.filter((a) => extractDirective(a.text)).length;
+    if (anchored >= 2) {
+      logError(`Consensus check using FINAL DIRECTIVE anchors (${anchored}/${answers.length} answers anchored).`);
+    }
     const agreed = [], outliers = [];
     answers.forEach((a, i) => {
-      const hasAlly = answers.some((b, j) => i !== j && similarity(a.text, b.text) >= AGREEMENT_THRESHOLD);
+      const hasAlly = answers.some((b, j) => i !== j && pairSimilarity(a.text, b.text) >= AGREEMENT_THRESHOLD);
       (hasAlly ? agreed : outliers).push(a);
     });
     return { agreed, outliers };
@@ -421,7 +462,7 @@
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         messages: [{ role: "user", content: query }],
-        max_tokens: 300,
+        max_tokens: MAX_TOKENS,
       }),
     }, "Groq");
     if (!res.ok) throw new Error(`Groq HTTP ${res.status}${res.status === 429 ? " — free-tier rate limit; circuit breaker will manage" : ""}`);
@@ -445,7 +486,7 @@
       body: JSON.stringify({
         model: CEREBRAS_MODEL,
         messages: [{ role: "user", content: query }],
-        max_tokens: 300,
+        max_tokens: MAX_TOKENS,
       }),
     }, "Cerebras");
     if (res.status === 404) throw new Error(`Cerebras model ${CEREBRAS_MODEL} unavailable (404) — free catalog churned; swap CEREBRAS_MODEL for a current model from cloud.cerebras.ai`);
@@ -493,7 +534,7 @@
       body: JSON.stringify({
         model: model,
         messages: [{ role: "user", content: query }],
-        max_tokens: 300,
+        max_tokens: MAX_TOKENS,
       }),
     }, "OpenRouter");
     if (res.status === 404) throw new Error(`OpenRouter model ${model} unavailable (404) — swap OR_SEAT_MODELS entry for another free model family`);
@@ -578,9 +619,28 @@
 
     if (answers.length === 0) return null; // triggers demo fallback
 
-    if (answers.length === 1) return { text: answers[0].text.trim(), divided: false, answers };
+    // MALFORMED_RESPONSE rule (Kimi review, 2026-07-12, Claude amendment):
+    // enforced ONLY when the query itself demands a FINAL DIRECTIVE —
+    // otherwise every conversational query would empty all seats.
+    // Anchored queries: answers missing the anchor (truncation, ignored
+    // instructions) are flagged and excluded from consensus math instead
+    // of silently corrupting the similarity scores.
+    const wantsDirective = /FINAL DIRECTIVE/i.test(query);
+    let eligible = answers;
+    if (wantsDirective) {
+      eligible = answers.filter((a) => extractDirective(a.text));
+      answers.filter((a) => !extractDirective(a.text)).forEach((m) =>
+        logError(`${seatLabel(m.name)} MALFORMED_RESPONSE — no FINAL DIRECTIVE anchor found (likely truncation or ignored instructions). Seat treated as empty this round.`)
+      );
+      if (eligible.length === 0) {
+        logError("All responses malformed — no directives to compare. Council divided by default; raw positions logged to Session History.");
+        return { text: null, divided: true, answers };
+      }
+    }
 
-    const { agreed, outliers } = checkConsensus(answers);
+    if (eligible.length === 1) return { text: eligible[0].text.trim(), divided: false, answers: eligible };
+
+    const { agreed, outliers } = checkConsensus(eligible);
 
     // PROVISIONAL rule (Kimi amendment, 2026-07-12): consensus is verified
     // if and only if at least one primary (1.0) voice is in the agreeing set.
@@ -591,7 +651,7 @@
     }
     if (agreed.length < 2) {
       // No consensus — by design, Red Queen declines to force an answer
-      logError(`Consensus round FAILED by design — ${answers.length} agents, 0 agreements above threshold. Individual positions logged to Session History.`);
+      logError(`Consensus round FAILED by design — ${eligible.length} eligible agents, 0 agreements above threshold. Individual positions logged to Session History.`);
       return { text: null, divided: true, answers };
     }
 
@@ -605,7 +665,7 @@
     // among equal weights, shortest coherent answer wins
     agreed.sort((a, b) => (seatWeight(b.name) - seatWeight(a.name)) || (a.text.length - b.text.length));
     const speaker = agreed[0];
-    logError(`Consensus synthesized — speaking voice: ${seatLabel(speaker.name)} (weight ${seatWeight(speaker.name)}), ${agreed.length}/${answers.length} agents in agreement.`);
+    logError(`Consensus synthesized — speaking voice: ${seatLabel(speaker.name)} (weight ${seatWeight(speaker.name)}), ${agreed.length}/${eligible.length} eligible agents in agreement.`);
     return { text: speaker.text.trim(), divided: false, answers };
   }
 
