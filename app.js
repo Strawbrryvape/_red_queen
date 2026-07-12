@@ -51,10 +51,11 @@
   $("keyKimi").value = settings.keyKimi || "";
   $("keyClaude").value = settings.keyClaude || "";
   $("keyGroq").value = settings.keyGroq || "";
+  $("keyOpenRouter").value = settings.keyOpenRouter || "";
   demoToggle.checked = !!settings.demoMode;
 
   function hasAnyKey() {
-    return !!(settings.keyGemini || settings.keyKimi || settings.keyClaude || settings.keyGroq);
+    return !!(settings.keyGemini || settings.keyKimi || settings.keyClaude || settings.keyGroq || settings.keyOpenRouter);
   }
   function inDemoMode() {
     return settings.demoMode || !hasAnyKey();
@@ -68,9 +69,20 @@
   function groqUnderstudy() {
     return !settings.keyClaude && !!settings.keyGroq;
   }
+  const seatProvider = {}; // per-dispatch: name -> "primary" | "groq" | "openrouter"
+
+  // Consensus weight hierarchy (founder decision 2026-07-12):
+  // primaries carry full weight; free-tier voices keep the workflow
+  // alive but must not outvote Gemini Pro / Kimi / Claude.
+  const SEAT_WEIGHTS = { primary: 1.0, groq: 0.75, openrouter: 0.5 };
+  function seatWeight(name) {
+    return SEAT_WEIGHTS[seatProvider[name] || "primary"];
+  }
   function seatLabel(name) {
+    const cap = name[0].toUpperCase() + name.slice(1);
+    if (seatProvider[name] === "openrouter") return `${cap} [fallback: OpenRouter Llama 3.3]`;
     if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
-    return name[0].toUpperCase() + name.slice(1);
+    return cap;
   }
   function refreshUnderstudyState() {
     const el = agents.claude;
@@ -90,6 +102,7 @@
       keyKimi: $("keyKimi").value.trim(),
       keyClaude: $("keyClaude").value.trim(),
       keyGroq: $("keyGroq").value.trim(),
+      keyOpenRouter: $("keyOpenRouter").value.trim(),
       demoMode: demoToggle.checked,
     };
     saveSettings(settings);
@@ -100,9 +113,20 @@
   function groqUnderstudy() {
     return !settings.keyClaude && !!settings.keyGroq;
   }
+  const seatProvider = {}; // per-dispatch: name -> "primary" | "groq" | "openrouter"
+
+  // Consensus weight hierarchy (founder decision 2026-07-12):
+  // primaries carry full weight; free-tier voices keep the workflow
+  // alive but must not outvote Gemini Pro / Kimi / Claude.
+  const SEAT_WEIGHTS = { primary: 1.0, groq: 0.75, openrouter: 0.5 };
+  function seatWeight(name) {
+    return SEAT_WEIGHTS[seatProvider[name] || "primary"];
+  }
   function seatLabel(name) {
+    const cap = name[0].toUpperCase() + name.slice(1);
+    if (seatProvider[name] === "openrouter") return `${cap} [fallback: OpenRouter Llama 3.3]`;
     if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
-    return name[0].toUpperCase() + name.slice(1);
+    return cap;
   }
   function refreshUnderstudyState() {
     const el = agents.claude;
@@ -389,6 +413,24 @@
     return data.choices?.[0]?.message?.content || "";
   }
 
+  async function callOpenRouter(query) {
+    const res = await fetchWithRetry("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + settings.keyOpenRouter,
+      },
+      body: JSON.stringify({
+        model: "meta-llama/llama-3.3-70b-instruct:free",
+        messages: [{ role: "user", content: query }],
+        max_tokens: 300,
+      }),
+    }, "OpenRouter");
+    if (!res.ok) throw new Error(`OpenRouter HTTP ${res.status}`);
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || "";
+  }
+
   async function runLiveCouncil(query) {
     const calls = [];
     if (settings.keyGemini) calls.push({ name: "gemini", fn: callGemini });
@@ -399,19 +441,37 @@
       calls.push({ name: "claude", fn: callGroq }); // Groq understudies Claude's seat (free tier)
     }
 
-    // circuit breaker: skip agents whose quota circuit is open
-    const skipped = calls.filter((c) => circuitOpen(c.name));
-    skipped.forEach((c) => {
-      const secs = Math.round((circuits[c.name].openUntil - Date.now()) / 1000);
-      logError(`${c.name[0].toUpperCase() + c.name.slice(1)} skipped — circuit open for ${secs}s more.`);
-    });
-    const active = calls.filter((c) => !circuitOpen(c.name));
-    if (active.length === 0) {
-      logError("All agent circuits open — quotas exhausted. Falling back to demo until cooldowns expire.");
-      return null;
-    }
+    // reset per-dispatch provider tracking
+    calls.forEach((c) => { seatProvider[c.name] = (c.name === "claude" && groqUnderstudy()) ? "groq" : "primary"; });
+
+    const orAvailable = !!settings.keyOpenRouter;
+
+    // wrap each seat: primary -> OpenRouter fallback on failure.
+    // circuit-open seats route straight to fallback instead of being skipped.
+    const wrapped = calls.map((c) => ({
+      name: c.name,
+      fn: async (q) => {
+        const cap = c.name[0].toUpperCase() + c.name.slice(1);
+        if (circuitOpen(c.name)) {
+          if (!orAvailable) throw new Error(`${cap} circuit open, no fallback available`);
+          logError(`${cap} circuit open — seat routed to OpenRouter free tier.`);
+          seatProvider[c.name] = "openrouter";
+          return callOpenRouter(q);
+        }
+        try {
+          return await c.fn(q);
+        } catch (e) {
+          if ((e.message || "").includes("429")) tripCircuit(c.name, fetchWithRetry.lastRetryAfterMs);
+          if (!orAvailable) throw e;
+          logError(`${seatLabel(c.name)} primary failed (${e.message || e}) — seat falling back to OpenRouter free tier.`);
+          seatProvider[c.name] = "openrouter";
+          return callOpenRouter(q);
+        }
+      },
+    }));
+    if (wrapped.length === 0) return null;
     calls.length = 0;
-    calls.push(...active);
+    calls.push(...wrapped);
 
     calls.forEach((c) => agents[c.name].classList.add("thinking"));
 
@@ -430,7 +490,6 @@
       } else {
         const msg = r.reason?.message || "unknown error";
         logError(`${seatLabel(name)} failed: ${msg}`);
-        if (msg.includes("429")) tripCircuit(name, fetchWithRetry.lastRetryAfterMs);
       }
       agents[name].classList.remove("thinking");
     });
@@ -441,6 +500,10 @@
 
     const { agreed, outliers } = checkConsensus(answers);
 
+    const agreedWeight = agreed.reduce((s, a) => s + seatWeight(a.name), 0);
+    if (agreed.length >= 2 && agreedWeight < 1.5) {
+      logError(`Consensus is PROVISIONAL — agreeing voices are all reduced-weight (combined ${agreedWeight.toFixed(2)}). Treat as workflow continuity, not verified consensus.`);
+    }
     if (agreed.length < 2) {
       // No consensus — by design, Red Queen declines to force an answer
       logError(`Consensus round FAILED by design — ${answers.length} agents, 0 agreements above threshold. Individual positions logged to Session History.`);
@@ -453,9 +516,12 @@
       );
     }
 
-    // synthesis among agreeing agents: shortest coherent answer wins
-    agreed.sort((a, b) => a.text.length - b.text.length);
-    return { text: agreed[0].text.trim(), divided: false, answers };
+    // weighted synthesis: highest-weight agreeing voice speaks for the Council;
+    // among equal weights, shortest coherent answer wins
+    agreed.sort((a, b) => (seatWeight(b.name) - seatWeight(a.name)) || (a.text.length - b.text.length));
+    const speaker = agreed[0];
+    logError(`Consensus synthesized — speaking voice: ${seatLabel(speaker.name)} (weight ${seatWeight(speaker.name)}), ${agreed.length}/${answers.length} agents in agreement.`);
+    return { text: speaker.text.trim(), divided: false, answers };
   }
 
   // ---------- Dispatch ----------
