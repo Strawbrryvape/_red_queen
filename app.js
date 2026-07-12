@@ -426,11 +426,22 @@
   // for any other distinct free model family — keep all three different.
   const OR_SEAT_MODELS = {
     gemini: "meta-llama/llama-3.3-70b-instruct:free",
-    kimi:   "mistralai/mixtral-8x7b-instruct:free",
+    kimi:   "openai/gpt-oss-20b:free",
     claude: "qwen/qwen-2.5-72b-instruct:free",
   };
 
+  let orQueue = Promise.resolve();
+  function serializeOR(fn) {
+    const run = orQueue.then(fn, fn);
+    orQueue = run.catch(() => {});
+    return run;
+  }
+
   async function callOpenRouter(query, seatName) {
+    return serializeOR(() => callOpenRouterNow(query, seatName));
+  }
+
+  async function callOpenRouterNow(query, seatName) {
     const model = OR_SEAT_MODELS[seatName] || OR_SEAT_MODELS.gemini;
     const res = await fetchWithRetry("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
