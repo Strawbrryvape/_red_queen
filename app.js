@@ -52,10 +52,14 @@
   $("keyClaude").value = settings.keyClaude || "";
   $("keyGroq").value = settings.keyGroq || "";
   $("keyOpenRouter").value = settings.keyOpenRouter || "";
+  // Cerebras input is optional in the HTML — guard so the app still boots if
+  // index.html hasn't been updated yet (prevents a dead-buttons failure mode).
+  const keyCerebrasEl = $("keyCerebras");
+  if (keyCerebrasEl) keyCerebrasEl.value = settings.keyCerebras || "";
   demoToggle.checked = !!settings.demoMode;
 
   function hasAnyKey() {
-    return !!(settings.keyGemini || settings.keyKimi || settings.keyClaude || settings.keyGroq || settings.keyOpenRouter);
+    return !!(settings.keyGemini || settings.keyKimi || settings.keyClaude || settings.keyGroq || settings.keyOpenRouter || settings.keyCerebras);
   }
   function inDemoMode() {
     return settings.demoMode || !hasAnyKey();
@@ -65,16 +69,26 @@
   }
   refreshDemoBadge();
 
-  // ---------- Understudy state (Groq filling Claude's seat) ----------
+  // Cerebras model choice (declared early — referenced by boot-time seat labels).
+  // Cerebras's free catalog churns — if calls 404, check cloud.cerebras.ai
+  // for the current list and swap these two strings.
+  const CEREBRAS_MODEL = "qwen-3-32b";
+  const CEREBRAS_MODEL_LABEL = "Qwen 3 32B";
+
+  // ---------- Understudy state (Groq filling Claude's seat, Cerebras filling Gemini's) ----------
   function groqUnderstudy() {
     return !settings.keyClaude && !!settings.keyGroq;
   }
-  const seatProvider = {}; // per-dispatch: name -> "primary" | "groq" | "openrouter"
+  function cerebrasUnderstudy() {
+    return !settings.keyGemini && !!settings.keyCerebras;
+  }
+  const seatProvider = {}; // per-dispatch: name -> "primary" | "groq" | "cerebras" | "openrouter"
 
   // Consensus weight hierarchy (founder decision 2026-07-12):
   // primaries carry full weight; free-tier voices keep the workflow
   // alive but must not outvote Gemini Pro / Kimi / Claude.
-  const SEAT_WEIGHTS = { primary: 1.0, groq: 0.75, openrouter: 0.5 };
+  // Cerebras joins at the dedicated-provider understudy tier (0.75), same as Groq.
+  const SEAT_WEIGHTS = { primary: 1.0, groq: 0.75, cerebras: 0.75, openrouter: 0.5 };
   function seatWeight(name) {
     return SEAT_WEIGHTS[seatProvider[name] || "primary"];
   }
@@ -85,10 +99,13 @@
       return `${cap} [fallback: OpenRouter ${m}]`;
     }
     if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
+    if (name === "gemini" && cerebrasUnderstudy()) return "Gemini [Cerebras understudy: " + CEREBRAS_MODEL_LABEL + "]";
     return cap;
   }
-  // Short occupant tags shown under a shadowed seat's name
-  const OR_SEAT_SHORT = { gemini: "llama", kimi: "gpt-oss", claude: "qwen" };
+  // Short occupant tags shown under a shadowed seat's name.
+  // Diversity note: claude's OR fallback moved off qwen (now deepseek) because
+  // qwen now occupies the Gemini seat via Cerebras — three seats, three families.
+  const OR_SEAT_SHORT = { gemini: "llama", kimi: "gpt-oss", claude: "deepseek" };
 
   function markSeat(name, occupant, tooltip) {
     const el = agents[name];
@@ -110,12 +127,16 @@
     } else {
       markSeat("claude", null);
     }
+    if (cerebrasUnderstudy()) {
+      markSeat("gemini", "cerebras", "Gemini seat — powered by Cerebras (" + CEREBRAS_MODEL_LABEL + ")");
+    } else {
+      markSeat("gemini", null);
+    }
   }
   refreshUnderstudyState();
 
   // reset all seats to configured state (start of each dispatch)
   function resetSeatVisuals() {
-    markSeat("gemini", null);
     markSeat("kimi", null);
     refreshUnderstudyState();
   }
@@ -127,66 +148,13 @@
       keyClaude: $("keyClaude").value.trim(),
       keyGroq: $("keyGroq").value.trim(),
       keyOpenRouter: $("keyOpenRouter").value.trim(),
+      keyCerebras: keyCerebrasEl ? keyCerebrasEl.value.trim() : (settings.keyCerebras || ""),
       demoMode: demoToggle.checked,
     };
     saveSettings(settings);
     refreshDemoBadge();
     refreshUnderstudyState();
 
-  // ---------- Understudy state (Groq filling Claude's seat) ----------
-  function groqUnderstudy() {
-    return !settings.keyClaude && !!settings.keyGroq;
-  }
-  const seatProvider = {}; // per-dispatch: name -> "primary" | "groq" | "openrouter"
-
-  // Consensus weight hierarchy (founder decision 2026-07-12):
-  // primaries carry full weight; free-tier voices keep the workflow
-  // alive but must not outvote Gemini Pro / Kimi / Claude.
-  const SEAT_WEIGHTS = { primary: 1.0, groq: 0.75, openrouter: 0.5 };
-  function seatWeight(name) {
-    return SEAT_WEIGHTS[seatProvider[name] || "primary"];
-  }
-  function seatLabel(name) {
-    const cap = name[0].toUpperCase() + name.slice(1);
-    if (seatProvider[name] === "openrouter") {
-      const m = (OR_SEAT_MODELS[name] || "").split("/").pop().replace(":free", "");
-      return `${cap} [fallback: OpenRouter ${m}]`;
-    }
-    if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
-    return cap;
-  }
-  // Short occupant tags shown under a shadowed seat's name
-  const OR_SEAT_SHORT = { gemini: "llama", kimi: "gpt-oss", claude: "qwen" };
-
-  function markSeat(name, occupant, tooltip) {
-    const el = agents[name];
-    const nameEl = el.querySelector(".agent-name");
-    if (occupant) {
-      el.classList.add("shadowed");
-      nameEl.dataset.occupant = occupant;
-      if (tooltip) el.title = tooltip;
-    } else {
-      el.classList.remove("shadowed");
-      delete nameEl.dataset.occupant;
-      el.removeAttribute("title");
-    }
-  }
-
-  function refreshUnderstudyState() {
-    if (groqUnderstudy()) {
-      markSeat("claude", "groq", "Claude seat — powered by Groq (Llama 3.3)");
-    } else {
-      markSeat("claude", null);
-    }
-  }
-  refreshUnderstudyState();
-
-  // reset all seats to configured state (start of each dispatch)
-  function resetSeatVisuals() {
-    markSeat("gemini", null);
-    markSeat("kimi", null);
-    refreshUnderstudyState();
-  }
     saveSettingsBtn.textContent = "Saved";
     setTimeout(() => (saveSettingsBtn.textContent = "Save settings"), 1200);
   });
@@ -461,15 +429,46 @@
     return data.choices?.[0]?.message?.content || "";
   }
 
+  // ---------- Cerebras (Gemini-seat understudy, free tier) ----------
+  // OpenAI-compatible endpoint on wafer-scale hardware. Free tier:
+  // ~30 req/min, ~1M tokens/day, no card. Qwen chosen for model-family
+  // diversity vs Groq's Llama (Claude seat) and gpt-oss (Kimi seat).
+  // Cerebras's free catalog churns — if this model 404s, check
+  // cloud.cerebras.ai for the current list and swap the string below.
+  async function callCerebras(query) {
+    const res = await fetchWithRetry("https://api.cerebras.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + settings.keyCerebras,
+      },
+      body: JSON.stringify({
+        model: CEREBRAS_MODEL,
+        messages: [{ role: "user", content: query }],
+        max_tokens: 300,
+      }),
+    }, "Cerebras");
+    if (res.status === 404) throw new Error(`Cerebras model ${CEREBRAS_MODEL} unavailable (404) — free catalog churned; swap CEREBRAS_MODEL for a current model from cloud.cerebras.ai`);
+    if (!res.ok) throw new Error(`Cerebras HTTP ${res.status}${res.status === 429 ? " — free-tier rate limit; circuit breaker will manage" : ""}`);
+    const data = await res.json();
+    let text = data.choices?.[0]?.message?.content || "";
+    // Qwen reasoning models may wrap chain-of-thought in <think> tags — strip
+    // it so only the final answer reaches consensus scoring.
+    text = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    return text;
+  }
+
   // Per-seat fallback diversity (Kimi amendment, 2026-07-12):
   // never let two seats share the same fallback model family, or
   // divergence detection degrades into an echo chamber.
   // If OpenRouter retires a :free model (HTTP 404), swap the string
   // for any other distinct free model family — keep all three different.
+  // claude's fallback moved qwen -> deepseek (2026-07-12, Claude amendment):
+  // qwen now occupies the Gemini seat via Cerebras understudy.
   const OR_SEAT_MODELS = {
     gemini: "meta-llama/llama-3.3-70b-instruct:free",
     kimi:   "openai/gpt-oss-20b:free",
-    claude: "qwen/qwen-2.5-72b-instruct:free",
+    claude: "deepseek/deepseek-chat-v3-0324:free",
   };
 
   let orQueue = Promise.resolve();
@@ -505,7 +504,11 @@
 
   async function runLiveCouncil(query) {
     const calls = [];
-    if (settings.keyGemini) calls.push({ name: "gemini", fn: callGemini });
+    if (settings.keyGemini) {
+      calls.push({ name: "gemini", fn: callGemini });
+    } else if (settings.keyCerebras) {
+      calls.push({ name: "gemini", fn: callCerebras }); // Cerebras understudies Gemini's seat (free tier)
+    }
     if (settings.keyKimi) calls.push({ name: "kimi", fn: callKimi });
     if (settings.keyClaude) {
       calls.push({ name: "claude", fn: callClaude });
@@ -514,7 +517,12 @@
     }
 
     // reset per-dispatch provider tracking
-    calls.forEach((c) => { seatProvider[c.name] = (c.name === "claude" && groqUnderstudy()) ? "groq" : "primary"; });
+    calls.forEach((c) => {
+      seatProvider[c.name] =
+        (c.name === "claude" && groqUnderstudy()) ? "groq" :
+        (c.name === "gemini" && cerebrasUnderstudy()) ? "cerebras" :
+        "primary";
+    });
 
     const orAvailable = !!settings.keyOpenRouter;
 
