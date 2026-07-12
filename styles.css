@@ -461,13 +461,13 @@ body::before {
   font-style: italic;
 }
 
-/* ---------- UNDERSTUDY STATE (Groq filling Claude's seat) ---------- */
-.agent.understudy .ring {
+/* ---------- SHADOWED SEAT (any non-primary occupant: understudy or fallback) ---------- */
+.agent.shadowed .ring {
   opacity: 0.5;
   border-style: dashed;
 }
-.agent.understudy .agent-name::after {
-  content: " \2022 groq";
+.agent.shadowed .agent-name::after {
+  content: " \2022 " attr(data-occupant);
   color: #555;
   text-transform: lowercase;
   letter-spacing: 0.05em;
