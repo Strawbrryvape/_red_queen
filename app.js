@@ -80,7 +80,10 @@
   }
   function seatLabel(name) {
     const cap = name[0].toUpperCase() + name.slice(1);
-    if (seatProvider[name] === "openrouter") return `${cap} [fallback: OpenRouter Llama 3.3]`;
+    if (seatProvider[name] === "openrouter") {
+      const m = (OR_SEAT_MODELS[name] || "").split("/").pop().replace(":free", "");
+      return `${cap} [fallback: OpenRouter ${m}]`;
+    }
     if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
     return cap;
   }
@@ -124,7 +127,10 @@
   }
   function seatLabel(name) {
     const cap = name[0].toUpperCase() + name.slice(1);
-    if (seatProvider[name] === "openrouter") return `${cap} [fallback: OpenRouter Llama 3.3]`;
+    if (seatProvider[name] === "openrouter") {
+      const m = (OR_SEAT_MODELS[name] || "").split("/").pop().replace(":free", "");
+      return `${cap} [fallback: OpenRouter ${m}]`;
+    }
     if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
     return cap;
   }
@@ -413,7 +419,19 @@
     return data.choices?.[0]?.message?.content || "";
   }
 
-  async function callOpenRouter(query) {
+  // Per-seat fallback diversity (Kimi amendment, 2026-07-12):
+  // never let two seats share the same fallback model family, or
+  // divergence detection degrades into an echo chamber.
+  // If OpenRouter retires a :free model (HTTP 404), swap the string
+  // for any other distinct free model family — keep all three different.
+  const OR_SEAT_MODELS = {
+    gemini: "meta-llama/llama-3.3-70b-instruct:free",
+    kimi:   "mistralai/mixtral-8x7b-instruct:free",
+    claude: "qwen/qwen-2.5-72b-instruct:free",
+  };
+
+  async function callOpenRouter(query, seatName) {
+    const model = OR_SEAT_MODELS[seatName] || OR_SEAT_MODELS.gemini;
     const res = await fetchWithRetry("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -421,11 +439,12 @@
         Authorization: "Bearer " + settings.keyOpenRouter,
       },
       body: JSON.stringify({
-        model: "meta-llama/llama-3.3-70b-instruct:free",
+        model: model,
         messages: [{ role: "user", content: query }],
         max_tokens: 300,
       }),
     }, "OpenRouter");
+    if (res.status === 404) throw new Error(`OpenRouter model ${model} unavailable (404) — swap OR_SEAT_MODELS entry for another free model family`);
     if (!res.ok) throw new Error(`OpenRouter HTTP ${res.status}`);
     const data = await res.json();
     return data.choices?.[0]?.message?.content || "";
@@ -456,7 +475,7 @@
           if (!orAvailable) throw new Error(`${cap} circuit open, no fallback available`);
           logError(`${cap} circuit open — seat routed to OpenRouter free tier.`);
           seatProvider[c.name] = "openrouter";
-          return callOpenRouter(q);
+          return callOpenRouter(q, c.name);
         }
         try {
           return await c.fn(q);
@@ -465,7 +484,7 @@
           if (!orAvailable) throw e;
           logError(`${seatLabel(c.name)} primary failed (${e.message || e}) — seat falling back to OpenRouter free tier.`);
           seatProvider[c.name] = "openrouter";
-          return callOpenRouter(q);
+          return callOpenRouter(q, c.name);
         }
       },
     }));
@@ -500,9 +519,12 @@
 
     const { agreed, outliers } = checkConsensus(answers);
 
-    const agreedWeight = agreed.reduce((s, a) => s + seatWeight(a.name), 0);
-    if (agreed.length >= 2 && agreedWeight < 1.5) {
-      logError(`Consensus is PROVISIONAL — agreeing voices are all reduced-weight (combined ${agreedWeight.toFixed(2)}). Treat as workflow continuity, not verified consensus.`);
+    // PROVISIONAL rule (Kimi amendment, 2026-07-12): consensus is verified
+    // if and only if at least one primary (1.0) voice is in the agreeing set.
+    // Any all-understudy/all-fallback agreement is workflow continuity, not verification.
+    const hasPrimaryVoice = agreed.some((a) => seatProvider[a.name] === "primary");
+    if (agreed.length >= 2 && !hasPrimaryVoice) {
+      logError("Consensus is PROVISIONAL — no primary voice (Gemini Pro / Kimi / Claude live) in the agreeing set. Treat as workflow continuity, not verified consensus.");
     }
     if (agreed.length < 2) {
       // No consensus — by design, Red Queen declines to force an answer
