@@ -189,6 +189,35 @@
     return demoConsensus(query);
   }
 
+  // ---------- Circuit breaker (per-agent) ----------
+  // After an agent exhausts retries on 429, its circuit "opens": we skip it
+  // entirely for a cooldown period instead of burning retries, routing queries
+  // to the remaining agents. It auto-closes after cooldown for a fresh attempt.
+  const circuits = {
+    gemini: { openUntil: 0, strikes: 0 },
+    kimi:   { openUntil: 0, strikes: 0 },
+    claude: { openUntil: 0, strikes: 0 },
+  };
+
+  function circuitOpen(name) {
+    return Date.now() < circuits[name].openUntil;
+  }
+
+  function tripCircuit(name, retryAfterMs) {
+    const c = circuits[name];
+    c.strikes = Math.min(c.strikes + 1, 4);
+    // cooldown: 60s, doubling per consecutive strike, cap 10 min; honor Retry-After if longer
+    const cooldown = Math.max(retryAfterMs || 0, 60000 * Math.pow(2, c.strikes - 1));
+    c.openUntil = Date.now() + Math.min(cooldown, 600000);
+    const label = name[0].toUpperCase() + name.slice(1);
+    logError(`${label} circuit OPEN — quota likely exhausted. Skipping for ${Math.round((c.openUntil - Date.now()) / 1000)}s, routing to remaining agents.`);
+  }
+
+  function resetCircuit(name) {
+    circuits[name].strikes = 0;
+    circuits[name].openUntil = 0;
+  }
+
   // ---------- Retry wrapper (handles HTTP 429 / transient failures) ----------
   async function fetchWithRetry(url, options, label, maxRetries = 3) {
     let attempt = 0;
@@ -198,6 +227,7 @@
       if (attempt >= maxRetries) return res;
       // honor Retry-After header if the API sends one; else exponential backoff + jitter
       const retryAfter = parseFloat(res.headers.get("Retry-After"));
+      fetchWithRetry.lastRetryAfterMs = !isNaN(retryAfter) ? retryAfter * 1000 : 0;
       const delay = !isNaN(retryAfter)
         ? retryAfter * 1000
         : Math.min(8000, 1000 * Math.pow(2, attempt)) + Math.random() * 400;
@@ -265,11 +295,58 @@
     return data.content?.map((b) => b.text || "").join("") || "";
   }
 
+  // ---------- Divergence detection (no-consensus, by design) ----------
+  // Mirrors the backend consensus engine's philosophy: if the agents' answers
+  // don't sufficiently agree, Red Queen says so rather than forcing an answer.
+  const STOPWORDS = new Set("a an and are as at be but by for from has have i if in is it its of on or that the this to was we what which will with you your".split(" "));
+
+  function tokenize(text) {
+    return new Set(
+      text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/)
+        .filter((w) => w.length > 2 && !STOPWORDS.has(w))
+    );
+  }
+
+  function similarity(a, b) {
+    const A = tokenize(a), B = tokenize(b);
+    if (A.size === 0 || B.size === 0) return 0;
+    let inter = 0;
+    A.forEach((w) => { if (B.has(w)) inter++; });
+    return inter / (A.size + B.size - inter); // Jaccard index
+  }
+
+  const AGREEMENT_THRESHOLD = 0.22; // lexical agreement floor (frontend approximation of backend's 0.7 cosine)
+
+  function checkConsensus(answers) {
+    // each answer must agree with at least one other above threshold
+    if (answers.length < 2) return { agreed: answers, outliers: [] };
+    const agreed = [], outliers = [];
+    answers.forEach((a, i) => {
+      const hasAlly = answers.some((b, j) => i !== j && similarity(a.text, b.text) >= AGREEMENT_THRESHOLD);
+      (hasAlly ? agreed : outliers).push(a);
+    });
+    return { agreed, outliers };
+  }
+
   async function runLiveCouncil(query) {
     const calls = [];
     if (settings.keyGemini) calls.push({ name: "gemini", fn: callGemini });
     if (settings.keyKimi) calls.push({ name: "kimi", fn: callKimi });
     if (settings.keyClaude) calls.push({ name: "claude", fn: callClaude });
+
+    // circuit breaker: skip agents whose quota circuit is open
+    const skipped = calls.filter((c) => circuitOpen(c.name));
+    skipped.forEach((c) => {
+      const secs = Math.round((circuits[c.name].openUntil - Date.now()) / 1000);
+      logError(`${c.name[0].toUpperCase() + c.name.slice(1)} skipped — circuit open for ${secs}s more.`);
+    });
+    const active = calls.filter((c) => !circuitOpen(c.name));
+    if (active.length === 0) {
+      logError("All agent circuits open — quotas exhausted. Falling back to demo until cooldowns expire.");
+      return null;
+    }
+    calls.length = 0;
+    calls.push(...active);
 
     calls.forEach((c) => agents[c.name].classList.add("thinking"));
 
@@ -284,20 +361,36 @@
       const name = calls[i].name;
       if (r.status === "fulfilled" && r.value) {
         answers.push({ name, text: r.value });
+        resetCircuit(name);
       } else {
-        logError(`${name[0].toUpperCase() + name.slice(1)} failed: ${r.reason?.message || "unknown error"}`);
+        const msg = r.reason?.message || "unknown error";
+        logError(`${name[0].toUpperCase() + name.slice(1)} failed: ${msg}`);
+        if (msg.includes("429")) tripCircuit(name, fetchWithRetry.lastRetryAfterMs);
       }
       agents[name].classList.remove("thinking");
     });
 
     if (answers.length === 0) return null; // triggers demo fallback
 
-    if (answers.length === 1) return answers[0].text.trim();
+    if (answers.length === 1) return { text: answers[0].text.trim(), divided: false, answers };
 
-    // simple client-side synthesis: shortest coherent answer wins,
-    // prefixed with which agents agreed
-    answers.sort((a, b) => a.text.length - b.text.length);
-    return answers[0].text.trim();
+    const { agreed, outliers } = checkConsensus(answers);
+
+    if (agreed.length < 2) {
+      // No consensus — by design, Red Queen declines to force an answer
+      logError(`Consensus round FAILED by design — ${answers.length} agents, 0 agreements above threshold. Individual positions logged to Session History.`);
+      return { text: null, divided: true, answers };
+    }
+
+    if (outliers.length > 0) {
+      outliers.forEach((o) =>
+        logError(`${o.name[0].toUpperCase() + o.name.slice(1)} excluded as outlier — position diverged from majority.`)
+      );
+    }
+
+    // synthesis among agreeing agents: shortest coherent answer wins
+    agreed.sort((a, b) => a.text.length - b.text.length);
+    return { text: agreed[0].text.trim(), divided: false, answers };
   }
 
   // ---------- Dispatch ----------
@@ -314,31 +407,59 @@
     consensusText.style.color = "#888";
 
     let answer = null;
+    let divided = false;
+    let allAnswers = [];
 
     if (!inDemoMode()) {
+      let result = null;
       try {
-        answer = await runLiveCouncil(query);
+        result = await runLiveCouncil(query);
       } catch (e) {
         logError("Council dispatch failed: " + (e.message || e));
       }
-      if (answer === null) {
+      if (result === null) {
         logError("All live agents failed — falling back to demo simulation.");
         demoBadge.classList.remove("hidden");
         answer = await runDemoCouncil(query);
+      } else {
+        divided = result.divided;
+        answer = result.text;
+        allAnswers = result.answers || [];
       }
     } else {
-      answer = await runDemoCouncil(query);
+      // demo showcase: queries mentioning "divided"/"controversial" demo the no-consensus state
+      if (/divided|controversial|disagree/.test(query.toLowerCase())) {
+        await runDemoCouncil(query);
+        divided = true;
+        allAnswers = [
+          { name: "gemini", text: "Position A — prioritize scale and reach first." },
+          { name: "kimi", text: "Position B — architecture integrity outweighs speed." },
+          { name: "claude", text: "Position C — neither is decidable without success criteria." },
+        ];
+      } else {
+        answer = await runDemoCouncil(query);
+      }
     }
 
     setThinking(false);
-    flashConsensus();
-
     consensusBar.classList.remove("loading");
     consensusText.style.fontStyle = "normal";
     consensusText.style.color = "";
-    consensusText.textContent = answer;
+    consensusBar.classList.remove("divided");
 
-    logHistory(query, answer);
+    if (divided) {
+      // No white flash — the Council did not converge. Amber state instead.
+      consensusBar.classList.add("divided");
+      consensusText.textContent = "The Council is divided — no consensus reached.";
+      allAnswers.forEach((a) =>
+        logHistory(`${a.name[0].toUpperCase() + a.name.slice(1)} position (${query})`, a.text)
+      );
+      logHistory(query, "NO CONSENSUS — Council divided by design. Individual positions above.");
+    } else {
+      flashConsensus();
+      consensusText.textContent = answer;
+      logHistory(query, answer);
+    }
     busy = false;
   }
 

@@ -450,3 +450,13 @@ body::before {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ---------- DIVIDED STATE (no consensus, by design) ---------- */
+.consensus-bar.divided {
+  border-color: var(--gold);
+  background: rgba(255, 215, 0, 0.07);
+}
+.consensus-bar.divided span {
+  color: var(--gold);
+  font-style: italic;
+}
