@@ -103,17 +103,13 @@
   function seatLabel(name) {
     const cap = name[0].toUpperCase() + name.slice(1);
     if (seatProvider[name] === "openrouter") {
-      const m = (OR_SEAT_MODELS[name] || "").split("/").pop().replace(":free", "");
+      const m = ((orActiveModel[name] || (OR_SEAT_MODELS[name] || [])[0]) || "").split("/").pop().replace(":free", "");
       return `${cap} [fallback: OpenRouter ${m}]`;
     }
     if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
     if (name === "gemini" && (seatProvider[name] === "cerebras" || cerebrasUnderstudy())) return "Gemini [Cerebras: " + CEREBRAS_MODEL_LABEL + "]";
     return cap;
   }
-  // Short occupant tags shown under a shadowed seat's name.
-  // Diversity note: claude's OR fallback moved off qwen (now deepseek) because
-  // qwen now occupies the Gemini seat via Cerebras — three seats, three families.
-  const OR_SEAT_SHORT = { gemini: "llama", kimi: "qwen", claude: "deepseek" };
 
   function markSeat(name, occupant, tooltip) {
     const el = agents[name];
@@ -502,15 +498,34 @@
   // Per-seat fallback diversity (Kimi amendment, 2026-07-12):
   // never let two seats share the same fallback model family, or
   // divergence detection degrades into an echo chamber.
-  // If OpenRouter retires a :free model (HTTP 404), swap the string
-  // for any other distinct free model family — keep all three different.
-  // claude's fallback moved qwen -> deepseek (2026-07-12, Claude amendment):
-  // qwen now occupies the Gemini seat via Cerebras understudy.
+  //
+  // v2.5 (Gemini memo + Claude amendments, 2026-07-13): each seat's
+  // OpenRouter fallback is now a LIST, walked in order on failure — the
+  // free catalog killed three of our hardcoded models in 24 hours
+  // (qwen-3-32b on Cerebras, qwen-2.5-72b and likely deepseek on OR).
+  // Roster verified against OpenRouter's live free catalog, July 2026.
+  // Placement rationale:
+  //  - gpt-oss family: two anchor failures on record (20b, 2026-07-12/13),
+  //    so the 120b sits at the DEEPEST slot despite Gemini's memo ranking
+  //    it first. Evidence beats endorsement.
+  //  - nemotron-3-super: hybrid Mamba-Transformer MoE — most
+  //    architecturally distinct voice vs dense Llama; anchors Claude's seat.
+  //  - gemma-4-31b: highest quality score in the free catalog. SOFT
+  //    COLLISION FLAG for Kimi's ruling: Gemma is Google, and can co-occur
+  //    with a healthy Gemini primary. Different architecture and training
+  //    lineage, but same lab.
+  //  - llama-3.3-70b removed from Gemini's seat: it duplicated Groq's
+  //    understudy on Claude's seat (pre-existing collision, now fixed).
   const OR_SEAT_MODELS = {
-    gemini: "meta-llama/llama-3.3-70b-instruct:free",
-    kimi:   "qwen/qwen-2.5-72b-instruct:free", // was gpt-oss-20b: ignored/truncated the anchor in 2 consecutive live runs
-    claude: "deepseek/deepseek-chat-v3-0324:free",
+    gemini: ["openai/gpt-oss-120b:free"],
+    kimi:   ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free"],
+    claude: ["nvidia/nemotron-3-super-120b-a12b:free", "google/gemma-4-31b-it:free"],
   };
+  const orActiveModel = {}; // seat -> slug currently answering (labels/visuals)
+
+  function orShort(slug) {
+    return (slug || "").split("/").pop().replace(":free", "").split("-")[0];
+  }
 
   let orQueue = Promise.resolve();
   function serializeOR(fn) {
@@ -520,11 +535,31 @@
   }
 
   async function callOpenRouter(query, seatName) {
-    return serializeOR(() => callOpenRouterNow(query, seatName));
+    return serializeOR(() => callOpenRouterWalk(query, seatName));
   }
 
-  async function callOpenRouterNow(query, seatName) {
-    const model = OR_SEAT_MODELS[seatName] || OR_SEAT_MODELS.gemini;
+  // Walk the seat's model list until one answers (v2.5). Every hop is
+  // logged — silence is never an option.
+  async function callOpenRouterWalk(query, seatName) {
+    const list = OR_SEAT_MODELS[seatName] || OR_SEAT_MODELS.gemini;
+    let lastErr = null;
+    for (let i = 0; i < list.length; i++) {
+      const model = list[i];
+      orActiveModel[seatName] = model;
+      markSeat(seatName, orShort(model), `${seatName} seat — fallback: ${model}`);
+      try {
+        return await callOpenRouterModel(query, model);
+      } catch (e) {
+        lastErr = e;
+        if (list[i + 1]) {
+          logError(`OpenRouter ${model} failed (${e.message || e}) — walking to ${list[i + 1]}.`);
+        }
+      }
+    }
+    throw lastErr || new Error("OpenRouter: no models configured for seat " + seatName);
+  }
+
+  async function callOpenRouterModel(query, model) {
     const res = await fetchWithRetry("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -609,7 +644,7 @@
             run: (qq) => callOpenRouter(qq, c.name),
             enter: () => {
               seatProvider[c.name] = "openrouter";
-              markSeat(c.name, OR_SEAT_SHORT[c.name], `${cap} seat — fallback: ${OR_SEAT_MODELS[c.name]}`);
+              // visual marking happens per-model inside the OR walk
             },
           });
         }
