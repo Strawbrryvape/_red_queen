@@ -107,7 +107,7 @@
       return `${cap} [fallback: OpenRouter ${m}]`;
     }
     if (name === "claude" && groqUnderstudy()) return "Claude [Groq understudy: Llama 3.3]";
-    if (name === "gemini" && cerebrasUnderstudy()) return "Gemini [Cerebras understudy: " + CEREBRAS_MODEL_LABEL + "]";
+    if (name === "gemini" && (seatProvider[name] === "cerebras" || cerebrasUnderstudy())) return "Gemini [Cerebras: " + CEREBRAS_MODEL_LABEL + "]";
     return cap;
   }
   // Short occupant tags shown under a shadowed seat's name.
@@ -540,7 +540,13 @@
     if (res.status === 404) throw new Error(`OpenRouter model ${model} unavailable (404) — swap OR_SEAT_MODELS entry for another free model family`);
     if (!res.ok) throw new Error(`OpenRouter HTTP ${res.status}`);
     const data = await res.json();
-    return data.choices?.[0]?.message?.content || "";
+    // OpenRouter free models sometimes return HTTP 200 with an error body or
+    // empty content (observed live 2026-07-12 as "unknown error"). Surface
+    // the real reason instead of failing silently downstream.
+    if (data.error) throw new Error(`OpenRouter ${model}: ${data.error.message || JSON.stringify(data.error)}`);
+    const content = data.choices?.[0]?.message?.content || "";
+    if (!content.trim()) throw new Error(`OpenRouter ${model} returned an empty answer (HTTP 200, no content)`);
+    return content;
   }
 
   async function runLiveCouncil(query) {
@@ -567,29 +573,69 @@
 
     const orAvailable = !!settings.keyOpenRouter;
 
-    // wrap each seat: primary -> OpenRouter fallback on failure.
-    // circuit-open seats route straight to fallback instead of being skipped.
+    // ---------- Failover chains (v2.4) ----------
+    // Each seat walks a chain until one provider answers:
+    //   Gemini seat: Gemini primary -> Cerebras -> OpenRouter
+    //   Claude seat: Claude primary (or Groq understudy) -> OpenRouter
+    //   Kimi seat:   Kimi primary -> OpenRouter
+    // Circuit-open seats skip their PRIMARY only — fallback providers have
+    // independent quotas and still get their shot. The circuit trips only on
+    // the seat's configured primary, never on a fallback's 429.
     const wrapped = calls.map((c) => ({
       name: c.name,
       fn: async (q) => {
         const cap = c.name[0].toUpperCase() + c.name.slice(1);
-        if (circuitOpen(c.name)) {
-          if (!orAvailable) throw new Error(`${cap} circuit open, no fallback available`);
-          logError(`${cap} circuit open — seat routed to OpenRouter free tier.`);
-          seatProvider[c.name] = "openrouter";
-          markSeat(c.name, OR_SEAT_SHORT[c.name], `${cap} seat — fallback: ${OR_SEAT_MODELS[c.name]}`);
-          return callOpenRouter(q, c.name);
+        const primaryTag = seatProvider[c.name]; // configured occupant at dispatch start
+
+        const chain = [];
+        if (!circuitOpen(c.name)) {
+          chain.push({ tag: primaryTag, run: c.fn, enter: null });
         }
-        try {
-          return await c.fn(q);
-        } catch (e) {
-          if ((e.message || "").includes("429")) tripCircuit(c.name, fetchWithRetry.lastRetryAfterMs);
-          if (!orAvailable) throw e;
-          logError(`${seatLabel(c.name)} primary failed (${e.message || e}) — seat falling back to OpenRouter free tier.`);
-          seatProvider[c.name] = "openrouter";
-          markSeat(c.name, OR_SEAT_SHORT[c.name], `${cap} seat — fallback: ${OR_SEAT_MODELS[c.name]}`);
-          return callOpenRouter(q, c.name);
+        // Cerebras as mid-chain failover for the Gemini seat (only when a
+        // real Gemini key holds the seat — otherwise Cerebras IS the primary)
+        if (c.name === "gemini" && settings.keyGemini && settings.keyCerebras) {
+          chain.push({
+            tag: "cerebras",
+            run: callCerebras,
+            enter: () => {
+              seatProvider[c.name] = "cerebras";
+              markSeat("gemini", "cerebras", "Gemini seat — failover: Cerebras (" + CEREBRAS_MODEL_LABEL + ")");
+            },
+          });
         }
+        if (orAvailable) {
+          chain.push({
+            tag: "openrouter",
+            run: (qq) => callOpenRouter(qq, c.name),
+            enter: () => {
+              seatProvider[c.name] = "openrouter";
+              markSeat(c.name, OR_SEAT_SHORT[c.name], `${cap} seat — fallback: ${OR_SEAT_MODELS[c.name]}`);
+            },
+          });
+        }
+
+        if (chain.length === 0) throw new Error(`${cap} circuit open, no fallback available`);
+        if (circuitOpen(c.name)) logError(`${cap} circuit open — primary skipped, seat routed to ${chain[0].tag} fallback.`);
+
+        let lastErr = null;
+        for (let i = 0; i < chain.length; i++) {
+          const step = chain[i];
+          if (step.enter) step.enter();
+          try {
+            return await step.run(q);
+          } catch (e) {
+            lastErr = e;
+            // only the configured primary's 429 trips the seat circuit
+            if (step.tag === primaryTag && (e.message || "").includes("429")) {
+              tripCircuit(c.name, fetchWithRetry.lastRetryAfterMs);
+            }
+            const next = chain[i + 1];
+            if (next) {
+              logError(`${seatLabel(c.name)} ${step.tag} failed (${e.message || e}) — seat falling to ${next.tag}.`);
+            }
+          }
+        }
+        throw lastErr || new Error(`${cap} — all providers in chain failed`);
       },
     }));
     if (wrapped.length === 0) return null;
@@ -638,7 +684,10 @@
       }
     }
 
-    if (eligible.length === 1) return { text: eligible[0].text.trim(), divided: false, answers: eligible };
+    if (eligible.length === 1) {
+      logError(`SOLE VOICE round — only one eligible answer (${seatLabel(eligible[0].name)}). No cross-model verification occurred; treat as a single model's opinion, not Council consensus.`);
+      return { text: eligible[0].text.trim(), divided: false, answers: eligible, trust: "sole" };
+    }
 
     const { agreed, outliers } = checkConsensus(eligible);
 
@@ -654,7 +703,6 @@
       logError(`Consensus round FAILED by design — ${eligible.length} eligible agents, 0 agreements above threshold. Individual positions logged to Session History.`);
       return { text: null, divided: true, answers };
     }
-
     if (outliers.length > 0) {
       outliers.forEach((o) =>
         logError(`${seatLabel(o.name)} excluded as outlier — position diverged from majority.`)
@@ -666,7 +714,14 @@
     agreed.sort((a, b) => (seatWeight(b.name) - seatWeight(a.name)) || (a.text.length - b.text.length));
     const speaker = agreed[0];
     logError(`Consensus synthesized — speaking voice: ${seatLabel(speaker.name)} (weight ${seatWeight(speaker.name)}), ${agreed.length}/${eligible.length} eligible agents in agreement.`);
-    return { text: speaker.text.trim(), divided: false, answers };
+    return {
+      text: speaker.text.trim(),
+      divided: false,
+      answers,
+      trust: hasPrimaryVoice ? "verified" : "provisional",
+      agreedCount: agreed.length,
+      eligibleCount: eligible.length,
+    };
   }
 
   // ---------- Dispatch ----------
@@ -686,6 +741,7 @@
     let answer = null;
     let divided = false;
     let allAnswers = [];
+    let trustPrefix = "";
 
     if (!inDemoMode()) {
       let result = null;
@@ -702,6 +758,16 @@
         divided = result.divided;
         answer = result.text;
         allAnswers = result.answers || [];
+        // Trust-state prefix (v2.4): the bar itself carries the verification
+        // level — a sole understudy's opinion must never wear the Council's
+        // crown unmarked. "Always check the error logs" — founder, 2026-07-12.
+        if (result.trust === "sole") {
+          trustPrefix = "⚠ SOLE VOICE (unverified) — ";
+        } else if (result.trust === "provisional") {
+          trustPrefix = `◐ PROVISIONAL ${result.agreedCount}/${result.eligibleCount} — `;
+        } else if (result.trust === "verified") {
+          trustPrefix = `✓ VERIFIED ${result.agreedCount}/${result.eligibleCount} — `;
+        }
       }
     } else {
       // demo showcase: queries mentioning "divided"/"controversial" demo the no-consensus state
@@ -734,7 +800,7 @@
       logHistory(query, "NO CONSENSUS — Council divided by design. Individual positions above.");
     } else {
       flashConsensus();
-      consensusText.textContent = answer;
+      consensusText.textContent = trustPrefix + answer;
       logHistory(query, answer);
     }
     busy = false;
