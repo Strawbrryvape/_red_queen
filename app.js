@@ -72,8 +72,8 @@
   // Cerebras model choice (declared early — referenced by boot-time seat labels).
   // Cerebras's free catalog churns — if calls 404, check cloud.cerebras.ai
   // for the current list and swap these two strings.
-  const CEREBRAS_MODEL = "qwen-3-32b";
-  const CEREBRAS_MODEL_LABEL = "Qwen 3 32B";
+  const CEREBRAS_MODEL = "zai-glm-4.7";
+  const CEREBRAS_MODEL_LABEL = "GLM 4.7";
 
   // Shared per-agent output budget. 300 proved too small in live testing
   // (2026-07-12): agents asked for reasoning + a FINAL DIRECTIVE got cut off
@@ -113,7 +113,7 @@
   // Short occupant tags shown under a shadowed seat's name.
   // Diversity note: claude's OR fallback moved off qwen (now deepseek) because
   // qwen now occupies the Gemini seat via Cerebras — three seats, three families.
-  const OR_SEAT_SHORT = { gemini: "llama", kimi: "gpt-oss", claude: "deepseek" };
+  const OR_SEAT_SHORT = { gemini: "llama", kimi: "qwen", claude: "deepseek" };
 
   function markSeat(name, occupant, tooltip) {
     const el = agents[name];
@@ -473,7 +473,7 @@
   // ---------- Cerebras (Gemini-seat understudy, free tier) ----------
   // OpenAI-compatible endpoint on wafer-scale hardware. Free tier:
   // ~30 req/min, ~1M tokens/day, no card. Qwen chosen for model-family
-  // diversity vs Groq's Llama (Claude seat) and gpt-oss (Kimi seat).
+  // diversity vs Groq's Llama (Claude seat) and Qwen (Kimi OR fallback).
   // Cerebras's free catalog churns — if this model 404s, check
   // cloud.cerebras.ai for the current list and swap the string below.
   async function callCerebras(query) {
@@ -508,7 +508,7 @@
   // qwen now occupies the Gemini seat via Cerebras understudy.
   const OR_SEAT_MODELS = {
     gemini: "meta-llama/llama-3.3-70b-instruct:free",
-    kimi:   "openai/gpt-oss-20b:free",
+    kimi:   "qwen/qwen-2.5-72b-instruct:free", // was gpt-oss-20b: ignored/truncated the anchor in 2 consecutive live runs
     claude: "deepseek/deepseek-chat-v3-0324:free",
   };
 
