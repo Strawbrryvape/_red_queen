@@ -422,9 +422,33 @@
   // If either lacks it (free-form answer, or truncated pre-anchor), fall
   // back to full-text comparison as before.
   const DIRECTIVE_ANCHOR = /FINAL DIRECTIVE:\s*([\s\S]+)/i;
+  // v2.7.1 (2026-07-13, FLAGGED FOR KIMI REVIEW): two hardenings after a
+  // live failure the same night. Nemotron QUOTED the instruction ("ending
+  // with 'FINAL DIRECTIVE:'...") inside leaked chain-of-thought, then
+  // truncated before any real verdict. The greedy first-match regex
+  // captured 1000 tokens of deliberation as its "directive" — dodging the
+  // MALFORMED bench and poisoning consensus math. Fixes:
+  //  1. Scan anchors LAST-to-first: a real verdict is always the final
+  //     anchor; instruction restating happens up top, and reasoning
+  //     models restate constantly.
+  //  2. Skip anchors wrapped in quote characters — a quoted anchor is a
+  //     model reading the rules aloud, not ruling. Nemotron's only
+  //     anchor was quoted; under this fix it correctly benches MALFORMED.
   function extractDirective(text) {
-    const m = text.match(DIRECTIVE_ANCHOR);
-    return m ? m[1].trim() : null;
+    const ANCHOR = "FINAL DIRECTIVE:";
+    const QUOTES = "\"'\u201C\u201D\u2018\u2019`";
+    const upper = text.toUpperCase();
+    let idx = upper.lastIndexOf(ANCHOR);
+    while (idx !== -1) {
+      const prevChar = idx > 0 ? text[idx - 1] : "";
+      const after = text.slice(idx + ANCHOR.length);
+      const firstChar = (after.match(/\S/) || [""])[0];
+      const quoted = QUOTES.includes(prevChar) || QUOTES.includes(firstChar);
+      const verdict = after.trim();
+      if (!quoted && verdict) return verdict;
+      idx = upper.lastIndexOf(ANCHOR, idx - 1);
+    }
+    return null; // no unquoted anchor with content = no verdict
   }
 
   function pairSimilarity(a, b) {
@@ -498,7 +522,12 @@
     let text = data.choices?.[0]?.message?.content || "";
     // Reasoning models (GLM, Qwen) may wrap chain-of-thought in <think>
     // tags — strip it so only the final answer reaches consensus scoring.
-    text = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    // v2.7.1: truncation-safe — an unclosed <think> (cut off mid-thought)
+    // is also dropped; leaked deliberation is never a verdict.
+    text = text.replace(/<think>[\s\S]*?<\/think>/g, "");
+    const openThink = text.lastIndexOf("<think>");
+    if (openThink !== -1) text = text.slice(0, openThink);
+    text = text.trim();
     return text;
   }
 
@@ -620,7 +649,18 @@
     if (data.error) throw new Error(`OpenRouter ${model}: ${data.error.message || JSON.stringify(data.error)}`);
     const content = data.choices?.[0]?.message?.content || "";
     if (!content.trim()) throw new Error(`OpenRouter ${model} returned an empty answer (HTTP 200, no content)`);
-    return content;
+    // v2.7.1: strip <think> reasoning blocks — parity with the Cerebras
+    // path. Live failure 2026-07-13: Nemotron (a reasoning model) flooded
+    // its visible answer with chain-of-thought on the OR path because only
+    // the Cerebras path had this filter. Truncation-safe: if the model was
+    // cut off mid-<think> (no closing tag), also drop from the last
+    // unclosed <think> to end — leaked deliberation is never a verdict.
+    let cleaned = content.replace(/<think>[\s\S]*?<\/think>/g, "");
+    const openThink = cleaned.lastIndexOf("<think>");
+    if (openThink !== -1) cleaned = cleaned.slice(0, openThink);
+    cleaned = cleaned.trim();
+    if (!cleaned) throw new Error(`OpenRouter ${model} returned only reasoning, no final answer (likely truncated mid-thought)`);
+    return cleaned;
   }
 
   async function runLiveCouncil(query) {
