@@ -889,12 +889,19 @@
         // Trust-state prefix (v2.4): the bar itself carries the verification
         // level — a sole understudy's opinion must never wear the Council's
         // crown unmarked. "Always check the error logs" — founder, 2026-07-12.
+        // Persona preambles (Gemini request 2026-07-13, Fable amendment):
+        // the Red Queen speaks as a casual referee, not an error handler.
+        // AMENDMENT: Gemini's "everyone's on the same page" line is only
+        // TRUE for verified consensus — sole/provisional states get honest
+        // variants so persona warmth never contradicts the trust doctrine.
+        // Trust prefix stays FIRST: the bar carries the verification level
+        // up front ("always check the error logs" — founder, 2026-07-12).
         if (result.trust === "sole") {
-          trustPrefix = "⚠ SOLE VOICE (unverified) — ";
+          trustPrefix = "⚠ SOLE VOICE (unverified) — Only one voice answered, so this is a single model's opinion, not a council verdict: ";
         } else if (result.trust === "provisional") {
-          trustPrefix = `◐ PROVISIONAL ${result.agreedCount}/${result.eligibleCount} — `;
+          trustPrefix = `◐ PROVISIONAL ${result.agreedCount}/${result.eligibleCount} — The bench agrees, but no primary voice has verified this yet: `;
         } else if (result.trust === "verified") {
-          trustPrefix = `✓ VERIFIED ${result.agreedCount}/${result.eligibleCount} — `;
+          trustPrefix = `✓ VERIFIED ${result.agreedCount}/${result.eligibleCount} — Everyone's on the same page for this one. Here is the council's unified answer: `;
         }
       }
     } else {
@@ -921,7 +928,8 @@
     if (divided) {
       // No white flash — the Council did not converge. Amber state instead.
       consensusBar.classList.add("divided");
-      consensusText.textContent = "The Council is divided — no consensus reached. Positions below.";
+      // Persona line (Gemini request 2026-07-13) — referee voice on a split.
+      consensusText.textContent = "We have a split decision. They all took this in slightly different directions, so I'm stepping back to let you read their raw responses.";
       renderDividedPanel(allAnswers);
       allAnswers.forEach((a) =>
         logHistory(`${seatLabel(a.name)} position (${query})`, a.text)
