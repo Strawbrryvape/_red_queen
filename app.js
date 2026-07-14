@@ -740,6 +740,17 @@
       name: c.name,
       fn: async (q) => {
         const cap = c.name[0].toUpperCase() + c.name.slice(1);
+        // v2.9.1: per-seat identity. The shared memory block carries a
+        // {{SEAT_IDENTITY}} token; each seat receives its own name here.
+        // Live failure 2026-07-14: without this, all three seats saw the
+        // roster format in memory and answered AS THE WHOLE COUNCIL —
+        // nine impersonated voices from three models, tripled output,
+        // renewed truncation. Examples beat instructions; identity must
+        // be explicit and singular.
+        q = q.replace("{{SEAT_IDENTITY}}",
+          `YOUR IDENTITY: You are the ${cap} seat of this council — one seat only. ` +
+          `The other seats deliberate separately and answer for themselves. ` +
+          `Write YOUR position only. Never simulate, quote, or draft responses for other seats.`);
         const primaryTag = seatProvider[c.name]; // configured occupant at dispatch start
 
         const chain = [];
@@ -1047,7 +1058,9 @@
     "only agreement, unconfirmed; SOLE VOICE = one model's unverified opinion; " +
     "DIVIDED = no consensus was reached and the positions are listed. Past " +
     "SOLE VOICE or DIVIDED rounds are NOT settled conclusions. Use this memory " +
-    "to answer follow-ups; do not restate it unless asked.\n";
+    "to answer follow-ups; do not restate it unless asked.\n" +
+    "{{SEAT_IDENTITY}}\n" +
+    "Respond in the language of the CURRENT QUESTION.\n";
 
   // Build the injected context: newest rounds verbatim, older rounds
   // compacted, assembled newest-backwards under the hard char cap, then
