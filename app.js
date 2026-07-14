@@ -468,8 +468,13 @@
 
   // ---------- Cerebras (Gemini-seat understudy, free tier) ----------
   // OpenAI-compatible endpoint on wafer-scale hardware. Free tier:
-  // ~30 req/min, ~1M tokens/day, no card. Qwen chosen for model-family
-  // diversity vs Groq's Llama (Claude seat) and Qwen (Kimi OR fallback).
+  // ~30 req/min, ~1M tokens/day, no card. GLM 4.7 (Z.ai) chosen for
+  // model-family diversity vs Groq's Llama (Claude seat) and the
+  // Gemma/Nemotron/gpt-oss OpenRouter fallbacks. PROMOTED to active
+  // shadow council duty per Kimi ruling 2026-07-13: passed audition under
+  // live 429-cascade conditions (anchor held, identity injection rejected,
+  // true origins asserted). 10-dispatch battery deferred to regression
+  // baseline — not a deployment gate.
   // Cerebras's free catalog churns — if this model 404s, check
   // cloud.cerebras.ai for the current list and swap the string below.
   async function callCerebras(query) {
@@ -489,8 +494,8 @@
     if (!res.ok) throw new Error(`Cerebras HTTP ${res.status}${res.status === 429 ? " — free-tier rate limit; circuit breaker will manage" : ""}`);
     const data = await res.json();
     let text = data.choices?.[0]?.message?.content || "";
-    // Qwen reasoning models may wrap chain-of-thought in <think> tags — strip
-    // it so only the final answer reaches consensus scoring.
+    // Reasoning models (GLM, Qwen) may wrap chain-of-thought in <think>
+    // tags — strip it so only the final answer reaches consensus scoring.
     text = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
     return text;
   }
@@ -511,9 +516,11 @@
   //  - nemotron-3-super: hybrid Mamba-Transformer MoE — most
   //    architecturally distinct voice vs dense Llama; anchors Claude's seat.
   //  - gemma-4-31b: highest quality score in the free catalog. SOFT
-  //    COLLISION FLAG for Kimi's ruling: Gemma is Google, and can co-occur
-  //    with a healthy Gemini primary. Different architecture and training
-  //    lineage, but same lab.
+  //    COLLISION FLAG — Kimi ruling 2026-07-13: same-lab (Google) but
+  //    distinct architecture satisfies the letter of the diversity rule.
+  //    NOT a blocker. MONITOR for correlated failures or shared bias
+  //    patterns with a live Gemini primary; escalate to hard eviction
+  //    only on observed evidence.
   //  - llama-3.3-70b removed from Gemini's seat: it duplicated Groq's
   //    understudy on Claude's seat (pre-existing collision, now fixed).
   const OR_SEAT_MODELS = {
@@ -606,6 +613,10 @@
         "primary";
     });
 
+    // Snapshot the configured occupant per seat BEFORE the failover chain
+    // mutates seatProvider — needed to gate circuit resets correctly below.
+    const configuredTag = Object.assign({}, seatProvider);
+
     const orAvailable = !!settings.keyOpenRouter;
 
     // ---------- Failover chains (v2.4) ----------
@@ -690,7 +701,13 @@
       const name = calls[i].name;
       if (r.status === "fulfilled" && r.value) {
         answers.push({ name, text: r.value });
-        resetCircuit(name);
+        // Circuit reset fix (2026-07-13, KIMI-RATIFIED same day): only a
+        // healthy PRIMARY closes its own circuit — "a fallback rescue is
+        // evidence the fallback is healthy, not the primary." Previously a fallback
+        // rescue also reset the breaker, so the next dispatch re-burned
+        // retries on a still-rate-limited primary — the cooldown never held
+        // past one round.
+        if (seatProvider[name] === configuredTag[name]) resetCircuit(name);
       } else {
         const msg = r.reason?.message || "unknown error";
         logError(`${seatLabel(name)} failed: ${msg}`);
@@ -710,9 +727,12 @@
     let eligible = answers;
     if (wantsDirective) {
       eligible = answers.filter((a) => extractDirective(a.text));
-      answers.filter((a) => !extractDirective(a.text)).forEach((m) =>
+      answers.filter((a) => !extractDirective(a.text)).forEach((m) => {
+        // Kimi amendment (2026-07-13): tag for the Divided Council panel —
+        // malformed seats render dimmed with a MALFORMED badge, never hidden.
+        m.malformed = true;
         logError(`${seatLabel(m.name)} MALFORMED_RESPONSE — no FINAL DIRECTIVE anchor found (likely truncation or ignored instructions). Seat treated as empty this round.`)
-      );
+      });
       if (eligible.length === 0) {
         logError("All responses malformed — no directives to compare. Council divided by default; raw positions logged to Session History.");
         return { text: null, divided: true, answers };
@@ -759,6 +779,78 @@
     };
   }
 
+  // ---------- Divided Council panel (v2.6, Gemini feature request 2026-07-13,
+  // Kimi-approved same day with malformed-badge amendment) ----------
+  // When consensus fails, the divergence IS the answer. Render each seat's
+  // position in the main viewport instead of burying it in Session History.
+  // Cards render in DISPATCH ORDER (Kimi ratification: weight-sorting would
+  // imply epistemic authority that doesn't exist in disagreement — badges
+  // show weight, users interpret hierarchy themselves). History logging is
+  // unchanged — this is presentation only. Cards render via textContent,
+  // never innerHTML: model output is untrusted input.
+  let dividedPanel = null;
+  function ensureDividedPanel() {
+    if (dividedPanel) return dividedPanel;
+    dividedPanel = document.createElement("section");
+    dividedPanel.id = "dividedPanel";
+    dividedPanel.setAttribute("aria-label", "Divided Council positions");
+    const style = document.createElement("style");
+    style.textContent = [
+      "#dividedPanel { display: none; margin: 12px 0 0; }",
+      "#dividedPanel.active { display: block; }",
+      "#dividedPanel .divided-note { font-size: 0.8em; opacity: 0.75; margin: 0 0 8px; }",
+      ".divided-card { border-left: 3px solid #d97706; background: rgba(217,119,6,0.08); border-radius: 6px; padding: 10px 12px; margin: 8px 0; }",
+      ".divided-card.malformed { opacity: 0.55; border-left-color: #dc2626; }",
+      ".divided-badge { color: #dc2626; border: 1px solid #dc2626; padding: 0 4px; border-radius: 4px; font-size: 0.72em; font-weight: normal; letter-spacing: 0.05em; margin-left: 6px; vertical-align: middle; }",
+      ".divided-card h4 { margin: 0 0 6px; font-size: 0.85em; letter-spacing: 0.02em; }",
+      ".divided-card h4 .divided-weight { opacity: 0.6; font-weight: normal; margin-left: 6px; }",
+      ".divided-card p { margin: 0; white-space: pre-wrap; font-size: 0.9em; line-height: 1.45; }",
+    ].join("\n");
+    document.head.appendChild(style);
+    consensusBar.parentNode.insertBefore(dividedPanel, consensusBar.nextSibling);
+    return dividedPanel;
+  }
+  function clearDividedPanel() {
+    if (dividedPanel) {
+      dividedPanel.classList.remove("active");
+      dividedPanel.innerHTML = "";
+    }
+  }
+  function renderDividedPanel(answers) {
+    const panel = ensureDividedPanel();
+    panel.innerHTML = "";
+    const note = document.createElement("p");
+    note.className = "divided-note";
+    note.textContent = "No consensus — the divergence is the answer. Each seat's position, unedited:";
+    panel.appendChild(note);
+    answers.forEach((a) => {
+      const card = document.createElement("div");
+      card.className = "divided-card";
+      const h = document.createElement("h4");
+      h.textContent = seatLabel(a.name);
+      const w = document.createElement("span");
+      w.className = "divided-weight";
+      w.textContent = "weight " + seatWeight(a.name);
+      h.appendChild(w);
+      // Kimi amendment (2026-07-13): malformed seats appear dimmed with a
+      // badge and their (truncated) text visible, so the user sees the seat
+      // tried to answer and why it was disqualified from consensus math.
+      if (a.malformed) {
+        card.classList.add("malformed");
+        const badge = document.createElement("span");
+        badge.className = "divided-badge";
+        badge.textContent = "MALFORMED — no directive anchor";
+        h.appendChild(badge);
+      }
+      const p = document.createElement("p");
+      p.textContent = a.text;
+      card.appendChild(h);
+      card.appendChild(p);
+      panel.appendChild(card);
+    });
+    panel.classList.add("active");
+  }
+
   // ---------- Dispatch ----------
   let busy = false;
 
@@ -767,6 +859,7 @@
     busy = true;
 
     resetSeatVisuals();
+    clearDividedPanel();
     consensusBar.classList.remove("is-empty");
     consensusBar.classList.add("loading");
     consensusText.textContent = "The Council is deliberating…";
@@ -828,7 +921,8 @@
     if (divided) {
       // No white flash — the Council did not converge. Amber state instead.
       consensusBar.classList.add("divided");
-      consensusText.textContent = "The Council is divided — no consensus reached.";
+      consensusText.textContent = "The Council is divided — no consensus reached. Positions below.";
+      renderDividedPanel(allAnswers);
       allAnswers.forEach((a) =>
         logHistory(`${seatLabel(a.name)} position (${query})`, a.text)
       );
@@ -859,6 +953,7 @@
   // ---------- New Session ----------
   newSessionBtn.addEventListener("click", () => {
     consensusText.textContent = "Awaiting Council Input...";
+    clearDividedPanel();
     consensusBar.classList.add("is-empty");
     consensusBar.classList.remove("loading");
     historyList.innerHTML = '<li class="empty-note">No queries yet this session.</li>';
