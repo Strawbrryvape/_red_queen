@@ -449,6 +449,7 @@
   }
 
   async function callGroq(query) {
+    await paceProvider("groq");
     const res = await fetchWithRetry("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -478,6 +479,7 @@
   // Cerebras's free catalog churns — if this model 404s, check
   // cloud.cerebras.ai for the current list and swap the string below.
   async function callCerebras(query) {
+    await paceProvider("cerebras");
     const res = await fetchWithRetry("https://api.cerebras.ai/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -534,15 +536,44 @@
     return (slug || "").split("/").pop().replace(":free", "").split("-")[0];
   }
 
-  let orQueue = Promise.resolve();
-  function serializeOR(fn) {
-    const run = orQueue.then(fn, fn);
-    orQueue = run.catch(() => {});
-    return run;
+  // ---------- Per-provider pacing gates (v2.7, COUNCIL-VOTED 2026-07-13,
+  // KIMI-RATIFIED same day with interval amendment: OR 1200→1800ms) ----------
+  // The council ruled: "dispatch calls in parallel with per-provider rate
+  // limiting" (2-1, GLM + Nemotron vs Llama's mutex). This replaces the
+  // OpenRouter mutex queue. Kitchen-table version: instead of a strict
+  // single-file line at the shared-key counter, callers can overlap but
+  // never order faster than one request per interval on the same key.
+  // Each provider gets its own gate — hammering tacos doesn't slow pizza.
+  // Concurrent callers reserve staggered slots, so bursts self-space.
+  //
+  // GOVERNANCE RULE (Kimi, 2026-07-13): "Council deliberation on user
+  // prompts is binding within its trust-state constraints. Council
+  // deliberation on its own architecture is ADVISORY; final authority
+  // rests with the Founder and Lead Architect." This change is the
+  // precedent case: council-voted, founder-directed, Kimi-ratified.
+  //
+  // Interval rationale (Kimi amendment): 1800ms OR = 33 RPM start rate,
+  // safely under the 20 RPM per-model free-tier floor even with 2-3s
+  // response latency across a 3-seat cascade. Pacing state is per-page-
+  // load by design; multi-tab coordination deferred to backend v4.
+  const providerPace = {
+    openrouter: { minInterval: 1800, nextSlot: 0 }, // shared key across up to 3 seats
+    groq:       { minInterval: 400,  nextSlot: 0 },
+    cerebras:   { minInterval: 400,  nextSlot: 0 },
+  };
+  async function paceProvider(provider) {
+    const p = providerPace[provider];
+    if (!p) return;
+    const now = Date.now();
+    const slot = Math.max(now, p.nextSlot);
+    p.nextSlot = slot + p.minInterval;
+    if (slot > now) await sleep(slot - now);
   }
 
   async function callOpenRouter(query, seatName) {
-    return serializeOR(() => callOpenRouterWalk(query, seatName));
+    // v2.7: mutex removed per council verdict — pacing gate inside
+    // callOpenRouterModel now enforces the shared-key limit instead.
+    return callOpenRouterWalk(query, seatName);
   }
 
   // Walk the seat's model list until one answers (v2.5). Every hop is
@@ -567,6 +598,7 @@
   }
 
   async function callOpenRouterModel(query, model) {
+    await paceProvider("openrouter"); // shared key — pace, don't mob
     const res = await fetchWithRetry("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
