@@ -56,6 +56,28 @@
   // index.html hasn't been updated yet (prevents a dead-buttons failure mode).
   const keyCerebrasEl = $("keyCerebras");
   if (keyCerebrasEl) keyCerebrasEl.value = settings.keyCerebras || "";
+  // v2.9: Supabase institutional-memory fields. If index.html lacks the
+  // inputs, inject them into the settings sheet dynamically — same
+  // zero-HTML-change doctrine as the Divided Council panel.
+  (function ensureSupabaseFields() {
+    if (!$("supabaseUrl") && keyCerebrasEl && keyCerebrasEl.parentNode) {
+      const mk = (id, ph) => {
+        const el = document.createElement("input");
+        el.type = "password";
+        el.id = id;
+        el.placeholder = ph;
+        el.autocomplete = "off";
+        el.className = keyCerebrasEl.className || "";
+        el.style.marginTop = "6px";
+        return el;
+      };
+      const host = keyCerebrasEl.parentNode;
+      host.appendChild(mk("supabaseUrl", "Supabase project URL (institutional memory)"));
+      host.appendChild(mk("supabaseAnonKey", "Supabase anon key (institutional memory)"));
+    }
+    if ($("supabaseUrl")) $("supabaseUrl").value = settings.supabaseUrl || "";
+    if ($("supabaseAnonKey")) $("supabaseAnonKey").value = settings.supabaseAnonKey || "";
+  })();
   demoToggle.checked = !!settings.demoMode;
 
   function hasAnyKey() {
@@ -82,6 +104,16 @@
   // hits reasoning fluff, never the anchor. Clears free-tier limits with
   // the staggered dispatch.
   const MAX_TOKENS = 1000;
+  // v2.7.2 (2026-07-13, FLAGGED FOR KIMI REVIEW): reasoning models need
+  // doubled headroom. Evidence from two live failures tonight: GLM 4.7
+  // burns budget inside <think> blocks, truncates MID-THOUGHT, and the
+  // truncation-safe strip then correctly discards the unclosed reasoning
+  // — leaving an empty answer ("failed: unknown error"). GLM's repeated
+  // "folds" were our ceiling, not its reliability. This is the original
+  // "second audition at doubled token headroom" plan, now with a
+  // confirmed mechanism. Applied to Cerebras (GLM) and OpenRouter
+  // (hosts Nemotron, which also truncated twice tonight).
+  const REASONING_MAX_TOKENS = 2000;
 
   // ---------- Understudy state (Groq filling Claude's seat, Cerebras filling Gemini's) ----------
   function groqUnderstudy() {
@@ -153,6 +185,8 @@
       keyGroq: $("keyGroq").value.trim(),
       keyOpenRouter: $("keyOpenRouter").value.trim(),
       keyCerebras: keyCerebrasEl ? keyCerebrasEl.value.trim() : (settings.keyCerebras || ""),
+      supabaseUrl: $("supabaseUrl") ? $("supabaseUrl").value.trim() : (settings.supabaseUrl || ""),
+      supabaseAnonKey: $("supabaseAnonKey") ? $("supabaseAnonKey").value.trim() : (settings.supabaseAnonKey || ""),
       demoMode: demoToggle.checked,
     };
     saveSettings(settings);
@@ -513,7 +547,7 @@
       body: JSON.stringify({
         model: CEREBRAS_MODEL,
         messages: [{ role: "user", content: query }],
-        max_tokens: MAX_TOKENS,
+        max_tokens: REASONING_MAX_TOKENS, // v2.7.2: GLM thinks before speaking
       }),
     }, "Cerebras");
     if (res.status === 404) throw new Error(`Cerebras model ${CEREBRAS_MODEL} unavailable (404) — free catalog churned; swap CEREBRAS_MODEL for a current model from cloud.cerebras.ai`);
@@ -528,6 +562,9 @@
     const openThink = text.lastIndexOf("<think>");
     if (openThink !== -1) text = text.slice(0, openThink);
     text = text.trim();
+    // v2.7.2: an empty answer after stripping is a diagnosis, not a
+    // mystery — fail loudly instead of returning "" ("unknown error").
+    if (!text) throw new Error(`Cerebras ${CEREBRAS_MODEL} spent its entire token budget reasoning and never produced a final answer (truncated mid-<think>). Headroom is ${REASONING_MAX_TOKENS} — if this recurs, raise it or shorten prompts.`);
     return text;
   }
 
@@ -637,7 +674,7 @@
       body: JSON.stringify({
         model: model,
         messages: [{ role: "user", content: query }],
-        max_tokens: MAX_TOKENS,
+        max_tokens: REASONING_MAX_TOKENS, // v2.7.2: Nemotron truncated twice tonight at 1000
       }),
     }, "OpenRouter");
     if (res.status === 404) throw new Error(`OpenRouter model ${model} unavailable (404) — swap OR_SEAT_MODELS entry for another free model family`);
@@ -923,6 +960,219 @@
     panel.classList.add("active");
   }
 
+  // ==================== v2.9: RED QUEEN MEMORY ====================
+  // Two organs, built 2026-07-14 (FLAGGED FOR KIMI REVIEW):
+  //   Organ 1 — Council Ledger: conversational memory. A shared, trust-
+  //     aware record of past rounds, injected into every seat's dispatch
+  //     so follow-up questions work. SHARED ledger, not per-seat memories
+  //     (Fable recommendation pending Kimi ruling): every seat sees the
+  //     same history, with trust prefixes intact, so no seat can mistake
+  //     a past SOLE VOICE for settled council law. Deterministic
+  //     compaction — zero API cost. Hard token cap so memory never
+  //     bankrupts the free tiers.
+  //   Organ 2 — Institutional memory: Supabase telemetry/events per the
+  //     Kimi v2.8 handoff schema, fail-soft (Supabase down or unset =
+  //     Red Queen works exactly as before; memory must never be a
+  //     dependency that can break dispatch).
+
+  // ---------- Organ 1: Council Ledger ----------
+  const LEDGER_KEY = "rq_ledger_v1";
+  const MEMORY_ENABLED_KEY = "rq_memory_enabled";
+  const LEDGER_MAX_ENTRIES = 40;        // persistent cap (localStorage hygiene)
+  const LEDGER_VERBATIM_ROUNDS = 2;     // newest N rounds get fuller text
+  const MEMORY_CONTEXT_CHAR_CAP = 2400; // ≈600 tokens — hard injection budget
+
+  function loadLedger() {
+    try { return JSON.parse(localStorage.getItem(LEDGER_KEY)) || []; }
+    catch { return []; }
+  }
+  let ledger = loadLedger();
+
+  function persistLedger() {
+    try { localStorage.setItem(LEDGER_KEY, JSON.stringify(ledger)); }
+    catch (e) { logError("Ledger persist failed (localStorage full?) — memory continues in-page only. " + (e.message || e)); }
+  }
+
+  function memoryEnabled() {
+    return localStorage.getItem(MEMORY_ENABLED_KEY) !== "off";
+  }
+  function setMemoryEnabled(on) {
+    localStorage.setItem(MEMORY_ENABLED_KEY, on ? "on" : "off");
+  }
+
+  const clip = (s, n) => (s && s.length > n ? s.slice(0, n - 1).trimEnd() + "…" : s || "");
+
+  // Memory sanitization: past prompts/verdicts can contain the literal
+  // anchor phrase (the v2.7 election texts did). If injected verbatim,
+  // remembered anchors would false-arm anchored-consensus mode and could
+  // be mistaken for verdicts by extractDirective. Neutralize on write.
+  const sanitizeMemory = (s) => (s ? s.replace(/FINAL DIRECTIVE:/gi, "FINAL VERDICT —") : s);
+
+  // Record one completed round. Demo rounds are never recorded — canned
+  // answers must not pollute real memory.
+  function recordLedger(entry) {
+    entry.prompt = sanitizeMemory(entry.prompt);
+    if (entry.verdict) entry.verdict = sanitizeMemory(entry.verdict);
+    if (entry.positions) entry.positions.forEach((p) => { p.text = sanitizeMemory(p.text); });
+    ledger.push(entry);
+    if (ledger.length > LEDGER_MAX_ENTRIES) ledger = ledger.slice(-LEDGER_MAX_ENTRIES);
+    persistLedger();
+  }
+
+  // One ledger entry -> one text line. Trust state ALWAYS travels with
+  // the memory — doctrine applies to the past as much as the present.
+  function ledgerLine(e, verbatim) {
+    const q = clip(e.prompt, verbatim ? 200 : 100);
+    if (e.outcome === "divided") {
+      const posCap = verbatim ? 200 : 60;
+      const positions = (e.positions || [])
+        .map((p) => `${p.seat}: "${clip(p.text, posCap)}"`)
+        .join(" | ");
+      return `Q: "${q}" → DIVIDED (no consensus) — ${positions}`;
+    }
+    const tag =
+      e.outcome === "verified" ? `VERIFIED ${e.counts || ""}`.trim() :
+      e.outcome === "provisional" ? `PROVISIONAL ${e.counts || ""} (bench only, unconfirmed)`.trim() :
+      e.outcome === "sole" ? "SOLE VOICE (single model, unverified)" :
+      e.outcome.toUpperCase();
+    return `Q: "${q}" → ${tag}: "${clip(e.verdict, verbatim ? 400 : 120)}"`;
+  }
+
+  const MEMORY_HEADER =
+    "=== COUNCIL MEMORY (shared ledger) ===\n" +
+    "You are one seat on the Red Queen council — a browser-based multi-model " +
+    "consensus orchestrator (static site, no backend). Below is the shared " +
+    "record of this council's previous rounds, oldest first. Read the trust " +
+    "tags carefully: VERIFIED = full council agreement; PROVISIONAL = bench-" +
+    "only agreement, unconfirmed; SOLE VOICE = one model's unverified opinion; " +
+    "DIVIDED = no consensus was reached and the positions are listed. Past " +
+    "SOLE VOICE or DIVIDED rounds are NOT settled conclusions. Use this memory " +
+    "to answer follow-ups; do not restate it unless asked.\n";
+
+  // Build the injected context: newest rounds verbatim, older rounds
+  // compacted, assembled newest-backwards under the hard char cap, then
+  // emitted oldest-first for natural reading order.
+  function buildMemoryContext() {
+    if (!memoryEnabled() || ledger.length === 0) return "";
+    const lines = [];
+    let budget = MEMORY_CONTEXT_CHAR_CAP;
+    for (let i = ledger.length - 1; i >= 0; i--) {
+      const verbatim = i >= ledger.length - LEDGER_VERBATIM_ROUNDS;
+      const line = `[Round ${i + 1}] ` + ledgerLine(ledger[i], verbatim);
+      if (line.length + 1 > budget) break;
+      budget -= line.length + 1;
+      lines.unshift(line);
+    }
+    if (lines.length === 0) return "";
+    return MEMORY_HEADER + lines.join("\n") + "\n=== CURRENT QUESTION ===\n";
+  }
+
+  // ---------- Memory UI (created dynamically — zero index.html changes,
+  // same pattern as the Divided Council panel) ----------
+  let memoryPill = null;
+  function ensureMemoryUI() {
+    if (memoryPill) return;
+    const style = document.createElement("style");
+    style.textContent = [
+      "#memoryPill { position: fixed; bottom: 14px; left: 14px; z-index: 60; display: flex; gap: 6px; }",
+      "#memoryPill button { font-size: 0.72em; letter-spacing: 0.04em; padding: 4px 10px; border-radius: 999px; border: 1px solid #d97706; background: rgba(217,119,6,0.12); color: inherit; cursor: pointer; }",
+      "#memoryPill button.mem-off { border-color: #666; background: rgba(120,120,120,0.12); opacity: 0.7; }",
+    ].join("\n");
+    document.head.appendChild(style);
+    memoryPill = document.createElement("div");
+    memoryPill.id = "memoryPill";
+    const toggle = document.createElement("button");
+    const forget = document.createElement("button");
+    const refresh = () => {
+      const on = memoryEnabled();
+      toggle.textContent = on ? `MEMORY ON · ${ledger.length}` : "MEMORY OFF";
+      toggle.classList.toggle("mem-off", !on);
+      forget.style.display = on && ledger.length ? "" : "none";
+    };
+    toggle.title = "Toggle whether past rounds are injected into council dispatches";
+    forget.textContent = "FORGET";
+    forget.title = "Erase the council ledger (permanent)";
+    toggle.addEventListener("click", () => { setMemoryEnabled(!memoryEnabled()); refresh(); });
+    forget.addEventListener("click", () => {
+      if (!confirm("Erase the council's memory of " + ledger.length + " round(s)? This is permanent.")) return;
+      ledger = [];
+      persistLedger();
+      refresh();
+    });
+    memoryPill.appendChild(toggle);
+    memoryPill.appendChild(forget);
+    document.body.appendChild(memoryPill);
+    memoryPill.refresh = refresh;
+    refresh();
+  }
+  ensureMemoryUI();
+
+  // ---------- Organ 2: Institutional memory (Supabase, fail-soft) ----------
+  // Kimi v2.8 handoff schema. Implemented via Supabase's PostgREST HTTP
+  // API directly — no CDN script, no library, flat-file doctrine intact.
+  // AMENDED from handoff (flagged): `const supabase = supabase.createClient`
+  // would TDZ-crash; fetch avoids the entire class of problem.
+  const RQ_SESSION_ID = "sess_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  let dispatchCounter = 0;
+
+  function sbConfigured() {
+    return !!(settings.supabaseUrl && settings.supabaseAnonKey);
+  }
+  function sbInsert(table, rows) {
+    if (!sbConfigured()) return Promise.resolve();
+    return fetch(settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/" + table, {
+      method: "POST",
+      headers: {
+        apikey: settings.supabaseAnonKey,
+        Authorization: "Bearer " + settings.supabaseAnonKey,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify(rows),
+    }).then((res) => {
+      if (!res.ok) logError(`Institutional memory write to ${table} failed (HTTP ${res.status}) — dispatch unaffected.`);
+    }).catch((e) => {
+      logError(`Institutional memory unreachable (${table}): ${e.message || e} — dispatch unaffected.`);
+    });
+  }
+
+  // Per-dispatch telemetry + significant-event logging. Fire-and-forget:
+  // never awaited on the dispatch critical path.
+  function logInstitutionalMemory(dispatchId, query, result) {
+    if (!sbConfigured()) return;
+    const answers = (result && result.answers) || [];
+    const rows = answers.map((a) => ({
+      session_id: RQ_SESSION_ID,
+      dispatch_id: dispatchId,
+      seat_label: seatLabel(a.name),
+      provider: seatProvider[a.name] || "primary",
+      model: seatLabel(a.name),
+      event_type: a.malformed ? "answer_malformed" : "answer",
+      consensus_weight: seatWeight(a.name),
+    }));
+    rows.push({
+      session_id: RQ_SESSION_ID,
+      dispatch_id: dispatchId,
+      seat_label: "council",
+      provider: "redqueen",
+      model: "consensus_engine",
+      event_type: result.divided ? "consensus_divided" : "consensus_" + (result.trust || "unknown"),
+    });
+    sbInsert("rq_telemetry", rows);
+    if (result.divided || result.trust === "sole") {
+      sbInsert("rq_events", [{
+        event_id: dispatchId,
+        title: result.divided ? "Divided Council round" : "Sole Voice round",
+        summary: clip(`Q: ${query} — ` + (result.divided
+          ? answers.map((a) => `${seatLabel(a.name)}: ${clip(a.text, 120)}`).join(" | ")
+          : `verdict: ${clip(result.text, 200)}`), 900),
+        cultural_tags: [result.divided ? "divided" : "sole_voice"],
+        participants: answers.map((a) => seatLabel(a.name)),
+        mood: "logged_automatically",
+      }]);
+    }
+  }
+
   // ---------- Dispatch ----------
   let busy = false;
 
@@ -945,8 +1195,14 @@
 
     if (!inDemoMode()) {
       let result = null;
+      const dispatchId = RQ_SESSION_ID + "_d" + (++dispatchCounter);
+      // v2.9: memory injection — the council receives the shared ledger
+      // context ahead of the current question. The RAW query (not the
+      // composed one) is what gets displayed, logged, and remembered.
+      const memoryContext = buildMemoryContext();
+      const composedQuery = memoryContext ? memoryContext + query : query;
       try {
-        result = await runLiveCouncil(query);
+        result = await runLiveCouncil(composedQuery);
       } catch (e) {
         logError("Council dispatch failed: " + (e.message || e));
       }
@@ -958,6 +1214,18 @@
         divided = result.divided;
         answer = result.text;
         allAnswers = result.answers || [];
+        // v2.9: record the round in the ledger (raw prompt, trust-tagged
+        // outcome) and fire institutional memory writes (never awaited).
+        recordLedger({
+          t: Date.now(),
+          prompt: query,
+          outcome: divided ? "divided" : (result.trust || "unknown"),
+          counts: result.agreedCount != null ? `${result.agreedCount}/${result.eligibleCount}` : "",
+          verdict: divided ? null : clip(result.text, 600),
+          positions: divided ? allAnswers.map((a) => ({ seat: seatLabel(a.name), text: clip(a.text, 300) })) : null,
+        });
+        if (memoryPill && memoryPill.refresh) memoryPill.refresh();
+        logInstitutionalMemory(dispatchId, query, result);
         // Trust-state prefix (v2.4): the bar itself carries the verification
         // level — a sole understudy's opinion must never wear the Council's
         // crown unmarked. "Always check the error logs" — founder, 2026-07-12.
@@ -1034,6 +1302,12 @@
   newSessionBtn.addEventListener("click", () => {
     consensusText.textContent = "Awaiting Council Input...";
     clearDividedPanel();
+    // v2.9: New Session is a true fresh start — the council forgets the
+    // conversation. (Ledger otherwise survives reloads; only the user
+    // erases memory, via New Session or the FORGET pill.)
+    ledger = [];
+    persistLedger();
+    if (memoryPill && memoryPill.refresh) memoryPill.refresh();
     consensusBar.classList.add("is-empty");
     consensusBar.classList.remove("loading");
     historyList.innerHTML = '<li class="empty-note">No queries yet this session.</li>';
