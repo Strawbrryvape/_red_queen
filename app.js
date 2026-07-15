@@ -61,19 +61,29 @@
   // zero-HTML-change doctrine as the Divided Council panel.
   (function ensureSupabaseFields() {
     if (!$("supabaseUrl") && keyCerebrasEl && keyCerebrasEl.parentNode) {
-      const mk = (id, ph) => {
+      // v2.9.3: permanent <label> elements, not placeholder-as-label —
+      // placeholders vanish once values are pasted, leaving anonymous
+      // boxes (live confusion 2026-07-14, and the prime suspect for a
+      // swapped URL/key causing "Failed to fetch"). URL field is type
+      // text: a project URL is not a secret and must be verifiable by eye.
+      const mk = (id, labelText, type, ph) => {
+        const label = document.createElement("label");
+        label.htmlFor = id;
+        label.textContent = labelText;
+        label.style.cssText = "display:block;margin-top:10px;font-size:0.75em;letter-spacing:0.03em;opacity:0.8;";
         const el = document.createElement("input");
-        el.type = "password";
+        el.type = type;
         el.id = id;
         el.placeholder = ph;
         el.autocomplete = "off";
         el.className = keyCerebrasEl.className || "";
-        el.style.marginTop = "6px";
-        return el;
+        el.style.marginTop = "4px";
+        const host = keyCerebrasEl.parentNode;
+        host.appendChild(label);
+        host.appendChild(el);
       };
-      const host = keyCerebrasEl.parentNode;
-      host.appendChild(mk("supabaseUrl", "Supabase project URL (institutional memory)"));
-      host.appendChild(mk("supabaseAnonKey", "Supabase anon key (institutional memory)"));
+      mk("supabaseUrl", "SUPABASE PROJECT URL (institutional memory)", "text", "https://yourproject.supabase.co");
+      mk("supabaseAnonKey", "SUPABASE ANON KEY (institutional memory)", "password", "eyJ… (the long anon public key)");
     }
     if ($("supabaseUrl")) $("supabaseUrl").value = settings.supabaseUrl || "";
     if ($("supabaseAnonKey")) $("supabaseAnonKey").value = settings.supabaseAnonKey || "";
@@ -198,6 +208,18 @@
       demoMode: demoToggle.checked,
     };
     saveSettings(settings);
+    // v2.9.3: Supabase field sanity checks — catch swapped or malformed
+    // values at save time with plain-English corrections, instead of a
+    // cryptic "Failed to fetch" at dispatch time.
+    if (settings.supabaseUrl && settings.supabaseUrl.startsWith("eyJ")) {
+      logError("Supabase URL field contains what looks like the ANON KEY (starts with eyJ). The two values are probably swapped — URL goes on top, key below.");
+    }
+    if (settings.supabaseAnonKey && /^https?:\/\//i.test(settings.supabaseAnonKey)) {
+      logError("Supabase ANON KEY field contains what looks like a URL. The two values are probably swapped — URL goes on top, key below.");
+    }
+    if (settings.supabaseUrl && !/^https:\/\/.+\.supabase\.co\/?$/i.test(settings.supabaseUrl) && !settings.supabaseUrl.startsWith("eyJ")) {
+      logError(`Supabase URL looks unusual ("${settings.supabaseUrl.slice(0, 40)}…"). Expected exactly https://yourproject.supabase.co — no extra path, no trailing text.`);
+    }
     refreshDemoBadge();
     refreshUnderstudyState();
 
