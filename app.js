@@ -1216,6 +1216,329 @@
     }
   }
 
+  // ==================== v3.0.0: FOUNDATION (Charter §11 items 1–6) ====================
+  // Kimi/Founder charter 2026-07-14: "The v3.0 foundation is not about
+  // adding features. It is about removing barriers." All UI injected
+  // dynamically — zero index.html changes, flat-file doctrine intact.
+
+  const v3css = document.createElement("style");
+  v3css.textContent = [
+    "#rqIntro { margin: 14px auto 0; max-width: 640px; text-align: center; }",
+    "#rqIntro .rq-sub { font-size: 0.95em; opacity: 0.85; margin: 0 0 12px; line-height: 1.5; }",
+    "#rqIntro .rq-cta { display: inline-block; margin: 4px 6px; padding: 9px 18px; border-radius: 999px; border: 1px solid #d97706; background: rgba(217,119,6,0.15); color: inherit; cursor: pointer; font-size: 0.85em; letter-spacing: 0.03em; }",
+    "#rqIntro .rq-cta.secondary { border-color: #777; background: rgba(120,120,120,0.12); }",
+    "#rqIntro .rq-how { display: block; margin: 10px auto 0; background: none; border: none; color: inherit; opacity: 0.7; text-decoration: underline; cursor: pointer; font-size: 0.78em; }",
+    ".rq-modal-scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 200; display: flex; align-items: center; justify-content: center; padding: 18px; }",
+    ".rq-modal { background: #17151a; border: 1px solid #d97706; border-radius: 12px; max-width: 560px; max-height: 80vh; overflow-y: auto; padding: 18px 20px; font-size: 0.9em; line-height: 1.55; }",
+    ".rq-modal h3 { margin: 14px 0 6px; font-size: 1em; color: #d97706; }",
+    ".rq-modal h3:first-child { margin-top: 0; }",
+    ".rq-modal p { margin: 0 0 8px; }",
+    ".rq-modal .rq-close { float: right; background: none; border: 1px solid #777; border-radius: 999px; color: inherit; padding: 2px 10px; cursor: pointer; }",
+    "#rqChips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }",
+    "#rqChips button { font-size: 0.75em; padding: 5px 10px; border-radius: 999px; border: 1px solid #666; background: rgba(255,255,255,0.05); color: inherit; cursor: pointer; }",
+    "#trustHelpBtn { margin-left: 8px; font-size: 0.72em; border: 1px solid #777; border-radius: 50%; width: 18px; height: 18px; line-height: 1; background: none; color: inherit; cursor: pointer; opacity: 0.7; vertical-align: middle; }",
+    "#rqSessions .rq-sess { border: 1px solid #444; border-radius: 8px; margin: 6px 0; padding: 8px 10px; font-size: 0.82em; }",
+    "#rqSessions .rq-sess-head { cursor: pointer; display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }",
+    "#rqSessions .rq-badge { font-size: 0.72em; padding: 1px 7px; border-radius: 999px; border: 1px solid #d97706; color: #d97706; white-space: nowrap; }",
+    "#rqSessions .rq-badge.verified { border-color: #16a34a; color: #16a34a; }",
+    "#rqSessions .rq-sess-body { display: none; margin-top: 8px; white-space: pre-wrap; opacity: 0.9; }",
+    "#rqSessions .rq-sess.open .rq-sess-body { display: block; }",
+    "#rqSessions .rq-sess-del { float: right; background: none; border: none; color: #dc2626; cursor: pointer; font-size: 0.9em; }",
+  ].join("\n");
+  document.head.appendChild(v3css);
+
+  function rqModal(html) {
+    const scrim = document.createElement("div");
+    scrim.className = "rq-modal-scrim";
+    const box = document.createElement("div");
+    box.className = "rq-modal";
+    box.innerHTML = '<button class="rq-close">✕</button>' + html; // static app copy only — never user/model content
+    scrim.appendChild(box);
+    scrim.addEventListener("click", (e) => { if (e.target === scrim || e.target.classList.contains("rq-close")) scrim.remove(); });
+    document.body.appendChild(scrim);
+  }
+
+  const TRUST_EDU_HTML =
+    "<h3>Reading the Council's verdicts</h3>" +
+    "<p><b>✓ VERIFIED</b> — Three primary advisors agreed on this answer.</p>" +
+    "<p><b>◐ PROVISIONAL</b> — All advisors agreed, but they're on backup models. Solid, not yet premium-verified.</p>" +
+    "<p><b>⚠ SOLE VOICE</b> — Only one advisor could answer. A single opinion, not a council verdict.</p>" +
+    "<p><b>DIVIDED</b> — The advisors disagreed. Their raw positions are shown so you can judge — the divergence is the answer.</p>";
+
+  const ABOUT_FAQ_HTML =
+    "<h3>What is the Red Queen?</h3>" +
+    "<p>Ask a question. Three AI advisors deliberate. You get the consensus — or the honest disagreement. Red Queen is a multi-model council: independent AI models answer in parallel, and she only claims agreement when it actually exists.</p>" +
+    "<h3>How does the council work?</h3>" +
+    "<p>1) You ask. 2) Three seats (Gemini, Kimi, Claude — with free understudies when a primary is unavailable) think independently. 3) Their answers are compared. Agreement gets a trust badge; disagreement is shown raw.</p>" +
+    TRUST_EDU_HTML +
+    "<h3>Does she remember?</h3>" +
+    "<p>Yes — a shared council ledger records each round with its trust state, so follow-up questions work. You control it: the MEMORY pill toggles it, FORGET erases it, New Session starts fresh.</p>" +
+    "<h3>Privacy</h3>" +
+    "<p>🔒 All API calls are client-side. Your keys stay in your browser — we never see them, and we don't store your prompts on any Syntropy server.</p>" +
+    "<h3>Terms</h3>" +
+    "<p>Formal Terms of Service are being drafted by counsel. Until published: provided as-is, AI outputs may be wrong, verify before acting on them.</p>" +
+    "<p style='opacity:0.6'>A Syntropy LLC project — syntropyllc.netlify.app</p>";
+
+  const HOW_IT_WORKS_HTML =
+    "<h3>How it works</h3>" +
+    "<p>1️⃣ <b>You ask.</b> Type or tap a suggestion.</p>" +
+    "<p>2️⃣ <b>Three models think.</b> Independent AI advisors deliberate in parallel — watch the orbs light up.</p>" +
+    "<p>3️⃣ <b>You get the truth about their answer.</b> Unified verdict with a trust badge — or their honest disagreement, unedited.</p>";
+
+  // Landing panel — shown to newcomers (no keys, no memory). Removed on
+  // first dispatch. Returning users skip straight to the council.
+  (function ensureLanding() {
+    const hasAnyKey = !!(settings.keyGemini || settings.keyKimi || settings.keyClaude || settings.keyGroq || settings.keyOpenRouter || settings.keyCerebras);
+    if (hasAnyKey || ledger.length > 0) return;
+    const intro = document.createElement("div");
+    intro.id = "rqIntro";
+    const sub = document.createElement("p");
+    sub.className = "rq-sub";
+    sub.textContent = "Ask a question. Three AI advisors deliberate. You get the consensus — or the honest disagreement.";
+    const tryBtn = document.createElement("button");
+    tryBtn.className = "rq-cta";
+    tryBtn.textContent = "👑 Try the Council (Demo)";
+    tryBtn.addEventListener("click", () => {
+      settings.demoMode = true;
+      demoToggle.checked = true;
+      saveSettings(settings);
+      refreshDemoBadge();
+      summonBtn.click();
+    });
+    const unlockBtn = document.createElement("button");
+    unlockBtn.className = "rq-cta secondary";
+    unlockBtn.textContent = "Unlock Live Council";
+    unlockBtn.addEventListener("click", () => menuBtn.click());
+    const how = document.createElement("button");
+    how.className = "rq-how";
+    how.textContent = "How it works";
+    how.addEventListener("click", () => rqModal(HOW_IT_WORKS_HTML));
+    intro.appendChild(sub);
+    intro.appendChild(tryBtn);
+    intro.appendChild(unlockBtn);
+    intro.appendChild(how);
+    consensusBar.parentNode.insertBefore(intro, consensusBar);
+    window.__rqIntro = intro;
+  })();
+
+  // Trust-state education — "?" on the Consensus Bar, one tap, plain English.
+  (function ensureTrustHelp() {
+    const btn = document.createElement("button");
+    btn.id = "trustHelpBtn";
+    btn.textContent = "?";
+    btn.title = "What do VERIFIED / PROVISIONAL / SOLE VOICE / DIVIDED mean?";
+    btn.addEventListener("click", (e) => { e.stopPropagation(); rqModal(TRUST_EDU_HTML); });
+    consensusBar.appendChild(btn);
+  })();
+
+  // Example prompt chips — blank-page anxiety killer, injected in the sheet.
+  (function ensureChips() {
+    if (!queryInput || !queryInput.parentNode) return;
+    const chips = document.createElement("div");
+    chips.id = "rqChips";
+    ["Should I learn Python or JavaScript?", "Explain quantum computing like I'm 5", "What is the Red Queen?", "Is a hot dog a sandwich?"].forEach((t) => {
+      const b = document.createElement("button");
+      b.textContent = t;
+      b.addEventListener("click", () => { queryInput.value = t; queryInput.focus(); });
+      chips.appendChild(b);
+    });
+    queryInput.parentNode.insertBefore(chips, queryInput.nextSibling);
+  })();
+
+  // Persistent Session History — ledger-backed collapsible cards in the
+  // drawer. (Charter names rq_telemetry as source; the ledger holds the
+  // same rounds with full positions, works offline, and is live today —
+  // telemetry-backed history upgrades in v3.0.x once Supabase verified.)
+  (function ensureSessionHistory() {
+    if (!historyList || !historyList.parentNode) return;
+    const wrap = document.createElement("div");
+    wrap.id = "rqSessions";
+    const title = document.createElement("h3");
+    title.textContent = "PAST ROUNDS (persistent)";
+    title.style.cssText = "font-size:0.78em;letter-spacing:0.05em;opacity:0.7;margin:14px 0 4px;";
+    const clearAll = document.createElement("button");
+    clearAll.textContent = "Clear all";
+    clearAll.style.cssText = "font-size:0.72em;margin-left:8px;background:none;border:1px solid #666;border-radius:999px;color:inherit;padding:1px 8px;cursor:pointer;";
+    clearAll.addEventListener("click", () => {
+      if (!confirm("Clear all persistent round history? (This also erases the council's memory.)")) return;
+      ledger = []; persistLedger(); renderSessions();
+      if (memoryPill && memoryPill.refresh) memoryPill.refresh();
+    });
+    title.appendChild(clearAll);
+    wrap.appendChild(title);
+    const list = document.createElement("div");
+    wrap.appendChild(list);
+    historyList.parentNode.insertBefore(wrap, historyList);
+    function renderSessions() {
+      list.innerHTML = "";
+      if (!ledger.length) {
+        const empty = document.createElement("p");
+        empty.style.cssText = "font-size:0.78em;opacity:0.5;";
+        empty.textContent = "No rounds yet. The council's past will appear here and survive reloads.";
+        list.appendChild(empty);
+        return;
+      }
+      ledger.slice().reverse().forEach((e, ri) => {
+        const idx = ledger.length - ri;
+        const card = document.createElement("div");
+        card.className = "rq-sess";
+        const head = document.createElement("div");
+        head.className = "rq-sess-head";
+        const t = document.createElement("span");
+        t.textContent = `#${idx} · ` + (e.prompt || "").split(/\s+/).slice(0, 5).join(" ") + "…";
+        const badge = document.createElement("span");
+        badge.className = "rq-badge" + (e.outcome === "verified" ? " verified" : "");
+        badge.textContent = e.outcome === "divided" ? "DIVIDED" : (e.outcome || "").toUpperCase() + (e.counts ? " " + e.counts : "");
+        head.appendChild(t);
+        head.appendChild(badge);
+        const body = document.createElement("div");
+        body.className = "rq-sess-body";
+        const del = document.createElement("button");
+        del.className = "rq-sess-del";
+        del.textContent = "delete";
+        del.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          ledger.splice(idx - 1, 1); persistLedger(); renderSessions();
+          if (memoryPill && memoryPill.refresh) memoryPill.refresh();
+        });
+        body.appendChild(del);
+        const bodyText = document.createElement("div");
+        bodyText.textContent = "Q: " + e.prompt + "\n\n" + (e.outcome === "divided"
+          ? (e.positions || []).map((p) => p.seat + ":\n" + p.text).join("\n\n")
+          : "Verdict: " + (e.verdict || "—"));
+        body.appendChild(bodyText);
+        head.addEventListener("click", () => card.classList.toggle("open"));
+        card.appendChild(head);
+        card.appendChild(body);
+        list.appendChild(card);
+      });
+    }
+    renderSessions();
+    window.__rqRenderSessions = renderSessions;
+  })();
+
+  // ==================== v3.0.1: Progressive Onboarding + Voice Input (Charter §11.7-8) ====================
+  const KEY_HINTS = [
+    { id: "keyGroq", label: "Groq (FREE — unlocks the Claude seat)", url: "https://console.groq.com/keys", prefix: "gsk_" },
+    { id: "keyOpenRouter", label: "OpenRouter (FREE — unlocks shadow fallbacks)", url: "https://openrouter.ai/keys", prefix: "sk-or-" },
+    { id: "keyCerebras", label: "Cerebras (FREE — unlocks GLM understudy)", url: "https://cloud.cerebras.ai", prefix: "csk-" },
+    { id: "keyGemini", label: "Gemini (primary seat)", url: "https://aistudio.google.com/apikey", prefix: "AIza" },
+    { id: "keyKimi", label: "Kimi / Moonshot (primary seat)", url: "https://platform.moonshot.ai", prefix: "sk-" },
+    { id: "keyClaude", label: "Claude / Anthropic (primary seat)", url: "https://console.anthropic.com", prefix: "sk-ant-" },
+  ];
+  function keyLooksValid(v, prefix) { return !!v && v.length > 20 && (!prefix || v.startsWith(prefix)); }
+
+  function openOnboarding(step) {
+    step = step || 1;
+    const stepDefs = [
+      { title: "Step 1 of 3 — Play immediately", body: "<p>Zero keys needed. Demo Mode simulates the full council so you can feel how deliberation works.</p>", keys: [], cta: "Try Demo Mode", ctaFn: () => { settings.demoMode = true; demoToggle.checked = true; saveSettings(settings); refreshDemoBadge(); summonBtn.click(); } },
+      { title: "Step 2 of 3 — One free key, one live seat", body: "<p>Groq is free and takes ~60 seconds. One key = one real AI advisor answering live.</p>", keys: [KEY_HINTS[0]], cta: "Save & continue", ctaFn: null },
+      { title: "Step 3 of 3 — Unlock the full council", body: "<p>Add the free fallback tier (OpenRouter, Cerebras) and any primary seats you have. Every key you skip just means an understudy fills that chair — she works either way.</p>", keys: KEY_HINTS.slice(1), cta: "Save & finish", ctaFn: null },
+    ];
+    const d = stepDefs[step - 1];
+    let html = "<h3>" + d.title + "</h3>" + d.body;
+    rqModal(html);
+    const box = document.querySelector(".rq-modal");
+    d.keys.forEach((k) => {
+      const label = document.createElement("label");
+      label.style.cssText = "display:block;margin-top:10px;font-size:0.78em;opacity:0.85;";
+      label.textContent = k.label + " ";
+      const a = document.createElement("a");
+      a.href = k.url; a.target = "_blank"; a.textContent = "(get key ↗)";
+      a.style.color = "#d97706";
+      label.appendChild(a);
+      const input = document.createElement("input");
+      input.type = "password"; input.autocomplete = "off";
+      input.placeholder = k.prefix ? k.prefix + "…" : "paste key";
+      input.style.cssText = "display:block;width:100%;margin-top:4px;padding:7px;border-radius:6px;border:1px solid #555;background:rgba(255,255,255,0.05);color:inherit;";
+      input.value = settings[k.id] || "";
+      const mark = document.createElement("span");
+      mark.style.cssText = "font-size:0.78em;";
+      const check = () => {
+        if (!input.value.trim()) { mark.textContent = ""; return; }
+        const ok = keyLooksValid(input.value.trim(), k.prefix);
+        mark.textContent = ok ? " ✅ looks valid" : " ❌ unexpected format (expected " + (k.prefix || "a longer key") + "…)";
+        mark.style.color = ok ? "#16a34a" : "#dc2626";
+      };
+      input.addEventListener("input", check); check();
+      input.dataset.keyId = k.id;
+      box.appendChild(label); box.appendChild(input); box.appendChild(mark);
+    });
+    const nav = document.createElement("div");
+    nav.style.cssText = "margin-top:14px;display:flex;gap:8px;justify-content:flex-end;";
+    const cta = document.createElement("button");
+    cta.className = "rq-cta";
+    cta.textContent = d.cta;
+    cta.addEventListener("click", () => {
+      box.querySelectorAll("input[data-key-id]").forEach((inp) => {
+        const v = inp.value.trim();
+        if (v) { settings[inp.dataset.keyId] = v; const el = $(inp.dataset.keyId); if (el) el.value = v; }
+      });
+      saveSettings(settings);
+      document.querySelector(".rq-modal-scrim").remove();
+      if (d.ctaFn) d.ctaFn();
+      else if (step < 3) openOnboarding(step + 1);
+      else logError("Onboarding complete — keys saved. Summon the council when ready.");
+    });
+    if (step < 3 && !d.ctaFn) {} // cta handles advance
+    if (step > 0 && step < 3) {
+      const skip = document.createElement("button");
+      skip.className = "rq-cta secondary";
+      skip.textContent = step === 1 ? "I have keys →" : "Skip →";
+      skip.addEventListener("click", () => { document.querySelector(".rq-modal-scrim").remove(); openOnboarding(step + 1); });
+      nav.appendChild(skip);
+    }
+    nav.appendChild(cta);
+    box.appendChild(nav);
+  }
+  // Entry points: settings drawer button + landing "Unlock" now routes here.
+  (function ensureOnboardingEntry() {
+    if (saveSettingsBtn && saveSettingsBtn.parentNode) {
+      const b = document.createElement("button");
+      b.textContent = "🧭 Setup Guide (step-by-step)";
+      b.style.cssText = "display:block;margin:10px 0 0;font-size:0.8em;padding:7px 12px;border-radius:999px;border:1px solid #d97706;background:rgba(217,119,6,0.12);color:inherit;cursor:pointer;";
+      b.addEventListener("click", () => openOnboarding(1));
+      saveSettingsBtn.parentNode.insertBefore(b, saveSettingsBtn);
+    }
+    const intro = window.__rqIntro;
+    if (intro) {
+      const unlock = intro.querySelector(".rq-cta.secondary");
+      if (unlock) {
+        const clone = unlock.cloneNode(true);
+        unlock.parentNode.replaceChild(clone, unlock);
+        clone.addEventListener("click", () => openOnboarding(1));
+      }
+    }
+  })();
+
+  // Voice Input — Web Speech API, native, zero cost. 🎤 fills the box.
+  (function ensureVoiceInput() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR || !queryInput || !queryInput.parentNode) return; // unsupported browser: no button, no clutter
+    const mic = document.createElement("button");
+    mic.id = "rqMic";
+    mic.textContent = "🎤";
+    mic.title = "Speak your question";
+    mic.style.cssText = "margin:6px 0 0;font-size:1.05em;padding:6px 12px;border-radius:999px;border:1px solid #666;background:rgba(255,255,255,0.05);color:inherit;cursor:pointer;";
+    let rec = null, listening = false;
+    mic.addEventListener("click", () => {
+      if (listening && rec) { rec.stop(); return; }
+      rec = new SR();
+      rec.lang = navigator.language || "en-US";
+      rec.interimResults = false;
+      rec.maxAlternatives = 1;
+      rec.onstart = () => { listening = true; mic.textContent = "🔴"; mic.title = "Listening… tap to stop"; };
+      rec.onend = () => { listening = false; mic.textContent = "🎤"; mic.title = "Speak your question"; };
+      rec.onerror = (e) => { listening = false; mic.textContent = "🎤"; if (e.error !== "aborted") logError("Voice input error: " + e.error + (e.error === "not-allowed" ? " — allow microphone access in your browser." : "")); };
+      rec.onresult = (e) => {
+        const t = e.results[0] && e.results[0][0] ? e.results[0][0].transcript : "";
+        if (t) { queryInput.value = (queryInput.value ? queryInput.value + " " : "") + t; queryInput.focus(); }
+      };
+      try { rec.start(); } catch (err) { logError("Voice input failed to start: " + (err.message || err)); }
+    });
+    queryInput.parentNode.insertBefore(mic, queryInput.nextSibling);
+  })();
+
   // ---------- Dispatch ----------
   let busy = false;
 
@@ -1268,6 +1591,8 @@
           positions: divided ? allAnswers.map((a) => ({ seat: seatLabel(a.name), text: clip(a.text, 300) })) : null,
         });
         if (memoryPill && memoryPill.refresh) memoryPill.refresh();
+        if (window.__rqRenderSessions) window.__rqRenderSessions();
+        if (window.__rqIntro) { window.__rqIntro.remove(); window.__rqIntro = null; }
         logInstitutionalMemory(dispatchId, query, result);
         // Trust-state prefix (v2.4): the bar itself carries the verification
         // level — a sole understudy's opinion must never wear the Council's
