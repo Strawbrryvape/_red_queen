@@ -460,11 +460,35 @@
     return w.length > 4 ? w.replace(/(ation|tion|ings?|ies|ied|ed|es|e|s)$/, "") : w;
   }
 
+  // ==================== v3.1.0: Phase 1 semantic stopgap + Temporal
+  // Consistency Validator (Kimi charter ruling + council's own request,
+  // 2026-07-15, FLAGGED FOR KIMI REVIEW) ====================
+  // One engine, two organs: (1) synonym canonicalization so "parallel
+  // dispatch" ≈ "concurrent requests" stops scoring as division (three
+  // documented Jaccard failure modes); (2) GLM's Temporal Consistency
+  // Validator — advisory-only flags when a new verdict sits in tension
+  // with a past VERIFIED conclusion. Flags inform the HUMAN; they never
+  // block, reweight, or rewrite anything (advisory-only doctrine).
+  const SYNONYMS = {
+    concurrent: "parallel", simultaneous: "parallel", parallelized: "parallel",
+    sequential: "serial", serialize: "serial", serialized: "serial", mutex: "serial", queue: "serial", queued: "serial",
+    stagger: "pace", staggered: "pace", throttle: "pace", throttled: "pace", ratelimit: "pace", rate: "pace", limit: "pace", limiting: "pace", delay: "pace", delays: "pace", serializ: "serial",
+    llm: "model", ai: "model", agent: "model", advisor: "model",
+    recall: "memory", remember: "memory", ledger: "memory", history: "memory", context: "memory",
+    reliable: "trust", trustworthy: "trust", confidence: "trust", verified: "trust",
+    postgresql: "postgres", db: "database",
+    fetch: "retrieve", retrieval: "retrieve", query: "retrieve",
+    pick: "choose", select: "choose", recommend: "choose", suggestion: "choose", suggest: "choose",
+  };
+  const NEGATORS = /\b(not|no|never|avoid|reject|against|don'?t|shouldn'?t|won'?t|rather than|instead of)\b/gi;
+  function canonical(w) { return SYNONYMS[w] || w; }
+
   function tokenize(text) {
     return new Set(
       text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/)
         .filter((w) => w.length > 2 && !STOPWORDS.has(w))
         .map(stem)
+        .map(canonical)
     );
   }
 
@@ -473,7 +497,33 @@
     if (A.size === 0 || B.size === 0) return 0;
     let inter = 0;
     A.forEach((w) => { if (B.has(w)) inter++; });
-    return inter / (A.size + B.size - inter); // Jaccard index
+    return inter / (A.size + B.size - inter); // Jaccard over canonicalized tokens
+  }
+
+  // Short-anchor relaxation (failure mode 1: tiny token sets are high-
+  // variance — a genuine 2-1 scored as 0). When both texts are short
+  // directives, the floor drops from 0.22 to 0.15 per Kimi's Phase 1 spec.
+  function effectiveThreshold(a, b) {
+    const short = tokenize(a).size <= 12 && tokenize(b).size <= 12;
+    return short ? 0.15 : AGREEMENT_THRESHOLD;
+  }
+
+  // Temporal Consistency Validator (GLM's proposal, council round
+  // 2026-07-15): topically-similar to a past VERIFIED verdict but with
+  // opposite negation polarity → advisory tension flag. Deliberately
+  // modest: it detects CANDIDATE tension for human review, nothing more.
+  function negationCount(text) { return (text.match(NEGATORS) || []).length; }
+  function checkTemporalConsistency(newVerdict) {
+    if (!newVerdict) return;
+    ledger.forEach((e, i) => {
+      if (e.outcome !== "verified" || !e.verdict) return;
+      const sim = similarity(newVerdict, e.verdict);
+      if (sim < 0.3) return; // not the same topic — no comparison
+      const polarityDiff = Math.abs((negationCount(newVerdict) % 2) - (negationCount(e.verdict) % 2));
+      if (polarityDiff > 0) {
+        logError(`⚖ TEMPORAL CONSISTENCY FLAG — today's verdict is topically close to Round ${i + 1}'s VERIFIED conclusion but with opposite polarity. Possible contradiction with settled council law; human review advised. (Advisory only — nothing was blocked or reweighted.)`);
+      }
+    });
   }
 
   const AGREEMENT_THRESHOLD = 0.22; // lexical agreement floor (frontend approximation of backend's 0.7 cosine)
@@ -530,7 +580,7 @@
     }
     const agreed = [], outliers = [];
     answers.forEach((a, i) => {
-      const hasAlly = answers.some((b, j) => i !== j && pairSimilarity(a.text, b.text) >= AGREEMENT_THRESHOLD);
+      const hasAlly = answers.some((b, j) => i !== j && pairSimilarity(a.text, b.text) >= effectiveThreshold(extractDirective(a.text) || a.text, extractDirective(b.text) || b.text));
       (hasAlly ? agreed : outliers).push(a);
     });
     return { agreed, outliers };
@@ -1345,52 +1395,201 @@
     queryInput.parentNode.insertBefore(chips, queryInput.nextSibling);
   })();
 
-  // Persistent Session History — ledger-backed collapsible cards in the
-  // drawer. (Charter names rq_telemetry as source; the ledger holds the
-  // same rounds with full positions, works offline, and is live today —
-  // telemetry-backed history upgrades in v3.0.x once Supabase verified.)
-  (function ensureSessionHistory() {
+  // ==================== v3.0.2: TRANSPARENT CONSENSUS VISUALIZATION
+  // (Kimi+Founder spec 2026-07-15, source: council proposal — Claude
+  // seat/Llama. Pure CSS+JS, ledger-fed, zero dependencies. The former
+  // "PAST ROUNDS" section is upgraded into the spec's Timeline rather
+  // than duplicated as a parallel tab.) ====================
+  const TRUST_COLORS = { verified: "#16a34a", provisional: "#d97706", divided: "#dc2626", sole: "#3b82f6" };
+  const tlcss = document.createElement("style");
+  tlcss.textContent = [
+    "#rqSessions .rq-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; flex:none; }",
+    "#rqTlFilters { display:flex; flex-wrap:wrap; gap:5px; margin:6px 0; }",
+    "#rqTlFilters button { font-size:0.68em; padding:2px 9px; border-radius:999px; border:1px solid #555; background:none; color:inherit; cursor:pointer; opacity:0.7; }",
+    "#rqTlFilters button.on { border-color:#d97706; color:#d97706; opacity:1; }",
+    ".rq-replay { font-size:0.72em; margin-top:6px; padding:3px 10px; border-radius:999px; border:1px solid #d97706; background:rgba(217,119,6,0.12); color:inherit; cursor:pointer; }",
+    "#rqSeatStats .rq-bar { display:flex; height:14px; border-radius:7px; overflow:hidden; margin:3px 0 10px; background:#333; }",
+    "#rqSeatStats .rq-seg { height:100%; }",
+    "#rqSeatStats .rq-lbl { font-size:0.75em; opacity:0.85; }",
+    "#rqFlow { position:fixed; inset:0; z-index:150; display:flex; align-items:center; justify-content:center; pointer-events:none; background:rgba(0,0,0,0.45); }",
+    "#rqFlow .fl-orb { width:22px; height:22px; border-radius:50%; animation:orbPulse 0.6s ease-in-out 2; }",
+    "#rqFlow .fl-stage { position:relative; width:260px; height:170px; }",
+    "#rqFlow .fl-line { position:absolute; width:2px; background:#d97706; transform-origin:top; animation:branchOut 0.7s ease-out forwards; animation-delay:0.7s; transform:scaleY(0); }",
+    "#rqFlow .fl-core { position:absolute; left:50%; bottom:8px; transform:translateX(-50%); width:16px; height:16px; border-radius:50%; opacity:0; animation:beamSolid 0.5s ease-in forwards; animation-delay:1.3s; }",
+    "@keyframes orbPulse { 0%{transform:scale(1);opacity:0.6;} 50%{transform:scale(1.2);opacity:1;} 100%{transform:scale(1);opacity:0.6;} }",
+    "@keyframes branchOut { 0%{transform:scaleY(0);} 100%{transform:scaleY(1);} }",
+    "@keyframes beamSolid { 0%{opacity:0.3;} 100%{opacity:1;} }",
+  ].join("\n");
+  document.head.appendChild(tlcss);
+
+  // Consensus Flow (hero animation, ~2s, spec 4.3): orbs pulse, lines
+  // draw, converge to one core (consensus) or stay branched (divided).
+  function playConsensusFlow(divided, trust) {
+    const wrap = document.createElement("div");
+    wrap.id = "rqFlow";
+    const stage = document.createElement("div");
+    stage.className = "fl-stage";
+    const color = divided ? TRUST_COLORS.divided : (TRUST_COLORS[trust] || "#d97706");
+    [30, 119, 208].forEach((x) => {
+      const orb = document.createElement("div");
+      orb.className = "fl-orb";
+      orb.style.cssText = `position:absolute;top:0;left:${x}px;background:${color};`;
+      stage.appendChild(orb);
+      const line = document.createElement("div");
+      line.className = "fl-line";
+      line.style.left = (x + 10) + "px";
+      line.style.top = "26px";
+      line.style.height = divided ? "120px" : "110px";
+      if (!divided) line.style.transform += ` rotate(${(119 - x) / 4}deg)`;
+      stage.appendChild(line);
+    });
+    if (!divided) {
+      const core = document.createElement("div");
+      core.className = "fl-core";
+      core.style.background = color;
+      stage.appendChild(core);
+    }
+    wrap.appendChild(stage);
+    document.body.appendChild(wrap);
+    setTimeout(() => { wrap.style.transition = "opacity 0.3s"; wrap.style.opacity = "0"; setTimeout(() => wrap.remove(), 350); }, 2000);
+  }
+
+  // Settings toggle for the animation (spec 4.3, default ON)
+  (function ensureFlowToggle() {
+    if (!demoToggle || !demoToggle.parentNode) return;
+    const lbl = document.createElement("label");
+    lbl.style.cssText = "display:block;margin-top:8px;font-size:0.78em;opacity:0.85;cursor:pointer;";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = settings.flowAnim !== false;
+    cb.addEventListener("change", () => { settings.flowAnim = cb.checked; saveSettings(settings); });
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(" Show consensus animation"));
+    demoToggle.parentNode.parentNode.appendChild(lbl);
+  })();
+
+  // Timeline (spec 4.1) + Seat Stats (spec 4.2), ledger-fed.
+  (function ensureTimeline() {
     if (!historyList || !historyList.parentNode) return;
     const wrap = document.createElement("div");
     wrap.id = "rqSessions";
     const title = document.createElement("h3");
-    title.textContent = "PAST ROUNDS (persistent)";
+    title.textContent = "TIMELINE";
     title.style.cssText = "font-size:0.78em;letter-spacing:0.05em;opacity:0.7;margin:14px 0 4px;";
+    const statsBtn = document.createElement("button");
+    statsBtn.textContent = "Seat Stats";
+    statsBtn.style.cssText = "font-size:0.72em;margin-left:8px;background:none;border:1px solid #666;border-radius:999px;color:inherit;padding:1px 8px;cursor:pointer;";
     const clearAll = document.createElement("button");
     clearAll.textContent = "Clear all";
-    clearAll.style.cssText = "font-size:0.72em;margin-left:8px;background:none;border:1px solid #666;border-radius:999px;color:inherit;padding:1px 8px;cursor:pointer;";
+    clearAll.style.cssText = statsBtn.style.cssText;
     clearAll.addEventListener("click", () => {
-      if (!confirm("Clear all persistent round history? (This also erases the council's memory.)")) return;
+      if (!confirm("Clear the whole timeline? (This also erases the council's memory.)")) return;
       ledger = []; persistLedger(); renderSessions();
       if (memoryPill && memoryPill.refresh) memoryPill.refresh();
     });
+    title.appendChild(statsBtn);
     title.appendChild(clearAll);
     wrap.appendChild(title);
+    const filters = document.createElement("div");
+    filters.id = "rqTlFilters";
+    let activeFilter = "all";
+    ["all", "verified", "provisional", "sole", "divided"].forEach((f) => {
+      const b = document.createElement("button");
+      b.textContent = f.toUpperCase();
+      if (f === "all") b.classList.add("on");
+      b.addEventListener("click", () => {
+        activeFilter = f;
+        filters.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
+        b.classList.add("on");
+        renderSessions();
+      });
+      filters.appendChild(b);
+    });
+    wrap.appendChild(filters);
+    const stats = document.createElement("div");
+    stats.id = "rqSeatStats";
+    stats.style.display = "none";
+    wrap.appendChild(stats);
     const list = document.createElement("div");
     wrap.appendChild(list);
     historyList.parentNode.insertBefore(wrap, historyList);
+
+    function renderStats() {
+      // Reduce over ledger: per seat — verified/provisional contributions,
+      // sole voice, divided, malformed/failed. Absent from a round's
+      // roster = failed that round. Pre-v3.0.2 entries lack rosters; skipped.
+      const seatsAll = ["gemini", "kimi", "claude"];
+      const agg = {};
+      seatsAll.forEach((s) => (agg[s] = { ok: 0, sole: 0, div: 0, fail: 0 }));
+      let counted = 0;
+      ledger.forEach((e) => {
+        if (!e.seats) return;
+        counted++;
+        const present = new Set(e.seats.filter((x) => !x.m).map((x) => x.n));
+        seatsAll.forEach((s) => {
+          if (!present.has(s)) { agg[s].fail++; return; }
+          if (e.outcome === "divided") agg[s].div++;
+          else if (e.outcome === "sole") agg[s].sole++;
+          else agg[s].ok++;
+        });
+      });
+      stats.innerHTML = "";
+      if (!counted) { stats.innerHTML = "<p class=\'rq-lbl\'>No rounds with seat data yet (recorded from v3.0.2 onward).</p>"; return; }
+      seatsAll.forEach((s) => {
+        const a = agg[s], total = a.ok + a.sole + a.div + a.fail || 1;
+        const lbl = document.createElement("div");
+        lbl.className = "rq-lbl";
+        lbl.textContent = s[0].toUpperCase() + s.slice(1) + ` — consensus ${a.ok}, sole ${a.sole}, divided ${a.div}, failed ${a.fail}`;
+        const bar = document.createElement("div");
+        bar.className = "rq-bar";
+        [[a.ok, TRUST_COLORS.verified], [a.sole, TRUST_COLORS.sole], [a.div, TRUST_COLORS.divided], [a.fail, "#666"]].forEach(([n, c]) => {
+          if (!n) return;
+          const seg = document.createElement("div");
+          seg.className = "rq-seg";
+          seg.style.cssText = `width:${(100 * n / total).toFixed(1)}%;background:${c};`;
+          seg.title = `${n}/${total}`;
+          bar.appendChild(seg);
+        });
+        stats.appendChild(lbl);
+        stats.appendChild(bar);
+      });
+    }
+    statsBtn.addEventListener("click", () => {
+      const show = stats.style.display === "none";
+      stats.style.display = show ? "" : "none";
+      list.style.display = show ? "none" : "";
+      statsBtn.textContent = show ? "Timeline" : "Seat Stats";
+      if (show) renderStats();
+    });
+
     function renderSessions() {
       list.innerHTML = "";
-      if (!ledger.length) {
+      const rows = ledger.map((e, i) => ({ e, i })).filter((r) => activeFilter === "all" || r.e.outcome === activeFilter);
+      if (!rows.length) {
         const empty = document.createElement("p");
         empty.style.cssText = "font-size:0.78em;opacity:0.5;";
-        empty.textContent = "No rounds yet. The council's past will appear here and survive reloads.";
+        empty.textContent = activeFilter === "all" ? "No rounds yet. The council's past appears here and survives reloads." : "No " + activeFilter.toUpperCase() + " rounds yet.";
         list.appendChild(empty);
         return;
       }
-      ledger.slice().reverse().forEach((e, ri) => {
-        const idx = ledger.length - ri;
+      rows.reverse().forEach(({ e, i }) => {
         const card = document.createElement("div");
         card.className = "rq-sess";
         const head = document.createElement("div");
         head.className = "rq-sess-head";
         const t = document.createElement("span");
-        t.textContent = `#${idx} · ` + (e.prompt || "").split(/\s+/).slice(0, 5).join(" ") + "…";
+        t.style.cssText = "display:flex;align-items:center;min-width:0;";
+        const dot = document.createElement("span");
+        dot.className = "rq-dot";
+        dot.style.background = TRUST_COLORS[e.outcome] || "#888";
+        const txt = document.createElement("span");
+        txt.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+        txt.textContent = `#${i + 1} · ` + clip(e.prompt || "", 40);
+        t.appendChild(dot); t.appendChild(txt);
         const badge = document.createElement("span");
         badge.className = "rq-badge" + (e.outcome === "verified" ? " verified" : "");
         badge.textContent = e.outcome === "divided" ? "DIVIDED" : (e.outcome || "").toUpperCase() + (e.counts ? " " + e.counts : "");
-        head.appendChild(t);
-        head.appendChild(badge);
+        head.appendChild(t); head.appendChild(badge);
         const body = document.createElement("div");
         body.className = "rq-sess-body";
         const del = document.createElement("button");
@@ -1398,7 +1597,7 @@
         del.textContent = "delete";
         del.addEventListener("click", (ev) => {
           ev.stopPropagation();
-          ledger.splice(idx - 1, 1); persistLedger(); renderSessions();
+          ledger.splice(i, 1); persistLedger(); renderSessions();
           if (memoryPill && memoryPill.refresh) memoryPill.refresh();
         });
         body.appendChild(del);
@@ -1407,6 +1606,16 @@
           ? (e.positions || []).map((p) => p.seat + ":\n" + p.text).join("\n\n")
           : "Verdict: " + (e.verdict || "—"));
         body.appendChild(bodyText);
+        const replay = document.createElement("button");
+        replay.className = "rq-replay";
+        replay.textContent = "↻ Replay this dispatch";
+        replay.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          queryInput.value = e.prompt;
+          if (drawerClose) drawerClose.click();
+          summonBtn.click();
+        });
+        body.appendChild(replay);
         head.addEventListener("click", () => card.classList.toggle("open"));
         card.appendChild(head);
         card.appendChild(body);
@@ -1582,6 +1791,9 @@
         allAnswers = result.answers || [];
         // v2.9: record the round in the ledger (raw prompt, trust-tagged
         // outcome) and fire institutional memory writes (never awaited).
+        // v3.1.0: Temporal Consistency Validator — check the new verdict
+        // against past VERIFIED conclusions before it enters memory.
+        if (!divided && result.text) checkTemporalConsistency(result.text);
         recordLedger({
           t: Date.now(),
           prompt: query,
@@ -1589,7 +1801,11 @@
           counts: result.agreedCount != null ? `${result.agreedCount}/${result.eligibleCount}` : "",
           verdict: divided ? null : clip(result.text, 600),
           positions: divided ? allAnswers.map((a) => ({ seat: seatLabel(a.name), text: clip(a.text, 300) })) : null,
+          // v3.0.2: per-seat roster for Seat Stats — who answered, who was
+          // malformed; absent seats failed that round.
+          seats: allAnswers.map((a) => ({ n: a.name, m: !!a.malformed })),
         });
+        if (typeof playConsensusFlow === "function" && settings.flowAnim !== false) playConsensusFlow(divided, result.trust);
         if (memoryPill && memoryPill.refresh) memoryPill.refresh();
         if (window.__rqRenderSessions) window.__rqRenderSessions();
         if (window.__rqIntro) { window.__rqIntro.remove(); window.__rqIntro = null; }
