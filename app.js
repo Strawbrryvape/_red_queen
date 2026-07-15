@@ -114,6 +114,14 @@
   // confirmed mechanism. Applied to Cerebras (GLM) and OpenRouter
   // (hosts Nemotron, which also truncated twice tonight).
   const REASONING_MAX_TOKENS = 2000;
+  // v2.9.2 (2026-07-14): GLM's final appeal. At 2000 it produced "as"
+  // then thought itself to death (all budget burned in an unclosed
+  // <think>, correctly stripped). One last doubling, Cerebras seat only
+  // — 10 dispatches at 4000 is 4% of the 1M/day quota. If GLM fails at
+  // 4000 the diagnosis is confirmed UNBOUNDED REASONER (thinks past any
+  // budget) and the seat recasts per Kimi's standing eviction ruling —
+  // with the accurate cause of death recorded in her memory.
+  const CEREBRAS_MAX_TOKENS = 4000;
 
   // ---------- Understudy state (Groq filling Claude's seat, Cerebras filling Gemini's) ----------
   function groqUnderstudy() {
@@ -547,7 +555,7 @@
       body: JSON.stringify({
         model: CEREBRAS_MODEL,
         messages: [{ role: "user", content: query }],
-        max_tokens: REASONING_MAX_TOKENS, // v2.7.2: GLM thinks before speaking
+        max_tokens: CEREBRAS_MAX_TOKENS, // v2.9.2: GLM final appeal — thinks before speaking, now with 4000
       }),
     }, "Cerebras");
     if (res.status === 404) throw new Error(`Cerebras model ${CEREBRAS_MODEL} unavailable (404) — free catalog churned; swap CEREBRAS_MODEL for a current model from cloud.cerebras.ai`);
@@ -564,7 +572,7 @@
     text = text.trim();
     // v2.7.2: an empty answer after stripping is a diagnosis, not a
     // mystery — fail loudly instead of returning "" ("unknown error").
-    if (!text) throw new Error(`Cerebras ${CEREBRAS_MODEL} spent its entire token budget reasoning and never produced a final answer (truncated mid-<think>). Headroom is ${REASONING_MAX_TOKENS} — if this recurs, raise it or shorten prompts.`);
+    if (!text) throw new Error(`Cerebras ${CEREBRAS_MODEL} spent its entire token budget reasoning and never produced a final answer (truncated mid-<think>). Headroom is ${CEREBRAS_MAX_TOKENS} — if this recurs, raise it or shorten prompts.`);
     return text;
   }
 
