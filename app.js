@@ -161,6 +161,50 @@
     return cap;
   }
 
+  // ---------- v3.1 Task 4: TIER_DECAY (SHADOW MODE) ----------
+  // Kimi-ratified 2026-07-17. PROPOSED schedule, NOT yet ratified — config
+  // edit, not a code change, if the values move.
+  //
+  // SCOPE CORRECTION (Fable, 2026-07-17): Task 4's stated purpose was "weight
+  // degrades with provenance." It ALREADY DOES — SEAT_WEIGHTS is provider-keyed
+  // and seatWeight() reads the live seatProvider. The petition's premise was
+  // wrong. What genuinely does NOT exist is WALK DEPTH: a seat on OpenRouter
+  // slot 1 and a seat that failed and walked to slot 2 both score 0.5 today.
+  // Tiers 2 and 3 below are the only new information in this table.
+  //
+  // DOUBLE-COUNT WARNING — REQUIRES KIMI'S RULING BEFORE ANY PROMOTION:
+  // the spec says weightEffective = weightBase * TIER_DECAY[tier]. Because
+  // weightBase is ALREADY provider-decayed, this multiplies the same penalty
+  // twice. Example: Claude seat on Groq = base 0.75 (already decayed from 1.0)
+  // x TIER_DECAY[1] 0.7 = 0.53 — a 47% penalty for one failover hop. That is
+  // almost certainly not what was intended. Implemented literally as specced so
+  // the ratified schedule is testable in shadow, and logged side-by-side with
+  // the live weight so the divergence is measurable rather than argued.
+  // Options for the ruling: (a) TIER_DECAY REPLACES SEAT_WEIGHTS as the single
+  // source of truth, (b) decay applies to WALK DEPTH ONLY on top of the
+  // existing provider weight, (c) schedule is re-cut to compose correctly.
+  // NOTHING IS PROMOTED TO CONSENSUS UNTIL THIS IS RULED ON.
+  const TIER_DECAY = { 0: 1.0, 1: 0.7, 2: 0.5, 3: 0.35, floor: 0.25 };
+
+  // tier 0 = primary | 1 = dedicated understudy (Groq/Cerebras)
+  // tier 2 = OpenRouter slot 1 | tier 3+ = walked-to OpenRouter slot
+  function seatTier(name) {
+    const p = seatProvider[name] || configuredProvider(name);
+    if (p === "groq" || p === "cerebras") return 1;
+    if (p === "openrouter") {
+      const list = OR_SEAT_MODELS[name] || [];
+      const idx = list.indexOf(orActiveModel[name] || "");
+      return 2 + (idx > 0 ? idx : 0);
+    }
+    return 0;
+  }
+  function seatWeightEffective(name) {
+    const t = seatTier(name);
+    const decay = typeof TIER_DECAY[t] === "number" ? TIER_DECAY[t] : TIER_DECAY[3];
+    const w = seatBaseWeight(name) * decay;
+    return Math.max(TIER_DECAY.floor, Math.round(w * 100) / 100);
+  }
+
   // ---------- v3.1 Task 1: Seat Health Badge (Kimi-ratified 2026-07-17) ----------
   // Renders the ACTUAL occupant of each chair in the seat header instead of
   // only in the drawer logs. Zero-HTML-change doctrine: styles injected here,
@@ -1074,7 +1118,19 @@
     results.forEach((r, i) => {
       const name = calls[i].name;
       if (r.status === "fulfilled" && r.value) {
-        answers.push({ name, text: r.value });
+        // v3.1 Task 4: provenance travels WITH the answer. seatProvider is
+        // final for this seat by now (all promises settled), so the snapshot
+        // is accurate. Task 5's session JSON reads these fields.
+        answers.push({
+          name,
+          text: r.value,
+          tier: seatTier(name),
+          provider: seatProvider[name] || "primary",
+          model: seatModelLabel(name),
+          weightBase: seatBaseWeight(name),
+          weightLive: seatWeight(name),          // what consensus actually uses
+          weightEffective: seatWeightEffective(name), // SHADOW — not used
+        });
         // Circuit reset fix (2026-07-13, KIMI-RATIFIED same day): only a
         // healthy PRIMARY closes its own circuit — "a fallback rescue is
         // evidence the fallback is healthy, not the primary." Previously a fallback
@@ -1127,6 +1183,30 @@
     if (agreed.length >= 2 && !hasPrimaryVoice) {
       logError("Consensus is PROVISIONAL — no primary voice (Gemini Pro / Kimi / Claude live) in the agreeing set. Treat as workflow continuity, not verified consensus.");
     }
+    // ---------- v3.1 Task 4: SHADOW MODE logging ----------
+    // Logged only. The live consensus math above is UNCHANGED and still uses
+    // seatWeight(). This block exists so the ratified TIER_DECAY schedule can
+    // be evaluated against real rounds before anyone promotes it.
+    eligible.forEach((a) => {
+      const t = seatTier(a.name);
+      const live = seatWeight(a.name);
+      const shadow = seatWeightEffective(a.name);
+      logError(`SHADOW WEIGHT — ${seatLabel(a.name)}: tier ${t}, base ${seatBaseWeight(a.name)}, LIVE weight ${live} (used), shadow weightEffective ${shadow} (not used, delta ${Math.round((shadow - live) * 100) / 100}).`);
+    });
+    (function shadowTagRule() {
+      const allDeep = eligible.length > 0 && eligible.every((a) => seatTier(a.name) >= 2);
+      const livePrimary = agreed.some((a) => seatProvider[a.name] === "primary");
+      if (allDeep) {
+        logError(`SHADOW TAG RULE — every eligible seat is tier \u22652. TIER_DECAY rule would downgrade this round's tag (VERIFIED\u2192PROVISIONAL, PROVISIONAL\u2192DIVIDED). Shadow only; tag unchanged.`);
+      }
+      // The existing hasPrimaryVoice rule (2026-07-12) already covers most of
+      // this. Log where the two rules DISAGREE — that delta is the only
+      // evidence that justifies adding a second rule at all.
+      if (allDeep !== !livePrimary) {
+        logError(`SHADOW RULE DIVERGENCE — tier rule says allDeep=${allDeep}, existing primary-voice rule says noPrimary=${!livePrimary}. The two rules disagree on this round; Kimi should see this before the tier rule is promoted.`);
+      }
+    })();
+
     if (agreed.length < 2) {
       // No consensus — by design, Red Queen declines to force an answer
       logError(`Consensus round FAILED by design — ${eligible.length} eligible agents, 0 agreements above threshold. Individual positions logged to Session History.`);
@@ -1412,10 +1492,15 @@
       session_id: RQ_SESSION_ID,
       dispatch_id: dispatchId,
       seat_label: seatLabel(a.name),
-      provider: seatProvider[a.name] || "primary",
-      model: seatLabel(a.name),
+      provider: a.provider || seatProvider[a.name] || "primary",
+      model: a.model || seatLabel(a.name),
       event_type: a.malformed ? "answer_malformed" : "answer",
-      consensus_weight: seatWeight(a.name),
+      consensus_weight: typeof a.weightLive === "number" ? a.weightLive : seatWeight(a.name),
+      // v3.1 Task 4 — provenance columns (Task 5 session JSON reads these).
+      // weight_effective is SHADOW: logged, never used in consensus.
+      tier: typeof a.tier === "number" ? a.tier : seatTier(a.name),
+      weight_base: typeof a.weightBase === "number" ? a.weightBase : seatBaseWeight(a.name),
+      weight_effective: typeof a.weightEffective === "number" ? a.weightEffective : seatWeightEffective(a.name),
     }));
     rows.push({
       session_id: RQ_SESSION_ID,
