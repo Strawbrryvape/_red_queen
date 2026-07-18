@@ -1,4 +1,4 @@
- /* Red Queen v2.1 — Command Center logic
+    /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -938,138 +938,88 @@
   }
 
   // ---------- v3.1.2: Markdown Presentation Layer ----------
-  // Founder + Gemini Pro request 2026-07-18. The council's verdicts arrive as
-  // markdown (models write lists, headings, fenced code) but were assigned via
-  // .textContent, which flattens every paragraph break into one wall of text.
-  //
-  // DOCTRINE TENSION — READ BEFORE RATIFYING (Fable):
-  // app.js line ~1393 states: "Cards render via textContent, never innerHTML:
-  // model output is untrusted input." This layer deliberately introduces
-  // innerHTML for model output. That is an XSS surface: a model can emit
-  // <img onerror=...> and a seat can be a rate-limited free-tier stranger.
-  // DOMPurify is the entire mitigation, so the rule here is ABSOLUTE:
-  //   innerHTML is used IF AND ONLY IF DOMPurify is present and sanitizing.
-  // marked without DOMPurify => we do NOT render HTML. We fall back. No
-  // exceptions, no "probably fine" path. If the sanitizer is missing the
-  // doctrine reverts to textContent, which is where it started.
-  //
-  // CSP WARNING — LIKELY BLOCKER, MUST BE VERIFIED BY THE FOUNDER:
-  // index.html carries a Content-Security-Policy meta tag (it was amended on
-  // 2026-07-13 to whitelist the Cerebras host). No CDN script is loaded
-  // anywhere else in this file, so script-src almost certainly does NOT allow
-  // jsdelivr. If so, BOTH library loads are blocked by the browser and this
-  // layer silently falls back forever. Fixing that requires editing
-  // index.html's CSP — which BREAKS the zero-HTML-change doctrine. That is a
-  // ruling for Kimi, not a decision for me. See CHANGELOG for the exact line.
-  //
-  // WHY THE FALLBACK IS NOT A CONSOLATION PRIZE:
-  // The reported bug is "flattens all paragraph spacing." white-space:pre-wrap
-  // fixes exactly that, with zero new dependencies, zero CSP change and zero
-  // XSS surface. If the CDNs are blocked the primary complaint is STILL fixed;
-  // only rich rendering (real bullets, styled code blocks) is lost.
+  // Verdicts arrive as markdown; .textContent flattened them into one block.
+  // SECURITY GATE IS ABSOLUTE: innerHTML is used IFF DOMPurify is present and
+  // sanitizing. marked without DOMPurify => plain-text fallback, no exceptions.
+  // CSP NOTE: needs cdn.jsdelivr.net in script-src (index.html edit — Kimi's
+  // ruling). If blocked, pre-wrap fallback still fixes the flattening.
   const MD_SOURCES = [
     { key: "marked", url: "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js", check: () => typeof window.marked !== "undefined" },
     { key: "DOMPurify", url: "https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js", check: () => typeof window.DOMPurify !== "undefined" },
   ];
-  const MD_LOAD_TIMEOUT = 5000; // never hang a verdict on a CDN
+  const MD_LOAD_TIMEOUT = 5000;
   let mdReady = false;
   let mdEnginePromise = null;
-
   function loadScriptOnce(src, isLoaded) {
     return new Promise((resolve) => {
       if (isLoaded()) return resolve(true);
       const s = document.createElement("script");
-      s.src = src;
-      s.async = true;
+      s.src = src; s.async = true;
       s.onload = () => resolve(isLoaded());
-      s.onerror = () => resolve(false); // CSP block lands here
+      s.onerror = () => resolve(false);
       document.head.appendChild(s);
       setTimeout(() => resolve(isLoaded()), MD_LOAD_TIMEOUT);
     });
   }
-
   function ensureMarkdownEngine() {
     if (mdEnginePromise) return mdEnginePromise;
     mdEnginePromise = (async () => {
       try {
-        const results = await Promise.all(MD_SOURCES.map((m) => loadScriptOnce(m.url, m.check)));
-        // BOTH required. marked alone is a security regression, not a feature.
-        mdReady = results.every(Boolean) && MD_SOURCES.every((m) => m.check());
+        const r = await Promise.all(MD_SOURCES.map((m) => loadScriptOnce(m.url, m.check)));
+        mdReady = r.every(Boolean) && MD_SOURCES.every((m) => m.check());
         if (!mdReady) {
-          const missing = MD_SOURCES.filter((m) => !m.check()).map((m) => m.key).join(" + ");
-          logError(`MARKDOWN LAYER — ${missing} did not load (CDN blocked, offline, or Content-Security-Policy script-src does not allow cdn.jsdelivr.net). Falling back to pre-wrap plain text: paragraph spacing is preserved, rich formatting is not. Verdicts are unaffected.`);
+          const miss = MD_SOURCES.filter((m) => !m.check()).map((m) => m.key).join(" + ");
+          logError(`MARKDOWN LAYER — ${miss} did not load (CDN blocked, offline, or CSP script-src disallows cdn.jsdelivr.net). Falling back to pre-wrap: paragraph spacing preserved, rich formatting not. Verdicts unaffected.`);
         }
-      } catch (e) {
-        mdReady = false;
-      }
+      } catch (e) { mdReady = false; }
       return mdReady;
     })();
     return mdEnginePromise;
   }
-
   let mdStyled = false;
   function ensureMarkdownStyles() {
-    if (mdStyled) return;
-    mdStyled = true;
+    if (mdStyled) return; mdStyled = true;
     const style = document.createElement("style");
     style.textContent = [
-      // Fallback: this alone fixes the reported "super block" flattening.
       ".rq-md-plain { white-space: pre-wrap; word-break: break-word; }",
       ".rq-md { word-break: break-word; }",
-      ".rq-md > *:first-child { margin-top: 0; }",
-      ".rq-md > *:last-child { margin-bottom: 0; }",
+      ".rq-md > *:first-child { margin-top: 0; } .rq-md > *:last-child { margin-bottom: 0; }",
       ".rq-md p { margin: 0 0 0.85em; line-height: 1.55; }",
       ".rq-md ul, .rq-md ol { margin: 0 0 0.85em; padding-left: 1.4em; }",
       ".rq-md li { margin: 0.25em 0; line-height: 1.5; }",
-      ".rq-md h1, .rq-md h2, .rq-md h3, .rq-md h4 { margin: 1.1em 0 0.5em; line-height: 1.3; font-weight: 600; }",
-      ".rq-md h1 { font-size: 1.25em; } .rq-md h2 { font-size: 1.15em; } .rq-md h3 { font-size: 1.05em; } .rq-md h4 { font-size: 1em; }",
-      ".rq-md code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: rgba(127,127,127,0.16); padding: 0.12em 0.38em; border-radius: 4px; }",
+      ".rq-md h1,.rq-md h2,.rq-md h3,.rq-md h4 { margin: 1.1em 0 0.5em; line-height: 1.3; font-weight: 600; }",
+      ".rq-md h1{font-size:1.25em}.rq-md h2{font-size:1.15em}.rq-md h3{font-size:1.05em}",
+      ".rq-md code { font-family: ui-monospace,Menlo,monospace; font-size: 0.88em; background: rgba(127,127,127,0.16); padding: 0.12em 0.38em; border-radius: 4px; }",
       ".rq-md pre { background: rgba(127,127,127,0.12); border: 1px solid rgba(127,127,127,0.25); border-radius: 6px; padding: 10px 12px; margin: 0 0 0.85em; overflow-x: auto; }",
-      ".rq-md pre code { background: none; padding: 0; font-size: 0.85em; line-height: 1.45; }",
+      ".rq-md pre code { background: none; padding: 0; }",
       ".rq-md blockquote { margin: 0 0 0.85em; padding-left: 0.9em; border-left: 3px solid rgba(127,127,127,0.4); opacity: 0.9; }",
       ".rq-md table { border-collapse: collapse; margin: 0 0 0.85em; display: block; overflow-x: auto; }",
-      ".rq-md th, .rq-md td { border: 1px solid rgba(127,127,127,0.3); padding: 5px 9px; text-align: left; font-size: 0.92em; }",
-      ".rq-md hr { border: 0; border-top: 1px solid rgba(127,127,127,0.3); margin: 1.1em 0; }",
+      ".rq-md th,.rq-md td { border: 1px solid rgba(127,127,127,0.3); padding: 5px 9px; }",
       ".rq-md a { color: inherit; text-decoration: underline; }",
       ".rq-trust { display: block; margin-bottom: 0.6em; opacity: 0.92; }",
     ].join("\n");
     document.head.appendChild(style);
   }
-
   function mdPaint(el, text) {
     ensureMarkdownStyles();
     const str = String(text == null ? "" : text);
-    // The security gate. Both libraries, or plain text. Nothing in between.
     if (mdReady && typeof window.marked !== "undefined" && typeof window.DOMPurify !== "undefined") {
       try {
         const html = window.DOMPurify.sanitize(window.marked.parse(str), { USE_PROFILES: { html: true } });
-        el.classList.remove("rq-md-plain");
-        el.classList.add("rq-md");
-        el.innerHTML = html; // sanitized above — the ONLY path that reaches here
+        el.classList.remove("rq-md-plain"); el.classList.add("rq-md");
+        el.innerHTML = html; // sanitized above — ONLY path that reaches innerHTML
         return;
-      } catch (e) {
-        // parser/sanitizer threw on hostile or malformed output — degrade, never guess
-      }
+      } catch (e) { /* degrade to text */ }
     }
-    el.classList.remove("rq-md");
-    el.classList.add("rq-md-plain");
+    el.classList.remove("rq-md"); el.classList.add("rq-md-plain");
     el.textContent = str;
   }
-
-  // Paint immediately with whatever is available, then upgrade in place once
-  // the engine lands. A verdict is never delayed waiting on a CDN.
   function renderRich(el, text) {
     if (!el) return;
     el.__rqText = text;
     mdPaint(el, text);
-    if (!mdReady) {
-      ensureMarkdownEngine().then((ok) => {
-        if (ok && el.__rqText === text) mdPaint(el, text);
-      });
-    }
+    if (!mdReady) ensureMarkdownEngine().then((ok) => { if (ok && el.__rqText === text) mdPaint(el, text); });
   }
-
-  // Warm the engine at boot so the first verdict is usually already rich.
   ensureMarkdownEngine();
 
   // ---------- v3.1.1 Task 2b: Live catalog discovery (ADVISORY ONLY) ----------
@@ -1272,6 +1222,163 @@
     } catch (e) { /* cosmetic — never block boot */ }
   })();
 
+  // ---------- v3.2: Adjudication Round (Kimi-ratified) ----------
+  // Fires ONLY on a DIVIDED result, and ONLY on the RAW per-seat answers —
+  // BEFORE any synthesis. This ordering is load-bearing: the 2026-07-18
+  // corrigibility probe proved a synthesized voice cannot assign individual
+  // error ("I did not make that claim" spoken for all three seats at once).
+  // Self-audit must see the seats un-merged or it is structurally blind.
+  //
+  // Each answering seat is shown every OTHER seat's answer, ANONYMIZED as
+  // "Position A/B/C" (no model or seat names — an understudy told it argues
+  // with "Kimi" defers to the label, not the argument). It returns a
+  // structured verdict. THE SYCOPHANCY GUARD (Requirement 2.4): a concession
+  // with an empty/generic error field DOES NOT COUNT. Llama-class models fold
+  // the instant they are challenged; a seat that flips without naming the
+  // error is collapsing, not reasoning. Unearned concessions are logged as a
+  // trust signal, never used to resolve.
+  const ADJUDICATION_ENABLED_KEY = "rq_adjudication_enabled";
+  function adjudicationEnabled() {
+    // Default ON — it only fires on DIVIDED rounds, which are already the
+    // expensive case, and it can only IMPROVE a divided outcome.
+    return localStorage.getItem(ADJUDICATION_ENABLED_KEY) !== "off";
+  }
+
+  function letterFor(i) { return String.fromCharCode(65 + i); } // 0->A
+
+  // A concession counts only if it names a specific, locatable error.
+  // Rejects empties, and generic collapse ("you're right", "good point",
+  // "I agree", "on reflection") with no located flaw.
+  function isSubstantiveError(err) {
+    if (!err || typeof err !== "string") return false;
+    const e = err.trim();
+    if (e.length < 25) return false; // too short to locate anything
+    const generic = /^(you'?re right|good point|i agree|on reflection|fair enough|that'?s correct|yes,?\s|indeed|agreed)\b/i;
+    if (generic.test(e) && e.length < 60) return false;
+    return true;
+  }
+
+  function parseAdjVerdict(raw) {
+    // Seats are asked for JSON; free-tier models wrap it in prose or fences.
+    // Extract the first balanced {...} and parse defensively.
+    if (!raw) return null;
+    let s = String(raw).replace(/```json|```/gi, "");
+    const a = s.indexOf("{"), b = s.lastIndexOf("}");
+    if (a === -1 || b <= a) return null;
+    try {
+      const o = JSON.parse(s.slice(a, b + 1));
+      const verdict = String(o.verdict || "").toLowerCase().trim();
+      if (!["concede", "refute", "hold"].includes(verdict)) return null;
+      return {
+        verdict,
+        target: o.target ? String(o.target).trim() : null,
+        error: o.error ? String(o.error).trim() : "",
+        confidence: typeof o.confidence === "number" ? o.confidence : null,
+      };
+    } catch (e) { return null; }
+  }
+
+  function buildAdjPrompt(originalQuery, selfLetter, positions) {
+    const board = positions
+      .map((p) => `Position ${p.letter}:\n${p.text}`)
+      .join("\n\n");
+    return (
+      "You are one voice in a panel that returned NO CONSENSUS on the question below. " +
+      "Your job now is to adjudicate — find the truth, not to keep the peace.\n\n" +
+      "ORIGINAL QUESTION:\n" + originalQuery + "\n\n" +
+      "ALL POSITIONS (anonymized — you do not know which is whose, including your own):\n" +
+      board + "\n\n" +
+      "You submitted Position " + selfLetter + ".\n\n" +
+      "Examine the OTHER positions against the question. Then return ONLY a JSON object, no prose:\n" +
+      '{"verdict": "concede" | "refute" | "hold", "target": "<the position letter you are conceding to or refuting>", "error": "<the SPECIFIC, located flaw — which claim, and why it is wrong. Required for concede or refute.>", "confidence": <0.0-1.0>}\n\n' +
+      "RULES:\n" +
+      "- concede: another position is right and yours has a specific error. You MUST state that error precisely — its location and why. 'You are right' or 'good point' is NOT an error and will be rejected.\n" +
+      "- refute: another position has a specific error. Name it precisely.\n" +
+      "- hold: you stand by your position and no other position located a real flaw in it. Say in one sentence why the disagreement does not change your answer.\n" +
+      "A concession that does not name a locatable error does not count. Reason it through yourself."
+    );
+  }
+
+  // Run the adjudication round. Returns a resolution object or null.
+  async function runAdjudication(originalQuery, rawAnswers, wrappedCalls) {
+    if (!adjudicationEnabled()) return null;
+    const answering = rawAnswers.filter((a) => a.text && !a.malformed);
+    if (answering.length < 2) return null;
+
+    // Anonymize. Letter assignment is stable within this round only.
+    const positions = answering.map((a, i) => ({
+      letter: letterFor(i), seat: a.name, text: a.text,
+    }));
+    logError(`ADJUDICATION — DIVIDED round enters cross-examination. ${positions.length} positions, anonymized. Each seat sees the others and must locate a specific error or hold.`);
+
+    // Dispatch per seat via its live call path (the wrapped failover fn that
+    // occupies the chair this dispatch), passed in from runLiveCouncil.
+    const seatFns = {};
+    (wrappedCalls || []).forEach((c) => { seatFns[c.name] = c.fn; });
+
+    const verdicts = [];
+    for (const p of positions) {
+      const fn = seatFns[p.seat];
+      if (!fn) continue;
+      const prompt = buildAdjPrompt(originalQuery, p.letter, positions);
+      try {
+        const raw = await fn(prompt);
+        const v = parseAdjVerdict(raw);
+        if (!v) {
+          logError(`ADJUDICATION — ${seatLabel(p.seat)} (Position ${p.letter}) returned no parseable verdict. Treated as HOLD.`);
+          verdicts.push({ letter: p.letter, seat: p.seat, verdict: "hold", target: null, error: "", counted: false });
+          continue;
+        }
+        // The sycophancy guard.
+        const substantive = (v.verdict === "concede" || v.verdict === "refute") ? isSubstantiveError(v.error) : true;
+        if ((v.verdict === "concede" || v.verdict === "refute") && !substantive) {
+          logError(`\u26A0 ADJUDICATION — ${seatLabel(p.seat)} (Position ${p.letter}) ${v.verdict.toUpperCase()}D to ${v.target || "?"} WITHOUT a locatable error ("${clip(v.error, 60)}"). SYCOPHANCY GUARD: does not count. Logged as an unearned concession — trust signal for the Nemotron scoring docket.`);
+          verdicts.push({ letter: p.letter, seat: p.seat, verdict: "hold", target: v.target, error: v.error, counted: false, collapsed: true });
+        } else {
+          logError(`ADJUDICATION — ${seatLabel(p.seat)} (Position ${p.letter}): ${v.verdict.toUpperCase()}${v.target ? " -> " + v.target : ""}${v.error ? " — " + clip(v.error, 80) : ""}`);
+          verdicts.push({ letter: p.letter, seat: p.seat, verdict: v.verdict, target: v.target, error: v.error, counted: true });
+        }
+      } catch (e) {
+        logError(`ADJUDICATION — ${seatLabel(p.seat)} failed to respond (${e.message || e}). Treated as HOLD.`);
+        verdicts.push({ letter: p.letter, seat: p.seat, verdict: "hold", target: null, error: "", counted: false });
+      }
+    }
+
+    // Resolution: RESOLVED iff all-but-one seat concedes (counted) to the
+    // SAME position, and that position did not itself concede.
+    const counted = verdicts.filter((v) => v.counted && v.verdict === "concede");
+    const byTarget = {};
+    counted.forEach((v) => {
+      const t = (v.target || "").toUpperCase().replace(/[^A-Z]/g, "").charAt(0);
+      if (t) (byTarget[t] = byTarget[t] || []).push(v);
+    });
+    let winner = null;
+    Object.keys(byTarget).forEach((t) => {
+      const conceders = byTarget[t];
+      const targetHeld = !verdicts.find((v) => v.letter === t && v.verdict === "concede" && v.counted);
+      // everyone except the target conceded to the target, with real errors
+      if (conceders.length >= positions.length - 1 && targetHeld) {
+        winner = t;
+      }
+    });
+
+    if (winner) {
+      const w = positions.find((p) => p.letter === winner);
+      logError(`\u2713 RESOLVED — Position ${winner} (${seatLabel(w.seat)}) survived cross-examination; every other seat located a specific error in its own position and conceded. Won by adjudication, NOT by vote.`);
+      return { resolved: true, winnerSeat: w.seat, winnerText: w.text, verdicts, contestedNote: null };
+    }
+
+    // Not resolved: surface the specific contested claims (the real
+    // "divergence is the answer" — located, not lexical).
+    const refutations = verdicts.filter((v) => v.counted && v.verdict === "refute" && v.error);
+    const contestedNote = refutations.length
+      ? refutations.map((v) => `${seatLabel(v.seat)} disputes Position ${(v.target || "?").toUpperCase().charAt(0)}: ${clip(v.error, 120)}`).join(" \u2014 ")
+      : null;
+    const collapses = verdicts.filter((v) => v.collapsed).length;
+    logError(`ADJUDICATION — remains DIVIDED after cross-examination${collapses ? ` (${collapses} unearned concession(s) rejected by the guard)` : ""}. ${contestedNote ? "Specific contested claims surfaced." : "No seat located a decisive error."}`);
+    return { resolved: false, verdicts, contestedNote };
+  }
+
   async function runLiveCouncil(query) {
     const calls = [];
     if (settings.keyGemini) {
@@ -1299,15 +1406,18 @@
     const configuredTag = Object.assign({}, seatProvider);
     refreshAllSeatHealth(); // v3.1 Task 1 — show configured occupants at dispatch start
 
+    const orAvailable = !!settings.keyOpenRouter;
+
     // v3.1.1 — validate seat chains against the live catalog ONCE per page
     // load, on first dispatch (not at boot: no cost for users who never
     // convene). Fire-and-forget: advisory, must never delay or block a round.
+    // BUGFIX 2026-07-19: this block previously sat ABOVE `const orAvailable`,
+    // a temporal-dead-zone ReferenceError that threw on first dispatch whenever
+    // the catalog check ran. Declaration moved up; check now follows it.
     if (orAvailable && !catalogChecked) {
       catalogChecked = true;
       validateOrSeatModels().catch(() => {});
     }
-
-    const orAvailable = !!settings.keyOpenRouter;
 
     // ---------- Failover chains (v2.4) ----------
     // Each seat walks a chain until one provider answers:
@@ -1492,9 +1602,25 @@
     })();
 
     if (agreed.length < 2) {
-      // No consensus — by design, Red Queen declines to force an answer
-      logError(`Consensus round FAILED by design — ${eligible.length} eligible agents, 0 agreements above threshold. Individual positions logged to Session History.`);
-      return { text: null, divided: true, answers };
+      // No consensus by the lexical comparator. v3.2: before declaring
+      // DIVIDED, run the adjudication round on the RAW answers (pre-synthesis).
+      // A correct-but-outvoted seat gets a chance to win by locating errors in
+      // the others; the sycophancy guard rejects concessions that name none.
+      logError(`Consensus round FAILED by lexical threshold — ${eligible.length} eligible agents, 0 agreements. Entering v3.2 adjudication before declaring DIVIDED.`);
+      const adj = await runAdjudication(query, eligible, calls);
+      if (adj && adj.resolved) {
+        return {
+          text: adj.winnerText.trim(),
+          divided: false,
+          answers,
+          trust: "resolved",
+          agreedCount: 1,
+          eligibleCount: eligible.length,
+          resolvedBy: seatLabel(adj.winnerSeat),
+        };
+      }
+      // Still divided — attach any located contested claims for display.
+      return { text: null, divided: true, answers, contestedNote: adj ? adj.contestedNote : null };
     }
     if (outliers.length > 0) {
       outliers.forEach((o) =>
@@ -1526,12 +1652,6 @@
   // show weight, users interpret hierarchy themselves). History logging is
   // unchanged — this is presentation only. Cards render via textContent,
   // never innerHTML: model output is untrusted input.
-  // AMENDED v3.1.2 (2026-07-18): seat position text now routes through
-  // renderRich(), which MAY use innerHTML — but only ever on output that
-  // DOMPurify has sanitized, and only when DOMPurify is confirmed present.
-  // Absent the sanitizer it reverts to textContent. The rule above still
-  // governs everything else in this panel (labels, weights, badges), which
-  // remain textContent-only.
   let dividedPanel = null;
   function ensureDividedPanel() {
     if (dividedPanel) return dividedPanel;
@@ -1587,7 +1707,7 @@
         h.appendChild(badge);
       }
       const p = document.createElement("p");
-      renderRich(p, a.text); // v3.1.2 — seat positions are markdown too
+      renderRich(p, a.text); // v3.1.2
       card.appendChild(h);
       card.appendChild(p);
       panel.appendChild(card);
@@ -1613,9 +1733,21 @@
   // ---------- Organ 1: Council Ledger ----------
   const LEDGER_KEY = "rq_ledger_v1";
   const MEMORY_ENABLED_KEY = "rq_memory_enabled";
-  const LEDGER_MAX_ENTRIES = 40;        // persistent cap (localStorage hygiene)
-  const LEDGER_VERBATIM_ROUNDS = 2;     // newest N rounds get fuller text
-  const MEMORY_CONTEXT_CHAR_CAP = 2400; // ≈600 tokens — hard injection budget
+  // v3.2 (Founder request 2026-07-19): storage 40 -> 200, and inject more
+  // history per prompt. HONEST TRADE-OFF, made explicit rather than silent:
+  //  - Storage cap is cheap: it is just localStorage bytes.
+  //  - Injection cap is NOT cheap: every char here is prepended to EVERY seat
+  //    dispatch, competing with the actual question for a free-tier model's
+  //    context window, and it directly amplifies the cross-session convergence
+  //    ("ledger flattening") Kimi flagged for investigation. So the injection
+  //    budget is raised to a deliberate, bounded value with a hard ceiling —
+  //    not uncapped. MEMORY_CONTEXT_HARD_MAX is the wall it can never cross,
+  //    so a 200-entry ledger can never balloon a prompt past a free seat's
+  //    limit. Tune MEMORY_CONTEXT_CHAR_CAP between the two, never above HARD_MAX.
+  const LEDGER_MAX_ENTRIES = 200;       // persistent cap (localStorage hygiene)
+  const LEDGER_VERBATIM_ROUNDS = 3;     // newest N rounds get fuller text
+  const MEMORY_CONTEXT_CHAR_CAP = 6000; // ≈1500 tokens — injection budget (raised from 2400)
+  const MEMORY_CONTEXT_HARD_MAX = 8000; // ≈2000 tokens — absolute ceiling; CHAR_CAP must never exceed this
 
   function loadLedger() {
     try { return JSON.parse(localStorage.getItem(LEDGER_KEY)) || []; }
@@ -1692,7 +1824,9 @@
   function buildMemoryContext() {
     if (!memoryEnabled() || ledger.length === 0) return "";
     const lines = [];
-    let budget = MEMORY_CONTEXT_CHAR_CAP;
+    // Defensive clamp: even if CHAR_CAP is mis-tuned above HARD_MAX, the
+    // injection can never exceed the ceiling that protects free-tier prompts.
+    let budget = Math.min(MEMORY_CONTEXT_CHAR_CAP, MEMORY_CONTEXT_HARD_MAX);
     for (let i = ledger.length - 1; i >= 0; i--) {
       const verbatim = i >= ledger.length - LEDGER_VERBATIM_ROUNDS;
       const line = `[Round ${i + 1}] ` + ledgerLine(ledger[i], verbatim);
@@ -2375,6 +2509,12 @@
           trustPrefix = `◐ PROVISIONAL ${result.agreedCount}/${result.eligibleCount} — The bench agrees, but no primary voice has verified this yet: `;
         } else if (result.trust === "verified") {
           trustPrefix = `✓ VERIFIED ${result.agreedCount}/${result.eligibleCount} — Everyone's on the same page for this one. Here is the council's unified answer: `;
+        } else if (result.trust === "resolved") {
+          // v3.2: the council disagreed, then cross-examined, and every other
+          // seat located a specific error in its own position and conceded to
+          // this one. Won by adjudication, not by vote — a stronger object than
+          // an uncontested VERIFIED, because it survived an attempt to break it.
+          trustPrefix = `\u25C8 RESOLVED — The council first split, then challenged each other; this position survived cross-examination after ${result.resolvedBy} and the others located specific errors in their own and conceded: `;
         }
       }
     } else {
@@ -2410,10 +2550,6 @@
       logHistory(query, "NO CONSENSUS — Council divided by design. Individual positions above.");
     } else {
       flashConsensus();
-      // v3.1.2: the trust prefix stays a plain text node OUTSIDE the markdown
-      // body. Concatenating it would corrupt parsing — "✓ VERIFIED — # Heading"
-      // is not a heading, and the prefix is the one string on screen that must
-      // never be model-influenced.
       consensusText.textContent = "";
       consensusText.classList.remove("rq-md", "rq-md-plain");
       if (trustPrefix) {
@@ -2422,9 +2558,9 @@
         tp.textContent = trustPrefix.trim();
         consensusText.appendChild(tp);
       }
-      const body = document.createElement("div");
-      consensusText.appendChild(body);
-      renderRich(body, answer);
+      const _body = document.createElement("div");
+      consensusText.appendChild(_body);
+      renderRich(_body, answer);
       logHistory(query, answer);
     }
     busy = false;
