@@ -1472,7 +1472,7 @@
   // ---------- Organ 1: Council Ledger ----------
   const LEDGER_KEY = "rq_ledger_v1";
   const MEMORY_ENABLED_KEY = "rq_memory_enabled";
-  const LEDGER_MAX_ENTRIES = 40;        // persistent cap (localStorage hygiene)
+  const LEDGER_MAX_ENTRIES = 200;        // persistent cap (localStorage hygiene)
   const LEDGER_VERBATIM_ROUNDS = 2;     // newest N rounds get fuller text
   const MEMORY_CONTEXT_CHAR_CAP = 2400; // ≈600 tokens — hard injection budget
 
