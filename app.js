@@ -161,6 +161,99 @@
     return cap;
   }
 
+  // ---------- v3.1 Task 1: Seat Health Badge (Kimi-ratified 2026-07-17) ----------
+  // Renders the ACTUAL occupant of each chair in the seat header instead of
+  // only in the drawer logs. Zero-HTML-change doctrine: styles injected here,
+  // same pattern as the Divided Council panel. textContent only — model
+  // output and model names are untrusted input.
+  //
+  // AUDIT CORRECTION (Fable, 2026-07-17): the v3.1 petition asserted that
+  // weight was seat-keyed and never degraded on failover. That was WRONG.
+  // SEAT_WEIGHTS has been provider-keyed since 2026-07-12 and seatWeight()
+  // reads the LIVE seatProvider, which the failover chain mutates. A
+  // Groq-occupied Claude seat has always scored 0.75, never 1.0. This badge
+  // therefore SURFACES a degradation that already existed; it does not
+  // introduce one. Task 4's only real gap is walk depth inside OpenRouter.
+  const PRIMARY_MODEL_LABELS = {
+    gemini: "Gemini 2.0 Flash",
+    kimi: "Moonshot v1 8k",
+    claude: "Claude Haiku 4.5",
+  };
+
+  // The provider a seat is CONFIGURED to use, before any failover walk.
+  // This is the baseline the badge degrades FROM.
+  function configuredProvider(name) {
+    if (name === "claude" && groqUnderstudy()) return "groq";
+    if (name === "gemini" && cerebrasUnderstudy()) return "cerebras";
+    return "primary";
+  }
+  function seatBaseWeight(name) {
+    const w = SEAT_WEIGHTS[configuredProvider(name)];
+    return typeof w === "number" ? w : 1.0;
+  }
+  function seatModelLabel(name) {
+    const p = seatProvider[name] || configuredProvider(name);
+    if (p === "openrouter") {
+      const slug = (orActiveModel[name] || (OR_SEAT_MODELS[name] || [])[0]) || "";
+      const m = slug.split("/").pop().replace(":free", "");
+      return "OpenRouter: " + (m || "\u2014");
+    }
+    if (p === "groq") return "Groq: Llama 3.3";
+    if (p === "cerebras") return "Cerebras: " + CEREBRAS_MODEL_LABEL;
+    return PRIMARY_MODEL_LABELS[name] || "primary";
+  }
+
+  let seatHealthStyled = false;
+  function ensureSeatHealthStyles() {
+    if (seatHealthStyled) return;
+    seatHealthStyled = true;
+    const style = document.createElement("style");
+    style.textContent = [
+      ".seat-health { margin-top: 4px; font-size: 0.62em; line-height: 1.35; letter-spacing: 0.03em; text-align: center; opacity: 0.75; }",
+      ".seat-health .sh-model { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 96px; margin: 0 auto; }",
+      ".seat-health .sh-weight { display: block; opacity: 0.85; }",
+      ".seat-health.degraded { opacity: 0.95; }",
+      ".seat-health.degraded .sh-weight { color: #f59e0b; }",
+    ].join("\n");
+    document.head.appendChild(style);
+  }
+
+  // Boot-safe: wrapped so a missing DOM node or an early call can never
+  // dead-button the app (same guard doctrine as the Cerebras settings field).
+  function renderSeatHealth(name) {
+    try {
+      const el = agents[name];
+      if (!el) return;
+      ensureSeatHealthStyles();
+      let box = el.querySelector(".seat-health");
+      if (!box) {
+        box = document.createElement("div");
+        box.className = "seat-health";
+        const m = document.createElement("span");
+        m.className = "sh-model";
+        const w = document.createElement("span");
+        w.className = "sh-weight";
+        box.appendChild(m);
+        box.appendChild(w);
+        el.appendChild(box);
+      }
+      const base = seatBaseWeight(name);
+      const eff = seatWeight(name);
+      const degraded = eff < base;
+      box.classList.toggle("degraded", degraded);
+      box.querySelector(".sh-model").textContent = seatModelLabel(name);
+      box.querySelector(".sh-weight").textContent = degraded
+        ? base + " \u2192 " + eff
+        : "weight " + eff;
+      el.title = seatLabel(name) + " \u2014 weight " + eff + (degraded ? " (base " + base + ")" : "");
+    } catch (e) {
+      // never let a cosmetic badge break a dispatch
+    }
+  }
+  function refreshAllSeatHealth() {
+    Object.keys(agents).forEach(renderSeatHealth);
+  }
+
   function markSeat(name, occupant, tooltip) {
     const el = agents[name];
     const nameEl = el.querySelector(".agent-name");
@@ -173,6 +266,7 @@
       delete nameEl.dataset.occupant;
       el.removeAttribute("title");
     }
+    renderSeatHealth(name); // v3.1 Task 1 — badge follows the occupant
   }
 
   function refreshUnderstudyState() {
@@ -193,6 +287,7 @@
   function resetSeatVisuals() {
     markSeat("kimi", null);
     refreshUnderstudyState();
+    refreshAllSeatHealth(); // v3.1 Task 1
   }
 
   saveSettingsBtn.addEventListener("click", () => {
@@ -805,6 +900,7 @@
     // Snapshot the configured occupant per seat BEFORE the failover chain
     // mutates seatProvider — needed to gate circuit resets correctly below.
     const configuredTag = Object.assign({}, seatProvider);
+    refreshAllSeatHealth(); // v3.1 Task 1 — show configured occupants at dispatch start
 
     const orAvailable = !!settings.keyOpenRouter;
 
@@ -855,6 +951,7 @@
             run: (qq) => callOpenRouter(qq, c.name),
             enter: () => {
               seatProvider[c.name] = "openrouter";
+              renderSeatHealth(c.name); // v3.1 Task 1 — weight drops here
               // visual marking happens per-model inside the OR walk
             },
           });
