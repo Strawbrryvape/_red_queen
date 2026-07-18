@@ -1,4 +1,4 @@
-       /* Red Queen v2.1 — Command Center logic
+ /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -937,6 +937,141 @@
     return cleaned;
   }
 
+  // ---------- v3.1.2: Markdown Presentation Layer ----------
+  // Founder + Gemini Pro request 2026-07-18. The council's verdicts arrive as
+  // markdown (models write lists, headings, fenced code) but were assigned via
+  // .textContent, which flattens every paragraph break into one wall of text.
+  //
+  // DOCTRINE TENSION — READ BEFORE RATIFYING (Fable):
+  // app.js line ~1393 states: "Cards render via textContent, never innerHTML:
+  // model output is untrusted input." This layer deliberately introduces
+  // innerHTML for model output. That is an XSS surface: a model can emit
+  // <img onerror=...> and a seat can be a rate-limited free-tier stranger.
+  // DOMPurify is the entire mitigation, so the rule here is ABSOLUTE:
+  //   innerHTML is used IF AND ONLY IF DOMPurify is present and sanitizing.
+  // marked without DOMPurify => we do NOT render HTML. We fall back. No
+  // exceptions, no "probably fine" path. If the sanitizer is missing the
+  // doctrine reverts to textContent, which is where it started.
+  //
+  // CSP WARNING — LIKELY BLOCKER, MUST BE VERIFIED BY THE FOUNDER:
+  // index.html carries a Content-Security-Policy meta tag (it was amended on
+  // 2026-07-13 to whitelist the Cerebras host). No CDN script is loaded
+  // anywhere else in this file, so script-src almost certainly does NOT allow
+  // jsdelivr. If so, BOTH library loads are blocked by the browser and this
+  // layer silently falls back forever. Fixing that requires editing
+  // index.html's CSP — which BREAKS the zero-HTML-change doctrine. That is a
+  // ruling for Kimi, not a decision for me. See CHANGELOG for the exact line.
+  //
+  // WHY THE FALLBACK IS NOT A CONSOLATION PRIZE:
+  // The reported bug is "flattens all paragraph spacing." white-space:pre-wrap
+  // fixes exactly that, with zero new dependencies, zero CSP change and zero
+  // XSS surface. If the CDNs are blocked the primary complaint is STILL fixed;
+  // only rich rendering (real bullets, styled code blocks) is lost.
+  const MD_SOURCES = [
+    { key: "marked", url: "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js", check: () => typeof window.marked !== "undefined" },
+    { key: "DOMPurify", url: "https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js", check: () => typeof window.DOMPurify !== "undefined" },
+  ];
+  const MD_LOAD_TIMEOUT = 5000; // never hang a verdict on a CDN
+  let mdReady = false;
+  let mdEnginePromise = null;
+
+  function loadScriptOnce(src, isLoaded) {
+    return new Promise((resolve) => {
+      if (isLoaded()) return resolve(true);
+      const s = document.createElement("script");
+      s.src = src;
+      s.async = true;
+      s.onload = () => resolve(isLoaded());
+      s.onerror = () => resolve(false); // CSP block lands here
+      document.head.appendChild(s);
+      setTimeout(() => resolve(isLoaded()), MD_LOAD_TIMEOUT);
+    });
+  }
+
+  function ensureMarkdownEngine() {
+    if (mdEnginePromise) return mdEnginePromise;
+    mdEnginePromise = (async () => {
+      try {
+        const results = await Promise.all(MD_SOURCES.map((m) => loadScriptOnce(m.url, m.check)));
+        // BOTH required. marked alone is a security regression, not a feature.
+        mdReady = results.every(Boolean) && MD_SOURCES.every((m) => m.check());
+        if (!mdReady) {
+          const missing = MD_SOURCES.filter((m) => !m.check()).map((m) => m.key).join(" + ");
+          logError(`MARKDOWN LAYER — ${missing} did not load (CDN blocked, offline, or Content-Security-Policy script-src does not allow cdn.jsdelivr.net). Falling back to pre-wrap plain text: paragraph spacing is preserved, rich formatting is not. Verdicts are unaffected.`);
+        }
+      } catch (e) {
+        mdReady = false;
+      }
+      return mdReady;
+    })();
+    return mdEnginePromise;
+  }
+
+  let mdStyled = false;
+  function ensureMarkdownStyles() {
+    if (mdStyled) return;
+    mdStyled = true;
+    const style = document.createElement("style");
+    style.textContent = [
+      // Fallback: this alone fixes the reported "super block" flattening.
+      ".rq-md-plain { white-space: pre-wrap; word-break: break-word; }",
+      ".rq-md { word-break: break-word; }",
+      ".rq-md > *:first-child { margin-top: 0; }",
+      ".rq-md > *:last-child { margin-bottom: 0; }",
+      ".rq-md p { margin: 0 0 0.85em; line-height: 1.55; }",
+      ".rq-md ul, .rq-md ol { margin: 0 0 0.85em; padding-left: 1.4em; }",
+      ".rq-md li { margin: 0.25em 0; line-height: 1.5; }",
+      ".rq-md h1, .rq-md h2, .rq-md h3, .rq-md h4 { margin: 1.1em 0 0.5em; line-height: 1.3; font-weight: 600; }",
+      ".rq-md h1 { font-size: 1.25em; } .rq-md h2 { font-size: 1.15em; } .rq-md h3 { font-size: 1.05em; } .rq-md h4 { font-size: 1em; }",
+      ".rq-md code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: rgba(127,127,127,0.16); padding: 0.12em 0.38em; border-radius: 4px; }",
+      ".rq-md pre { background: rgba(127,127,127,0.12); border: 1px solid rgba(127,127,127,0.25); border-radius: 6px; padding: 10px 12px; margin: 0 0 0.85em; overflow-x: auto; }",
+      ".rq-md pre code { background: none; padding: 0; font-size: 0.85em; line-height: 1.45; }",
+      ".rq-md blockquote { margin: 0 0 0.85em; padding-left: 0.9em; border-left: 3px solid rgba(127,127,127,0.4); opacity: 0.9; }",
+      ".rq-md table { border-collapse: collapse; margin: 0 0 0.85em; display: block; overflow-x: auto; }",
+      ".rq-md th, .rq-md td { border: 1px solid rgba(127,127,127,0.3); padding: 5px 9px; text-align: left; font-size: 0.92em; }",
+      ".rq-md hr { border: 0; border-top: 1px solid rgba(127,127,127,0.3); margin: 1.1em 0; }",
+      ".rq-md a { color: inherit; text-decoration: underline; }",
+      ".rq-trust { display: block; margin-bottom: 0.6em; opacity: 0.92; }",
+    ].join("\n");
+    document.head.appendChild(style);
+  }
+
+  function mdPaint(el, text) {
+    ensureMarkdownStyles();
+    const str = String(text == null ? "" : text);
+    // The security gate. Both libraries, or plain text. Nothing in between.
+    if (mdReady && typeof window.marked !== "undefined" && typeof window.DOMPurify !== "undefined") {
+      try {
+        const html = window.DOMPurify.sanitize(window.marked.parse(str), { USE_PROFILES: { html: true } });
+        el.classList.remove("rq-md-plain");
+        el.classList.add("rq-md");
+        el.innerHTML = html; // sanitized above — the ONLY path that reaches here
+        return;
+      } catch (e) {
+        // parser/sanitizer threw on hostile or malformed output — degrade, never guess
+      }
+    }
+    el.classList.remove("rq-md");
+    el.classList.add("rq-md-plain");
+    el.textContent = str;
+  }
+
+  // Paint immediately with whatever is available, then upgrade in place once
+  // the engine lands. A verdict is never delayed waiting on a CDN.
+  function renderRich(el, text) {
+    if (!el) return;
+    el.__rqText = text;
+    mdPaint(el, text);
+    if (!mdReady) {
+      ensureMarkdownEngine().then((ok) => {
+        if (ok && el.__rqText === text) mdPaint(el, text);
+      });
+    }
+  }
+
+  // Warm the engine at boot so the first verdict is usually already rich.
+  ensureMarkdownEngine();
+
   // ---------- v3.1.1 Task 2b: Live catalog discovery (ADVISORY ONLY) ----------
   // Kimi-ratified scope: advisory. This code REPORTS what exists. It never
   // selects a model, never edits OR_SEAT_MODELS, never touches consensus.
@@ -1391,6 +1526,12 @@
   // show weight, users interpret hierarchy themselves). History logging is
   // unchanged — this is presentation only. Cards render via textContent,
   // never innerHTML: model output is untrusted input.
+  // AMENDED v3.1.2 (2026-07-18): seat position text now routes through
+  // renderRich(), which MAY use innerHTML — but only ever on output that
+  // DOMPurify has sanitized, and only when DOMPurify is confirmed present.
+  // Absent the sanitizer it reverts to textContent. The rule above still
+  // governs everything else in this panel (labels, weights, badges), which
+  // remain textContent-only.
   let dividedPanel = null;
   function ensureDividedPanel() {
     if (dividedPanel) return dividedPanel;
@@ -1446,7 +1587,7 @@
         h.appendChild(badge);
       }
       const p = document.createElement("p");
-      p.textContent = a.text;
+      renderRich(p, a.text); // v3.1.2 — seat positions are markdown too
       card.appendChild(h);
       card.appendChild(p);
       panel.appendChild(card);
@@ -1472,7 +1613,7 @@
   // ---------- Organ 1: Council Ledger ----------
   const LEDGER_KEY = "rq_ledger_v1";
   const MEMORY_ENABLED_KEY = "rq_memory_enabled";
-  const LEDGER_MAX_ENTRIES = 200;        // persistent cap (localStorage hygiene)
+  const LEDGER_MAX_ENTRIES = 40;        // persistent cap (localStorage hygiene)
   const LEDGER_VERBATIM_ROUNDS = 2;     // newest N rounds get fuller text
   const MEMORY_CONTEXT_CHAR_CAP = 2400; // ≈600 tokens — hard injection budget
 
@@ -2269,7 +2410,21 @@
       logHistory(query, "NO CONSENSUS — Council divided by design. Individual positions above.");
     } else {
       flashConsensus();
-      consensusText.textContent = trustPrefix + answer;
+      // v3.1.2: the trust prefix stays a plain text node OUTSIDE the markdown
+      // body. Concatenating it would corrupt parsing — "✓ VERIFIED — # Heading"
+      // is not a heading, and the prefix is the one string on screen that must
+      // never be model-influenced.
+      consensusText.textContent = "";
+      consensusText.classList.remove("rq-md", "rq-md-plain");
+      if (trustPrefix) {
+        const tp = document.createElement("span");
+        tp.className = "rq-trust";
+        tp.textContent = trustPrefix.trim();
+        consensusText.appendChild(tp);
+      }
+      const body = document.createElement("div");
+      consensusText.appendChild(body);
+      renderRich(body, answer);
       logHistory(query, answer);
     }
     busy = false;
