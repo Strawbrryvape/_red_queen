@@ -766,8 +766,26 @@
   //    only on observed evidence.
   //  - llama-3.3-70b removed from Gemini's seat: it duplicated Groq's
   //    understudy on Claude's seat (pre-existing collision, now fixed).
+  // v3.1 Task 2 (Kimi-ratified 2026-07-17, Amendment B): gpt-oss-120b REMOVED
+  // — returned 404 live on 2026-07-17 and it was the Gemini seat's ONLY
+  // OpenRouter entry, so the walk had zero depth. Root cause of the seat's
+  // total disappearance that session: Gemini 429 -> Cerebras 429 -> OR 404 ->
+  // nothing left to walk to. Chain now has depth 2, family-distinct from
+  // every other seat (Qwen=Alibaba, Mistral=Mistral AI vs Gemma=Google,
+  // Nemotron=NVIDIA, Llama=Meta, GLM=Zhipu). No collision.
+  //
+  // ORDERING NOTE (Fable): Kimi's Amendment B proposed qwen-2.5-72b FIRST.
+  // Line ~753 of this same file records qwen-2.5-72b as already killed from
+  // the free catalog on 2026-07-13. Kept as the DEEPER slot rather than
+  // dropped — free catalogs churn both directions and the walk costs nothing
+  // if it is dead. Mistral leads until the TEST OPENROUTER MODELS button says
+  // otherwise. Evidence beats endorsement (same precedent as gpt-oss's demotion).
+  //
+  // UNVERIFIED BY FABLE: this container has no network access, so neither slug
+  // has been test-dispatched. Run TEST OPENROUTER MODELS in the settings sheet
+  // before committing — that satisfies Kimi's "non-empty response required".
   const OR_SEAT_MODELS = {
-    gemini: ["openai/gpt-oss-120b:free"],
+    gemini: ["mistralai/mistral-7b-instruct:free", "qwen/qwen-2.5-72b-instruct:free"],
     kimi:   ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free"],
     claude: ["nvidia/nemotron-3-super-120b-a12b:free", "google/gemma-4-31b-it:free"],
   };
@@ -874,6 +892,65 @@
     if (!cleaned) throw new Error(`OpenRouter ${model} returned only reasoning, no final answer (likely truncated mid-thought)`);
     return cleaned;
   }
+
+  // ---------- v3.1 Task 2: Model liveness test ----------
+  // Kimi's requirement: "Before shipping, run a test dispatch to the new model
+  // and confirm it responds with a non-empty answer. Do not commit a model you
+  // haven't tested." Fable cannot dispatch (no network in the build container),
+  // so the test ships as a button the Founder runs in the live browser.
+  // Uses the REAL callOpenRouterModel path, so it exercises pacing, the 404
+  // detector, the <think> strip and the empty-answer guard — not a mock.
+  async function testOrModels() {
+    if (!settings.keyOpenRouter) {
+      logError("MODEL TEST — no OpenRouter key saved. Paste the key, hit Save, then test.");
+      return;
+    }
+    const seen = new Set();
+    const jobs = [];
+    Object.keys(OR_SEAT_MODELS).forEach((seat) => {
+      (OR_SEAT_MODELS[seat] || []).forEach((m, i) => {
+        if (!seen.has(m)) { seen.add(m); jobs.push({ seat, model: m, depth: i }); }
+      });
+    });
+    logError(`MODEL TEST — dispatching to ${jobs.length} OpenRouter model(s), paced. A 429 here means rate limit (retry later), a 404 means the model is DEAD and must be swapped.`);
+    let live = 0, dead = 0;
+    for (const j of jobs) {
+      try {
+        const r = await callOpenRouterModel("Reply with the single word: OK", j.model);
+        live++;
+        logError(`\u2713 ${j.model} LIVE (${j.seat} seat, slot ${j.depth + 1}) — answered: ${JSON.stringify(String(r).slice(0, 40))}`);
+      } catch (e) {
+        dead++;
+        const msg = e.message || String(e);
+        const verdict = /404/.test(msg) ? "DEAD (404) — swap this entry out of OR_SEAT_MODELS"
+                      : /429/.test(msg) ? "RATE-LIMITED (429) — inconclusive, retest later"
+                      : "FAILED";
+        logError(`\u2717 ${j.model} ${verdict} (${j.seat} seat, slot ${j.depth + 1}): ${msg}`);
+      }
+    }
+    logError(`MODEL TEST COMPLETE — ${live} live, ${dead} failed, ${jobs.length} tested. Any seat whose entire list failed has NO OpenRouter floor.`);
+  }
+
+  // Zero-HTML-change doctrine: inject the button beside Save rather than
+  // editing index.html. Guarded so a missing Save button can't break boot.
+  (function ensureModelTestButton() {
+    try {
+      if (!saveSettingsBtn || !saveSettingsBtn.parentNode || $("testOrModels")) return;
+      const b = document.createElement("button");
+      b.id = "testOrModels";
+      b.type = "button";
+      b.textContent = "TEST OPENROUTER MODELS";
+      b.className = saveSettingsBtn.className || "";
+      b.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      saveSettingsBtn.parentNode.insertBefore(b, saveSettingsBtn.nextSibling);
+      b.addEventListener("click", async () => {
+        const label = b.textContent;
+        b.disabled = true;
+        b.textContent = "TESTING\u2026 see Error Logs";
+        try { await testOrModels(); } finally { b.disabled = false; b.textContent = label; }
+      });
+    } catch (e) { /* cosmetic — never block boot */ }
+  })();
 
   async function runLiveCouncil(query) {
     const calls = [];
