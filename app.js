@@ -1,4 +1,4 @@
-/* Red Queen v2.1 — Command Center logic
+       /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -937,6 +937,131 @@
     return cleaned;
   }
 
+  // ---------- v3.1.1 Task 2b: Live catalog discovery (ADVISORY ONLY) ----------
+  // Kimi-ratified scope: advisory. This code REPORTS what exists. It never
+  // selects a model, never edits OR_SEAT_MODELS, never touches consensus.
+  // Auto-population from the catalog is Phase 2 and requires a ruling.
+  //
+  // WHY THIS EXISTS (Fable, 2026-07-18): on 2026-07-17 the Gemini seat's only
+  // OpenRouter model 404'd, so Task 2 swapped it for two models chosen from
+  // memory — mistral-7b-instruct and qwen-2.5-72b. The live test found BOTH
+  // dead. Mistral has since left the free tier entirely; qwen-2.5-72b was
+  // already on this file's own kill list from 2026-07-13. Three dead picks in
+  // two rounds, from three different sources (Gemini's memo, Kimi's amendment,
+  // Fable's pick). The lesson is not "pick better" — every model's knowledge of
+  // this catalog is stale by construction and the catalog rotates weekly.
+  // Model selection is a LOOKUP, not a recollection. Ask the catalog.
+  //
+  // Endpoint is public (no API key required) and same-host as the completions
+  // call already in the CSP whitelist, so no index.html change is needed.
+  const OR_CATALOG_URL = "https://openrouter.ai/api/v1/models";
+  // Families occupying seats OUTSIDE OpenRouter — they still count against
+  // Kimi's model-family diversity rule.
+  // NOTE (Fable, 2026-07-18): keys MUST be the OpenRouter slug prefix, not the
+  // lab's colloquial name. Caught in test: keying Groq's Llama as "meta"
+  // silently failed to ban "meta-llama/*", so the Gemini seat was offered
+  // llama-3.3 as "family-safe" — re-introducing the exact collision line ~672
+  // of this file records as already fixed on 2026-07-13. FAMILY_ALIASES folds
+  // the variants together so a rename can't reopen it.
+  const NON_OR_FAMILIES = { "meta-llama": "Groq Llama 3.3 (Claude seat)", "zai": "Cerebras GLM (Gemini seat)" };
+  const FAMILY_ALIASES = { meta: "meta-llama", llama: "meta-llama", zhipu: "zai", "z-ai": "zai", google: "google", alibaba: "qwen" };
+
+  let catalogCache = null; // { at, free:Set, total } — per page load
+  let catalogChecked = false; // validate seat chains once per page load
+  function orFamily(slug) {
+    const raw = String(slug || "").split("/")[0].toLowerCase();
+    return FAMILY_ALIASES[raw] || raw;
+  }
+
+  async function fetchFreeCatalog(force) {
+    if (catalogCache && !force) return catalogCache;
+    const res = await fetch(OR_CATALOG_URL, { headers: { Accept: "application/json" } });
+    if (!res.ok) throw new Error(`OpenRouter catalog HTTP ${res.status}`);
+    const data = await res.json();
+    const list = Array.isArray(data.data) ? data.data : [];
+    if (!list.length) throw new Error("OpenRouter catalog returned no models (unexpected shape)");
+    const free = new Set();
+    list.forEach((m) => {
+      const p = m && m.pricing;
+      if (!p) return;
+      // OpenRouter reports prices as STRINGS ("0"). parseFloat both; a model is
+      // free only when prompt AND completion are zero.
+      if (parseFloat(p.prompt) === 0 && parseFloat(p.completion) === 0 && m.id) free.add(m.id);
+    });
+    catalogCache = { at: Date.now(), free, total: list.length };
+    return catalogCache;
+  }
+
+  // Families used by every seat EXCEPT this one, plus the non-OR occupants.
+  function familiesUsedExcept(seat) {
+    const fams = new Set(Object.keys(NON_OR_FAMILIES));
+    Object.keys(OR_SEAT_MODELS).forEach((s) => {
+      if (s === seat) return;
+      (OR_SEAT_MODELS[s] || []).forEach((m) => fams.add(orFamily(m)));
+    });
+    return fams;
+  }
+
+  // Cross-check the configured chains against reality. Advisory: logs only.
+  async function validateOrSeatModels() {
+    let cat;
+    try {
+      cat = await fetchFreeCatalog();
+    } catch (e) {
+      logError(`CATALOG CHECK — could not reach OpenRouter's model list (${e.message || e}). Seat chains unverified this session.`);
+      return null;
+    }
+    let dead = 0;
+    const seatsWithNoFloor = [];
+    Object.keys(OR_SEAT_MODELS).forEach((seat) => {
+      const list = OR_SEAT_MODELS[seat] || [];
+      const alive = list.filter((m) => cat.free.has(m));
+      list.forEach((m) => {
+        if (!cat.free.has(m)) {
+          dead++;
+          logError(`\u2717 CATALOG CHECK — ${m} (${seat} seat) is NOT in OpenRouter's live free catalog. It will 404. Swap it.`);
+        }
+      });
+      if (list.length && alive.length === 0) seatsWithNoFloor.push(seat);
+    });
+    if (seatsWithNoFloor.length) {
+      logError(`\u26A0 NO OPENROUTER FLOOR — ${seatsWithNoFloor.join(", ")} seat(s) have zero live fallback models. If their primary and understudy both fail, the seat VANISHES from the council (root cause of the 2026-07-17 Gemini disappearance). Run LIST FREE MODELS and swap.`);
+    }
+    if (!dead) logError(`\u2713 CATALOG CHECK — all configured OpenRouter models present in the live free catalog (${cat.free.size} free of ${cat.total} total).`);
+    return cat;
+  }
+
+  // Print the live free catalog, annotated for the diversity rule.
+  async function listFreeModels() {
+    let cat;
+    try {
+      cat = await fetchFreeCatalog(true);
+    } catch (e) {
+      logError(`LIST FREE MODELS — failed: ${e.message || e}`);
+      return;
+    }
+    const inUse = new Map();
+    Object.keys(OR_SEAT_MODELS).forEach((s) => (OR_SEAT_MODELS[s] || []).forEach((m) => inUse.set(m, s)));
+    const free = Array.from(cat.free).sort();
+    logError(`LIST FREE MODELS — ${free.length} zero-cost models live on OpenRouter right now (of ${cat.total} total). Catalog rotates weekly; this is a snapshot, not a permanent list.`);
+
+    const byFamily = {};
+    free.forEach((m) => { (byFamily[orFamily(m)] = byFamily[orFamily(m)] || []).push(m); });
+    Object.keys(byFamily).sort().forEach((fam) => {
+      const note = NON_OR_FAMILIES[fam] ? ` [family already seated: ${NON_OR_FAMILIES[fam]}]` : "";
+      logError(`  \u2500 ${fam}${note}: ${byFamily[fam].map((m) => (inUse.has(m) ? m + " \u2190 IN USE (" + inUse.get(m) + ")" : m)).join(", ")}`);
+    });
+
+    // Actionable: what may legally fill each seat under the diversity rule.
+    Object.keys(OR_SEAT_MODELS).forEach((seat) => {
+      const banned = familiesUsedExcept(seat);
+      const ok = free.filter((m) => !banned.has(orFamily(m)));
+      const live = (OR_SEAT_MODELS[seat] || []).filter((m) => cat.free.has(m));
+      logError(`  ${seat.toUpperCase()} SEAT — ${live.length} of ${(OR_SEAT_MODELS[seat] || []).length} configured models are live. Family-safe candidates (no collision with other seats): ${ok.length ? ok.join(", ") : "NONE \u2014 every live family is already seated; escalate to Kimi."}`);
+    });
+    logError("LIST FREE MODELS — advisory only. Nothing was changed. Copy chosen slugs into OR_SEAT_MODELS, then run TEST OPENROUTER MODELS to confirm they answer.");
+  }
+
   // ---------- v3.1 Task 2: Model liveness test ----------
   // Kimi's requirement: "Before shipping, run a test dispatch to the new model
   // and confirm it responds with a non-empty answer. Do not commit a model you
@@ -993,6 +1118,22 @@
         b.textContent = "TESTING\u2026 see Error Logs";
         try { await testOrModels(); } finally { b.disabled = false; b.textContent = label; }
       });
+
+      // v3.1.1 — catalog discovery. No API key required: the models endpoint
+      // is public, so this works even before any key is saved.
+      const c = document.createElement("button");
+      c.id = "listFreeModels";
+      c.type = "button";
+      c.textContent = "LIST FREE MODELS";
+      c.className = saveSettingsBtn.className || "";
+      c.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      b.parentNode.insertBefore(c, b.nextSibling);
+      c.addEventListener("click", async () => {
+        const label = c.textContent;
+        c.disabled = true;
+        c.textContent = "FETCHING\u2026 see Error Logs";
+        try { await listFreeModels(); } finally { c.disabled = false; c.textContent = label; }
+      });
     } catch (e) { /* cosmetic — never block boot */ }
   })();
 
@@ -1022,6 +1163,14 @@
     // mutates seatProvider — needed to gate circuit resets correctly below.
     const configuredTag = Object.assign({}, seatProvider);
     refreshAllSeatHealth(); // v3.1 Task 1 — show configured occupants at dispatch start
+
+    // v3.1.1 — validate seat chains against the live catalog ONCE per page
+    // load, on first dispatch (not at boot: no cost for users who never
+    // convene). Fire-and-forget: advisory, must never delay or block a round.
+    if (orAvailable && !catalogChecked) {
+      catalogChecked = true;
+      validateOrSeatModels().catch(() => {});
+    }
 
     const orAvailable = !!settings.keyOpenRouter;
 
