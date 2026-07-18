@@ -639,6 +639,76 @@
     return inter / (A.size + B.size - inter); // Jaccard over canonicalized tokens
   }
 
+  // ==================== v3.3: CONCEPT-BASED COMPARATOR ====================
+  // The lexical Jaccard comparator counts SHARED WORDS. Live failure
+  // 2026-07-19: three seats returned IMPOSSIBLE in different vocabularies
+  // (symbolic math / prose / prose) and scored 0 agreement — a unanimous
+  // correct answer tagged DIVIDED. This comparator judges by CONCLUSION,
+  // not phrasing:
+  //   1. VERDICT POLARITY — if both answers state an explicit conclusion
+  //      (impossible/possible, reject/approve, yes/no), that decides it:
+  //      same polarity agrees, opposite splits. Verdicts trump vocabulary,
+  //      and — critically — opposite conclusions in near-identical wording
+  //      (the "approve X" vs "reject X" false-consensus bug) now SPLIT.
+  //   2. TF-IDF COSINE — when either side states no explicit verdict, fall
+  //      back to smoothed-IDF cosine over the round's answers (concept
+  //      overlap that survives paraphrase; smoothing keeps terms shared by
+  //      all seats from zeroing out).
+  // Runs in SHADOW first (logged beside the live Jaccard result) so its
+  // divergence from the current comparator is measured before promotion.
+  const CONCEPT_DENY = /\b(impossible|infeasible|unsatisfiable|cannot|can't|no valid|not possible|invalid|reject|denied|deny|contradiction|does not exist|no schedule|violat)\w*/gi;
+  const CONCEPT_AFFIRM = /\b(possible|feasible|satisfiable|is valid|achievable|approve|yes it|can be done|schedule exists|valid schedule)\w*/gi;
+  function verdictPolarity(text) {
+    const t = (text || "").toLowerCase();
+    let lastDeny = -1, lastAff = -1, m;
+    CONCEPT_DENY.lastIndex = 0; while ((m = CONCEPT_DENY.exec(t))) lastDeny = m.index;
+    CONCEPT_AFFIRM.lastIndex = 0; while ((m = CONCEPT_AFFIRM.exec(t))) lastAff = m.index;
+    if (lastDeny === -1 && lastAff === -1) return 0;
+    return lastDeny > lastAff ? -1 : 1;
+  }
+  function tfidfVectors(texts) {
+    const docs = texts.map((t) => Array.from(tokenize(t)));
+    const df = {};
+    docs.forEach((d) => new Set(d).forEach((tok) => (df[tok] = (df[tok] || 0) + 1)));
+    const N = docs.length;
+    const idf = (tok) => Math.log((N + 1) / ((df[tok] || 0) + 0.5)); // smoothed
+    return docs.map((d) => {
+      const tf = {}; d.forEach((tok) => (tf[tok] = (tf[tok] || 0) + 1));
+      const v = {}; Object.keys(tf).forEach((tok) => (v[tok] = tf[tok] * idf(tok)));
+      return v;
+    });
+  }
+  function cosineVec(a, b) {
+    let dot = 0, na = 0, nb = 0;
+    new Set([...Object.keys(a), ...Object.keys(b)]).forEach((k) => (dot += (a[k] || 0) * (b[k] || 0)));
+    Object.values(a).forEach((x) => (na += x * x));
+    Object.values(b).forEach((y) => (nb += y * y));
+    return (na && nb) ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+  }
+  const CONCEPT_COSINE_THRESHOLD = 0.28;
+  // Returns { agree, mode, detail } for one pair within a set of answer texts.
+  function conceptAgreePair(allTexts, i, j) {
+    const pi = verdictPolarity(allTexts[i]), pj = verdictPolarity(allTexts[j]);
+    if (pi !== 0 && pj !== 0) {
+      return { agree: pi === pj, mode: "verdict", detail: `polarity ${pi} vs ${pj}` };
+    }
+    const V = tfidfVectors(allTexts);
+    const c = cosineVec(V[i], V[j]);
+    return { agree: c >= CONCEPT_COSINE_THRESHOLD, mode: "cosine", detail: `cos ${c.toFixed(3)}` };
+  }
+  // Shadow consensus using the concept comparator. Same "agree with >=1 ally"
+  // rule as checkConsensus, but with concept pairing. Logged, not used (yet).
+  function conceptConsensusShadow(answers) {
+    if (answers.length < 2) return { agreed: answers.map((a) => a.name), outliers: [] };
+    const texts = answers.map((a) => extractDirective(a.text) || a.text);
+    const agreed = [], outliers = [];
+    answers.forEach((a, i) => {
+      const ally = answers.some((b, j) => i !== j && conceptAgreePair(texts, i, j).agree);
+      (ally ? agreed : outliers).push(a.name);
+    });
+    return { agreed, outliers };
+  }
+
   // Short-anchor relaxation (failure mode 1: tiny token sets are high-
   // variance — a genuine 2-1 scored as 0). When both texts are short
   // directives, the floor drops from 0.22 to 0.15 per Kimi's Phase 1 spec.
@@ -710,6 +780,14 @@
     return similarity(a, b);
   }
 
+  // v3.3: concept comparator promotion toggle. Default SHADOW — the live
+  // Jaccard math is unchanged until the Founder flips this on, having seen
+  // the shadow logs agree with reality. Flip via localStorage or the
+  // Settings toggle: rq_concept_mode = "live" | "shadow" (default shadow).
+  function conceptMode() {
+    return localStorage.getItem("rq_concept_mode") === "live" ? "live" : "shadow";
+  }
+
   function checkConsensus(answers) {
     // each answer must agree with at least one other above threshold
     if (answers.length < 2) return { agreed: answers, outliers: [] };
@@ -717,12 +795,33 @@
     if (anchored >= 2) {
       logError(`Consensus check using FINAL DIRECTIVE anchors (${anchored}/${answers.length} answers anchored).`);
     }
-    const agreed = [], outliers = [];
+
+    // --- LEXICAL (Jaccard) result — the historical comparator ---
+    const lexAgreed = [], lexOutliers = [];
     answers.forEach((a, i) => {
       const hasAlly = answers.some((b, j) => i !== j && pairSimilarity(a.text, b.text) >= effectiveThreshold(extractDirective(a.text) || a.text, extractDirective(b.text) || b.text));
-      (hasAlly ? agreed : outliers).push(a);
+      (hasAlly ? lexAgreed : lexOutliers).push(a);
     });
-    return { agreed, outliers };
+
+    // --- CONCEPT result (verdict-polarity + TF-IDF cosine) ---
+    const conceptShadow = conceptConsensusShadow(answers);
+    const conceptAgreed = answers.filter((a) => conceptShadow.agreed.includes(a.name));
+    const conceptOutliers = answers.filter((a) => !conceptShadow.agreed.includes(a.name));
+
+    // Always log both so divergence is visible and measurable.
+    const lexNames = lexAgreed.map((a) => a.name).join(",") || "none";
+    const conNames = conceptAgreed.map((a) => a.name).join(",") || "none";
+    if (lexNames !== conNames) {
+      logError(`CONCEPT COMPARATOR — DIVERGES from lexical this round. Lexical agrees: [${lexNames}]. Concept agrees: [${conNames}]. ${conceptMode() === "live" ? "CONCEPT is LIVE — using it." : "Shadow only — lexical still used. Flip rq_concept_mode=live to promote."}`);
+    } else {
+      logError(`CONCEPT COMPARATOR — matches lexical this round (both agree: [${lexNames}]).`);
+    }
+
+    // Promotion: concept result is used for consensus ONLY when flipped live.
+    if (conceptMode() === "live") {
+      return { agreed: conceptAgreed, outliers: conceptOutliers };
+    }
+    return { agreed: lexAgreed, outliers: lexOutliers };
   }
 
   async function callGroq(query) {
