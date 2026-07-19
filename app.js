@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4-pyodide-sandbox+2026-07-19";
+  const RQ_BUILD = "v3.4.1-sandbox-loadfix+2026-07-19";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -835,68 +835,107 @@
     return { agreed: lexAgreed, outliers: lexOutliers };
   }
 
-  // ==================== v3.4: PYODIDE CODE SANDBOX (SHADOW) ====================
-  // The council's FIRST real tool: seats can now EXECUTE Python, not just
-  // describe it. Any seat answer containing a ```python fenced block has that
-  // block run in a Pyodide (WASM) worker; stdout / return value / errors are
-  // captured, attached to the answer, and logged beside it. SHADOW by default:
-  // results are logged and stored on the answer object but are NOT fed back to
-  // the model and do NOT affect consensus. Promotion (feed result back to the
-  // seat, then reviewer-runs-code) is a later stage, gated on Kimi's ruling
-  // like every other live change.
+  // ==================== v3.4.1: PYODIDE CODE SANDBOX (SHADOW) ====================
+  // The council's first real tool: seats can EXECUTE Python, not just describe
+  // it. Any answer with a ```python fenced block has it run in a Pyodide (WASM)
+  // worker; stdout/return/errors are captured, attached to the answer, logged.
+  // SHADOW: results are logged and stored on a.compute but NOT fed back to the
+  // model and NOT used in consensus. Promotion is gated on Kimi's ruling.
   //
-  //  - Runs in a Web Worker built from an INLINE BLOB, so it stays inside this
-  //    single app.js (flat-file doctrine: no second worker file, no index.html
-  //    edit). CSP still needs, in the headers (NOT here): script-src
-  //    'wasm-unsafe-eval' + cdn.jsdelivr.net ; connect-src cdn.jsdelivr.net ;
-  //    worker-src blob: . (jsdelivr script-src is likely already open from the
-  //    markdown layer.)
-  //  - Pyodide (~6-10MB WASM) is LAZY-loaded on first execution, never at boot.
-  //  - A runaway (infinite loop / memory bomb) is killed by TERMINATING the
-  //    worker on timeout; it respawns on the next call. On the main thread this
-  //    would be an unrecoverable UI freeze — that is why it is a worker.
-  //  - Pyodide is WASM-sandboxed: Python has no filesystem and no network
-  //    unless explicitly bridged, so arbitrary model code is contained by
-  //    default; the only real risk is resource exhaustion, handled by timeout.
+  // v3.4.1 load-fix (2026-07-19): the v3.4 version used ONE 10s timeout around
+  // the whole call, including the first-time ~6-10MB Pyodide download. On a cold
+  // load that 10s expired mid-download, the worker was terminated, the download
+  // aborted before caching, and every subsequent run cold-loaded and died again
+  // — an unescapable timeout loop. It also had no worker-error handler, so a
+  // real load failure was indistinguishable from a slow one. Fixes:
+  //   - SPLIT timeouts: a generous LOAD budget (60s, happens once) for the cold
+  //     WASM bootstrap, and a tight EXEC budget (10s) for the actual code run.
+  //   - Keep the worker WARM after a successful load, so Pyodide caches and
+  //     every later run is near-instant (no re-download).
+  //   - Explicit ready / loaderror protocol + a worker "error" listener, so a
+  //     genuine load failure surfaces its real message instead of a mystery
+  //     timeout. Only a runaway EXECUTION (infinite loop) still kills the worker.
+  //   - CSP still required (already set in index.html's meta): script-src
+  //     'wasm-unsafe-eval' + cdn.jsdelivr.net ; connect-src cdn.jsdelivr.net ;
+  //     worker-src blob: . (Flat-file preserved: worker is an inline blob.)
   const PYODIDE_VERSION = "0.26.4";
-  const PY_TIMEOUT_MS = 10000;
+  const PY_LOAD_TIMEOUT_MS = 60000; // cold WASM bootstrap budget (once)
+  const PY_EXEC_TIMEOUT_MS = 10000; // per-run compute budget (kills runaways)
   let _pyWorker = null;
+  let _pyReady = null; // Promise<void>, resolves when THIS worker's Pyodide is loaded
 
   function _makePyWorker() {
     const src =
+      'let loadErr=null;' +
+      'const boot=(async()=>{try{' +
       'importScripts("https://cdn.jsdelivr.net/pyodide/v' + PYODIDE_VERSION + '/full/pyodide.js");' +
-      'const ready=(async()=>{self.py=await loadPyodide();})();' +
-      'self.onmessage=async(e)=>{await ready;const{id,code}=e.data;let out="",err="";' +
-      'self.py.setStdout({batched:s=>out+=s+"\n"});self.py.setStderr({batched:s=>err+=s+"\n"});' +
+      'self.py=await loadPyodide();self.postMessage({type:"ready"});' +
+      '}catch(e){loadErr=String((e&&e.stack)||e);self.postMessage({type:"loaderror",error:loadErr});}})();' +
+      'self.onmessage=async(e)=>{if(!e.data||e.data.type!=="run")return;const{id,code}=e.data;await boot;' +
+      'if(loadErr){self.postMessage({type:"result",id,ok:false,error:"Pyodide load failed: "+loadErr,stdout:"",stderr:""});return;}' +
+      'let out="",err="";self.py.setStdout({batched:s=>out+=s+"\\n"});self.py.setStderr({batched:s=>err+=s+"\\n"});' +
       'try{const r=await self.py.runPythonAsync(code);' +
-      'self.postMessage({id,ok:true,result:(r&&r.toString)?r.toString():String(r),stdout:out,stderr:err});}' +
-      'catch(ex){self.postMessage({id,ok:false,error:String(ex),stdout:out,stderr:err});}};';
+      'self.postMessage({type:"result",id,ok:true,result:(r&&r.toString)?r.toString():String(r),stdout:out,stderr:err});}' +
+      'catch(ex){self.postMessage({type:"result",id,ok:false,error:String(ex),stdout:out,stderr:err});}};';
     return new Worker(URL.createObjectURL(new Blob([src], { type: "application/javascript" })));
   }
 
-  // Run one block of Python in the worker; resolves { ok, result, stdout,
-  // stderr } or { ok:false, error }. Never rejects — timeout kills + respawns.
-  function runPython(code, timeoutMs) {
-    timeoutMs = timeoutMs || PY_TIMEOUT_MS;
+  // Bring up a worker and a readiness promise if we don't have a live one.
+  function _ensureWorker() {
+    if (_pyWorker && _pyReady) return;
+    _pyWorker = _makePyWorker();
+    _pyReady = new Promise((resolve, reject) => {
+      const loadTimer = setTimeout(
+        () => reject(new Error("Pyodide did not finish loading within " + (PY_LOAD_TIMEOUT_MS / 1000) + "s (cold WASM download — try once more; it caches)")),
+        PY_LOAD_TIMEOUT_MS
+      );
+      const onReady = (e) => {
+        if (!e.data) return;
+        if (e.data.type === "ready") {
+          clearTimeout(loadTimer); _pyWorker.removeEventListener("message", onReady); resolve();
+        } else if (e.data.type === "loaderror") {
+          clearTimeout(loadTimer); _pyWorker.removeEventListener("message", onReady);
+          reject(new Error(e.data.error || "Pyodide load error"));
+        }
+      };
+      _pyWorker.addEventListener("message", onReady);
+      _pyWorker.addEventListener("error", (ev) => {
+        clearTimeout(loadTimer);
+        reject(new Error("Worker error during load: " + ((ev && ev.message) || "unknown — check CSP worker-src/script-src")));
+      });
+    });
+    // If loading fails, drop the worker so the next call rebuilds cleanly.
+    _pyReady.catch(() => { try { _pyWorker && _pyWorker.terminate(); } catch (_) {} _pyWorker = null; _pyReady = null; });
+  }
+
+  // Run one block of Python. Resolves { ok, result, stdout, stderr } or
+  // { ok:false, error }. Never rejects. Waits up to PY_LOAD_TIMEOUT_MS for a
+  // cold load (worker kept warm after), then PY_EXEC_TIMEOUT_MS for the run.
+  async function runPython(code, execTimeoutMs) {
+    execTimeoutMs = execTimeoutMs || PY_EXEC_TIMEOUT_MS;
     if (typeof Worker === "undefined") {
-      return Promise.resolve({ ok: false, error: "Web Workers unavailable in this environment", stdout: "", stderr: "" });
+      return { ok: false, error: "Web Workers unavailable in this environment", stdout: "", stderr: "" };
     }
-    if (!_pyWorker) _pyWorker = _makePyWorker();
+    _ensureWorker();
+    try { await _pyReady; }
+    catch (e) { return { ok: false, error: (e && e.message) || String(e), stdout: "", stderr: "" }; }
     const id = Math.random().toString(36).slice(2);
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
+        // A runaway (infinite loop) can only be stopped by killing the worker;
+        // reset so the next call rebuilds. Load cost is paid again only here.
         try { _pyWorker && _pyWorker.terminate(); } catch (_) {}
-        _pyWorker = null; // respawn on next call
-        resolve({ ok: false, error: "Timed out after " + timeoutMs + "ms (worker killed)", stdout: "", stderr: "" });
-      }, timeoutMs);
+        _pyWorker = null; _pyReady = null;
+        resolve({ ok: false, error: "Execution timed out after " + execTimeoutMs + "ms (worker killed — likely an infinite loop in the code)", stdout: "", stderr: "" });
+      }, execTimeoutMs);
       const onMsg = (e) => {
-        if (!e.data || e.data.id !== id) return;
+        if (!e.data || e.data.type !== "result" || e.data.id !== id) return;
         clearTimeout(timer);
         _pyWorker.removeEventListener("message", onMsg);
         resolve(e.data);
       };
       _pyWorker.addEventListener("message", onMsg);
-      _pyWorker.postMessage({ id, code });
+      _pyWorker.postMessage({ type: "run", id, code });
     });
   }
 
@@ -906,8 +945,7 @@
   }
 
   // Shadow execution across a round's answers. Runs any python a seat emitted,
-  // attaches the result to the answer (a.compute) and logs it. Never throws
-  // into the round — a sandbox failure is logged, not fatal.
+  // attaches the result (a.compute) and logs it. Never throws into the round.
   async function runSandboxShadow(answers) {
     for (const a of answers) {
       const code = extractPython(a && a.text);
@@ -926,7 +964,6 @@
       }
     }
   }
-
 
   async function callGroq(query) {
     await paceProvider("groq");
