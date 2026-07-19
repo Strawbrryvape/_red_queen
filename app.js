@@ -1,4 +1,4 @@
- /* Red Queen v2.1 — Command Center logic
+  /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4.1-sandbox-loadfix+2026-07-19";
+  const RQ_BUILD = "v3.4.2-feedback+display+2026-07-19";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -965,6 +965,51 @@
     }
   }
 
+  // ==================== v3.4.2: SANDBOX FEEDBACK LOOP (TOGGLE) ====================
+  // Stage 2 of the sandbox: feed the COMPUTED result back to the seat so it can
+  // revise its answer, then that revised answer flows into consensus + gets
+  // presented. This is what closes the gap the 2916-vs-2817 round exposed — a
+  // seat guessed wrong, the worker computed right, but nobody told the seat.
+  //
+  // GATED. Default OFF (shadow discipline): this is the first thing that lets a
+  // computed result CHANGE what the council says, so it's the exact kind of
+  // change that needs Kimi's ratification before it runs by default. Flip it on
+  // to demo:  localStorage.setItem("rq_sandbox_feedback","on")  (and "off" to
+  // disable). When off, this is a no-op and consensus is untouched.
+  function sandboxFeedbackMode() {
+    return localStorage.getItem("rq_sandbox_feedback") === "on" ? "on" : "off";
+  }
+  async function runSandboxFeedback(answers, calls) {
+    if (sandboxFeedbackMode() !== "on") return;
+    for (const a of answers) {
+      if (!a || !a.compute || !a.compute.ok) continue; // only successful runs
+      const call = (calls || []).find((c) => c.name === a.name);
+      if (!call) continue;
+      const computed = String(a.compute.stdout || a.compute.result || "").trim();
+      if (!computed) continue;
+      const fbPrompt =
+        "Your previous answer included Python code, which was EXECUTED in a sandbox. " +
+        "The verified output was:\n\n" + computed + "\n\n" +
+        "Treat that output as ground truth. Give your FINAL answer now, using the " +
+        "computed result. If your earlier answer stated a different value, correct it " +
+        "explicitly. Your earlier answer was:\n\n" + a.text;
+      try {
+        const revised = await call.fn(fbPrompt);
+        if (revised && revised.trim()) {
+          a.textOriginal = a.text;   // keep the pre-compute answer for the record
+          a.text = revised.trim();   // consensus + synthesis now use the revised text
+          a.revisedByCompute = true;
+          logError("SANDBOX FEEDBACK (LIVE) — " + seatLabel(a.name) +
+            " revised its answer using the computed result (" + clip(computed, 40) +
+            "). Consensus now uses the revised answer.");
+        }
+      } catch (e) {
+        logError("SANDBOX FEEDBACK — " + seatLabel(a.name) +
+          " re-query failed (" + (e && (e.message || e)) + "); keeping original answer.");
+      }
+    }
+  }
+
   async function callGroq(query) {
     await paceProvider("groq");
     const res = await fetchWithRetry("https://api.groq.com/openai/v1/chat/completions", {
@@ -1237,6 +1282,10 @@
       ".rq-md th,.rq-md td { border: 1px solid rgba(127,127,127,0.3); padding: 5px 9px; }",
       ".rq-md a { color: inherit; text-decoration: underline; }",
       ".rq-trust { display: block; margin-bottom: 0.6em; opacity: 0.92; }",
+      // v3.4.2: long synthesized answers were clipping the consensus box.
+      // Cap its height and let it scroll internally. (If styles.css sets a
+      // fixed height on .consensus-bar, that may still clip — send styles.css.)
+      "#consensusText { max-height: 62vh; overflow-y: auto; overscroll-behavior: contain; }",
     ].join("\n");
     document.head.appendChild(style);
   }
@@ -1245,7 +1294,7 @@
     const str = String(text == null ? "" : text);
     if (mdReady && typeof window.marked !== "undefined" && typeof window.DOMPurify !== "undefined") {
       try {
-        const html = window.DOMPurify.sanitize(window.marked.parse(str), { USE_PROFILES: { html: true } });
+        const html = window.DOMPurify.sanitize(window.marked.parse(str, { breaks: true, gfm: true }), { USE_PROFILES: { html: true } });
         el.classList.remove("rq-md-plain"); el.classList.add("rq-md");
         el.innerHTML = html; // sanitized above — ONLY path that reaches innerHTML
         return;
@@ -1784,6 +1833,9 @@
     // v3.4: run the Pyodide sandbox on any code the seats emitted (SHADOW —
     // logged + attached to each answer, NOT fed to consensus). Non-fatal.
     await runSandboxShadow(answers);
+    // v3.4.2: feed computed results back to the seats (toggle rq_sandbox_feedback;
+    // OFF by default, so consensus is unchanged until deliberately enabled).
+    await runSandboxFeedback(answers, calls);
 
     // MALFORMED_RESPONSE rule (Kimi review, 2026-07-12, Claude amendment):
     // enforced ONLY when the query itself demands a FINAL DIRECTIVE —
