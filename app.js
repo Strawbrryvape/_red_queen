@@ -1,10 +1,21 @@
-    /* Red Queen v2.1 — Command Center logic
+ /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
 
 (function () {
   "use strict";
+
+  // ---------- Build stamp (deploy verification, added 2026-07-19) ----------
+  // Bump this string on every shipped change. If it is NOT visible in the
+  // browser console AND at the top of the drawer log after a deploy, you are
+  // running a STALE/CACHED build — hard-clear and redeploy. Verify by THIS
+  // message, never by line count. Root cause of the "nothing works" week:
+  // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
+  // tell was the divided-round log wording ("FAILED by design" = old build,
+  // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
+  const RQ_BUILD = "v3.4-pyodide-sandbox+2026-07-19";
+  try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
   const $ = (id) => document.getElementById(id);
@@ -824,6 +835,99 @@
     return { agreed: lexAgreed, outliers: lexOutliers };
   }
 
+  // ==================== v3.4: PYODIDE CODE SANDBOX (SHADOW) ====================
+  // The council's FIRST real tool: seats can now EXECUTE Python, not just
+  // describe it. Any seat answer containing a ```python fenced block has that
+  // block run in a Pyodide (WASM) worker; stdout / return value / errors are
+  // captured, attached to the answer, and logged beside it. SHADOW by default:
+  // results are logged and stored on the answer object but are NOT fed back to
+  // the model and do NOT affect consensus. Promotion (feed result back to the
+  // seat, then reviewer-runs-code) is a later stage, gated on Kimi's ruling
+  // like every other live change.
+  //
+  //  - Runs in a Web Worker built from an INLINE BLOB, so it stays inside this
+  //    single app.js (flat-file doctrine: no second worker file, no index.html
+  //    edit). CSP still needs, in the headers (NOT here): script-src
+  //    'wasm-unsafe-eval' + cdn.jsdelivr.net ; connect-src cdn.jsdelivr.net ;
+  //    worker-src blob: . (jsdelivr script-src is likely already open from the
+  //    markdown layer.)
+  //  - Pyodide (~6-10MB WASM) is LAZY-loaded on first execution, never at boot.
+  //  - A runaway (infinite loop / memory bomb) is killed by TERMINATING the
+  //    worker on timeout; it respawns on the next call. On the main thread this
+  //    would be an unrecoverable UI freeze — that is why it is a worker.
+  //  - Pyodide is WASM-sandboxed: Python has no filesystem and no network
+  //    unless explicitly bridged, so arbitrary model code is contained by
+  //    default; the only real risk is resource exhaustion, handled by timeout.
+  const PYODIDE_VERSION = "0.26.4";
+  const PY_TIMEOUT_MS = 10000;
+  let _pyWorker = null;
+
+  function _makePyWorker() {
+    const src =
+      'importScripts("https://cdn.jsdelivr.net/pyodide/v' + PYODIDE_VERSION + '/full/pyodide.js");' +
+      'const ready=(async()=>{self.py=await loadPyodide();})();' +
+      'self.onmessage=async(e)=>{await ready;const{id,code}=e.data;let out="",err="";' +
+      'self.py.setStdout({batched:s=>out+=s+"\n"});self.py.setStderr({batched:s=>err+=s+"\n"});' +
+      'try{const r=await self.py.runPythonAsync(code);' +
+      'self.postMessage({id,ok:true,result:(r&&r.toString)?r.toString():String(r),stdout:out,stderr:err});}' +
+      'catch(ex){self.postMessage({id,ok:false,error:String(ex),stdout:out,stderr:err});}};';
+    return new Worker(URL.createObjectURL(new Blob([src], { type: "application/javascript" })));
+  }
+
+  // Run one block of Python in the worker; resolves { ok, result, stdout,
+  // stderr } or { ok:false, error }. Never rejects — timeout kills + respawns.
+  function runPython(code, timeoutMs) {
+    timeoutMs = timeoutMs || PY_TIMEOUT_MS;
+    if (typeof Worker === "undefined") {
+      return Promise.resolve({ ok: false, error: "Web Workers unavailable in this environment", stdout: "", stderr: "" });
+    }
+    if (!_pyWorker) _pyWorker = _makePyWorker();
+    const id = Math.random().toString(36).slice(2);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        try { _pyWorker && _pyWorker.terminate(); } catch (_) {}
+        _pyWorker = null; // respawn on next call
+        resolve({ ok: false, error: "Timed out after " + timeoutMs + "ms (worker killed)", stdout: "", stderr: "" });
+      }, timeoutMs);
+      const onMsg = (e) => {
+        if (!e.data || e.data.id !== id) return;
+        clearTimeout(timer);
+        _pyWorker.removeEventListener("message", onMsg);
+        resolve(e.data);
+      };
+      _pyWorker.addEventListener("message", onMsg);
+      _pyWorker.postMessage({ id, code });
+    });
+  }
+
+  function extractPython(text) {
+    const m = (text || "").match(/```python\s*([\s\S]*?)```/i);
+    return m ? m[1].trim() : null;
+  }
+
+  // Shadow execution across a round's answers. Runs any python a seat emitted,
+  // attaches the result to the answer (a.compute) and logs it. Never throws
+  // into the round — a sandbox failure is logged, not fatal.
+  async function runSandboxShadow(answers) {
+    for (const a of answers) {
+      const code = extractPython(a && a.text);
+      if (!code) continue;
+      try {
+        const res = await runPython(code);
+        a.compute = res; // provenance travels with the answer (Task 5 JSON)
+        const preview = String(res.stdout || res.result || res.error || "").trim().slice(0, 160);
+        logError("SANDBOX (shadow) — " + seatLabel(a.name) + " executed " +
+          code.split("\n").length + " line(s) of Python: " + (res.ok ? "OK" : "ERROR") +
+          (preview ? " -> " + preview : "") +
+          " . Result NOT fed to consensus (shadow mode; flip after Kimi ratifies).");
+      } catch (e) {
+        logError("SANDBOX (shadow) — " + seatLabel(a.name) +
+          " harness error: " + (e && (e.message || e)) + ". Round unaffected.");
+      }
+    }
+  }
+
+
   async function callGroq(query) {
     await paceProvider("groq");
     const res = await fetchWithRetry("https://api.groq.com/openai/v1/chat/completions", {
@@ -1639,6 +1743,10 @@
     });
 
     if (answers.length === 0) return null; // triggers demo fallback
+
+    // v3.4: run the Pyodide sandbox on any code the seats emitted (SHADOW —
+    // logged + attached to each answer, NOT fed to consensus). Non-fatal.
+    await runSandboxShadow(answers);
 
     // MALFORMED_RESPONSE rule (Kimi review, 2026-07-12, Claude amendment):
     // enforced ONLY when the query itself demands a FINAL DIRECTIVE —
@@ -2697,4 +2805,11 @@
     Object.values(agents).forEach((a) => a.classList.remove("thinking", "consensus"));
     closeDrawer();
   });
+
+  // Surface the build stamp in the in-app drawer log too, so deploy
+  // verification never requires opening devtools — it lands at the top of the
+  // log on load. (added 2026-07-19)
+  try {
+    logError("BUILD " + RQ_BUILD + " loaded. If this line is absent after a deploy, you are on a cached build — hard-clear and reload.");
+  } catch (_) {}
 })();
