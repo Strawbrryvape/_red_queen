@@ -1,4 +1,4 @@
-  /* Red Queen v2.1 — Command Center logic
+   /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4.2-feedback+display+2026-07-19";
+  const RQ_BUILD = "v3.4.4-envelope+CHIM+2026-07-19";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -948,7 +948,7 @@
   // attaches the result (a.compute) and logs it. Never throws into the round.
   async function runSandboxShadow(answers) {
     for (const a of answers) {
-      const code = extractPython(a && a.text);
+      const code = (a && a.code) || extractPython(a && a.text);
       if (!code) continue;
       try {
         const res = await runPython(code);
@@ -1006,6 +1006,107 @@
       } catch (e) {
         logError("SANDBOX FEEDBACK — " + seatLabel(a.name) +
           " re-query failed (" + (e && (e.message || e)) + "); keeping original answer.");
+      }
+    }
+  }
+
+  // ============ v3.4.4: STRUCTURED RESPONSE ENVELOPE + VALIDATOR ============
+  // Council-reviewed next build. NOTE: the council VOTED for "Incremental
+  // State-Diff Sync," which was DECLINED — it assumes a WebSocket/multi-node
+  // network layer this static-site arch does not have (seats are parallel
+  // fetch() calls, nothing to diff-sync). This is the buildable winner from the
+  // same round instead: a structured response contract that fixes the real,
+  // observed failures (bare-number answers, truncated code, chain-of-thought
+  // leaks) that broke fragile ```python regex parsing.
+  //
+  // Seats optionally return a JSON envelope {seat,reasoning,guess,code,final};
+  // the orchestrator extracts structured fields instead of scraping free text.
+  // A VALIDATOR retries a seat once if the envelope is unparseable, then falls
+  // back to raw text.
+  //
+  // GATED: default OFF (localStorage rq_json_envelope="on"). When OFF there is
+  // ZERO change to behavior. When ON it is TOLERANT by design — a malformed
+  // envelope NEVER hard-fails a round; the seat's raw text is used exactly as
+  // before. Built for free-tier models that are unreliable at strict JSON
+  // (prose before "{", ```json fences, trailing text, truncation mid-object).
+  const ENVELOPE_FIELDS = ["seat", "reasoning", "guess", "code", "final"];
+  function jsonEnvelopeEnabled() { return localStorage.getItem("rq_json_envelope") === "on"; }
+
+  const ENVELOPE_INSTRUCTION =
+    "\n\n=== RESPONSE FORMAT ===\n" +
+    "Return ONE JSON object and NOTHING else, in exactly this shape:\n" +
+    '{"seat":"<your seat name>","reasoning":"<brief reasoning>",' +
+    '"guess":"<answer from reasoning alone, or empty>",' +
+    '"code":"<python that computes/verifies the answer, or empty>",' +
+    '"final":"<your final answer>"}\n' +
+    'Put runnable Python in the "code" field, NOT in a markdown block. ' +
+    "Escape newlines inside string values as \\n. Output only the JSON object, " +
+    "with no prose or fences before or after it.\n";
+
+  // Tolerant extractor: pull the first balanced {...} out of surrounding junk,
+  // parse it, normalize expected fields. Returns a normalized envelope or null.
+  // Brace matching is string-aware so braces inside Python code don't confuse it.
+  function parseEnvelope(text) {
+    if (!text) return null;
+    let s = String(text).replace(/```(?:json)?/gi, "").trim();
+    const start = s.indexOf("{");
+    if (start === -1) return null;
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = start; i < s.length; i++) {
+      const c = s[i];
+      if (esc) { esc = false; continue; }
+      if (c === "\\") { esc = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (c === "{") depth++;
+      else if (c === "}") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) return null; // unbalanced (e.g. truncated mid-object)
+    let obj;
+    try { obj = JSON.parse(s.slice(start, end + 1)); }
+    catch (_) { return null; }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+    // require at least one usable answer field, else it isn't a real envelope
+    if (!("final" in obj) && !("reasoning" in obj) && !("guess" in obj)) return null;
+    const norm = {};
+    ENVELOPE_FIELDS.forEach((f) => { norm[f] = obj[f] != null ? String(obj[f]) : ""; });
+    return norm;
+  }
+
+  // Apply the envelope to each answer when the mode is on. Parse; on failure,
+  // retry the seat ONCE with a stricter reminder; on second failure keep raw
+  // text (full backward-compatible fallback). Sets a.envelope, a.code, and
+  // replaces a.text with the clean final answer for consensus (a.rawText kept).
+  async function applyEnvelope(answers, calls) {
+    if (!jsonEnvelopeEnabled()) return;
+    for (const a of answers) {
+      if (!a) continue;
+      let env = parseEnvelope(a.text);
+      if (!env) {
+        const call = (calls || []).find((c) => c.name === a.name);
+        if (call) {
+          try {
+            const retry = await call.fn(
+              "Your previous response was not valid JSON. Reply with ONLY a single " +
+              'JSON object: {"seat":"","reasoning":"","guess":"","code":"","final":""}. ' +
+              "No prose, no markdown fences, no text before or after the object."
+            );
+            env = parseEnvelope(retry);
+            if (env) logError("ENVELOPE — " + seatLabel(a.name) + " recovered on validator retry.");
+          } catch (e) { /* fall through to raw-text fallback */ }
+        }
+      }
+      if (env) {
+        a.rawText = a.text;
+        a.envelope = env;
+        if (env.code) a.code = env.code;                 // sandbox prefers this
+        const clean = (env.final || env.reasoning || env.guess || "").trim();
+        if (clean) a.text = clean;                        // consensus uses clean answer
+        logError("ENVELOPE — " + seatLabel(a.name) + " parsed OK" +
+          (env.code ? " (code field present)" : "") + ".");
+      } else {
+        logError("ENVELOPE — " + seatLabel(a.name) +
+          " unparseable after retry; using raw text (fallback, round unaffected).");
       }
     }
   }
@@ -1832,6 +1933,9 @@
 
     // v3.4: run the Pyodide sandbox on any code the seats emitted (SHADOW —
     // logged + attached to each answer, NOT fed to consensus). Non-fatal.
+    // v3.4.4: parse structured envelopes (gated) BEFORE the sandbox, so it
+    // can use the envelope's code field instead of regex-scraping ```python.
+    await applyEnvelope(answers, calls);
     await runSandboxShadow(answers);
     // v3.4.2: feed computed results back to the seats (toggle rq_sandbox_feedback;
     // OFF by default, so consensus is unchanged until deliberately enabled).
@@ -2114,15 +2218,89 @@
     "{{SEAT_IDENTITY}}\n" +
     "Respond in the language of the CURRENT QUESTION.\n";
 
+  // ==================== v3.4.3: CHIM — Concise History Injection Module ====================
+  // Council-approved (round 27: Gemini Y, Claude AMEND, Kimi conceded no defect).
+  // PROBLEM it fixes: buildMemoryContext fills the char budget newest-first and,
+  // when it runs out, SILENTLY DROPS the oldest rounds. Once the ledger is long,
+  // early SETTLED decisions (constitution, protocol rounds, roster changes) fall
+  // off the cliff and the council "loses the plot." CHIM reserves a slice of the
+  // budget for a compact STATE DIGEST of exactly those would-be-dropped rounds,
+  // so long-term settled context survives in bounded form instead of vanishing.
+  //
+  // SPEC-VS-REALITY (the honest refinement of the round-26 proposal):
+  //  - The proposal said "runs every 10 rounds." This architecture rebuilds the
+  //    injected context FRESH every dispatch, so a periodic stored job is the
+  //    wrong shape — CHIM runs CONTINUOUSLY at injection time (always current,
+  //    no stored summary blob that can drift out of sync).
+  //  - The proposal said "RESOLVED vs OUTSTANDING proposals / active protocols."
+  //    The ledger stores free-text prompt/outcome/verdict, NOT structured
+  //    proposal metadata. So CHIM summarizes what's ACTUALLY there — trust-tag
+  //    counts + VERIFIED verdicts (safe to carry as settled) + recurring DIVIDED
+  //    topics (open threads) — rather than asserting invented structure, which
+  //    would just amplify confabulation.
+  //
+  // GATED: default OFF. Flip on: localStorage.setItem("rq_chim","on"). When off,
+  // buildMemoryContext behaves EXACTLY as before (safe rollback + clean A/B).
+  const CHIM_DIGEST_BUDGET_FRAC = 0.35; // share of the char budget reserved for the digest
+  function chimEnabled() { return localStorage.getItem("rq_chim") === "on"; }
+
+  // Compact the older entries (those the recent-budget couldn't fit) into a
+  // bounded digest. VERIFIED verdicts are carried as settled fact; DIVIDED are
+  // listed as open threads; PROVISIONAL/SOLE are counted only (never asserted).
+  function buildStateDigest(olderEntries, charBudget) {
+    if (!olderEntries.length || charBudget < 80) return "";
+    const counts = { verified: 0, provisional: 0, sole: 0, divided: 0 };
+    const settled = [];
+    const openTopics = [];
+    olderEntries.forEach((e) => {
+      if (counts[e.outcome] !== undefined) counts[e.outcome]++;
+      if (e.outcome === "verified" && e.verdict) settled.push(clip(e.verdict, 90));
+      else if (e.outcome === "divided") openTopics.push(clip(e.prompt, 50));
+    });
+    let out = "=== EARLIER ROUNDS (compacted by CHIM) ===\n" +
+      olderEntries.length + " older round(s): " + counts.verified + " VERIFIED, " +
+      counts.provisional + " PROVISIONAL, " + counts.sole + " SOLE VOICE, " +
+      counts.divided + " DIVIDED.\n";
+    if (settled.length) out += "Settled (VERIFIED, treat as established): " +
+      settled.slice(0, 8).map((s) => '"' + s + '"').join("; ") + "\n";
+    if (openTopics.length) out += "Recurring open threads (were DIVIDED, NOT settled): " +
+      openTopics.slice(0, 6).map((s) => '"' + s + '"').join("; ") + "\n";
+    if (out.length > charBudget) out = clip(out, charBudget - 4) + "…\n";
+    return out;
+  }
+
   // Build the injected context: newest rounds verbatim, older rounds
   // compacted, assembled newest-backwards under the hard char cap, then
-  // emitted oldest-first for natural reading order.
+  // emitted oldest-first for natural reading order. With CHIM on, rounds that
+  // don't fit are compacted into a state digest instead of being dropped.
   function buildMemoryContext() {
     if (!memoryEnabled() || ledger.length === 0) return "";
     const lines = [];
     // Defensive clamp: even if CHAR_CAP is mis-tuned above HARD_MAX, the
     // injection can never exceed the ceiling that protects free-tier prompts.
     let budget = Math.min(MEMORY_CONTEXT_CHAR_CAP, MEMORY_CONTEXT_HARD_MAX);
+
+    if (chimEnabled()) {
+      // Reserve a slice for the digest so old rounds never fall off the cliff.
+      const digestBudget = Math.floor(budget * CHIM_DIGEST_BUDGET_FRAC);
+      let recentBudget = budget - digestBudget;
+      let oldestShown = ledger.length; // index of the oldest round shown in full
+      for (let i = ledger.length - 1; i >= 0; i--) {
+        const verbatim = i >= ledger.length - LEDGER_VERBATIM_ROUNDS;
+        const line = `[Round ${i + 1}] ` + ledgerLine(ledger[i], verbatim);
+        if (line.length + 1 > recentBudget) break;
+        recentBudget -= line.length + 1;
+        lines.unshift(line);
+        oldestShown = i;
+      }
+      const older = ledger.slice(0, oldestShown); // everything not shown in full
+      const digest = buildStateDigest(older, digestBudget);
+      if (lines.length === 0 && !digest) return "";
+      const body = (digest ? digest + "\n" : "") + lines.join("\n");
+      return MEMORY_HEADER + body + "\n=== CURRENT QUESTION ===\n";
+    }
+
+    // CHIM off — original behaviour: newest-first until budget runs out.
     for (let i = ledger.length - 1; i >= 0; i--) {
       const verbatim = i >= ledger.length - LEDGER_VERBATIM_ROUNDS;
       const line = `[Round ${i + 1}] ` + ledgerLine(ledger[i], verbatim);
@@ -2754,7 +2932,8 @@
       // context ahead of the current question. The RAW query (not the
       // composed one) is what gets displayed, logged, and remembered.
       const memoryContext = buildMemoryContext();
-      const composedQuery = memoryContext ? memoryContext + query : query;
+      const composedQuery = (memoryContext ? memoryContext + query : query) +
+        (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "");
       try {
         result = await runLiveCouncil(composedQuery);
       } catch (e) {
