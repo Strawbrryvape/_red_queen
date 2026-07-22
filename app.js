@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4.6-ledger-complete";
+  const RQ_BUILD = "v3.4.7-embedding-shadow";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -939,6 +939,159 @@
     });
   }
 
+  // ==================== v3.4.7: VECTOR MEMORY — embedding layer (Stage 1) ====================
+  // Kimi Ruling 2 (2026-07-22): the "one worker, two entry points" non-negotiable
+  // is satisfied here as ONE SHARED LIFECYCLE FACTORY, TWO INSTANCES — not one
+  // worker instance. A single instance would break Requirement #4 (no re-download
+  // per round): runPython() TERMINATES its worker on exec timeout to kill runaway
+  // loops, which would evict the 20-30MB embedding model and force re-download.
+  // The factory below is the single lifecycle abstraction; the Pyodide path above
+  // should be refactored onto it in a later pass. DO NOT recombine into one worker.
+  const _EMBED_XFORMERS_URL = "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2";
+  const _EMBED_MODEL = "Xenova/all-MiniLM-L6-v2";
+  const _EMBED_DIM = 384;                  // schema commitment — pgvector column is vector(384)
+  const _EMBED_LOAD_TIMEOUT_MS = 90000;    // cold model download, once (bigger payload than Pyodide)
+  const _EMBED_EXEC_TIMEOUT_MS = 15000;    // per-embed budget
+
+  function _makeManagedWorker(opts) {
+    let worker = null, ready = null;
+    function ensure() {
+      if (worker && ready) return;
+      worker = new Worker(
+        URL.createObjectURL(new Blob([opts.src], { type: "application/javascript" })),
+        opts.workerOptions || undefined
+      );
+      ready = new Promise((resolve, reject) => {
+        const t = setTimeout(
+          () => reject(new Error(opts.label + " did not load within " + (opts.loadTimeoutMs / 1000) + "s")),
+          opts.loadTimeoutMs
+        );
+        const onReady = (e) => {
+          if (!e.data) return;
+          if (e.data.type === "ready") {
+            clearTimeout(t); worker.removeEventListener("message", onReady); resolve();
+          } else if (e.data.type === "loaderror") {
+            clearTimeout(t); worker.removeEventListener("message", onReady);
+            reject(new Error(e.data.error || (opts.label + " load error")));
+          }
+        };
+        worker.addEventListener("message", onReady);
+        worker.addEventListener("error", (ev) => {
+          clearTimeout(t);
+          reject(new Error("Worker error during load: " + ((ev && ev.message) || "unknown — check CSP worker-src/script-src/connect-src")));
+        });
+      });
+      ready.catch(() => { teardown(); });
+    }
+    function teardown() {
+      try { worker && worker.terminate(); } catch (_) {}
+      worker = null; ready = null;
+    }
+    return {
+      teardown: teardown,
+      warm: function () { try { ensure(); } catch (_) {} },
+      call: function (payload, timeoutMs) {
+        if (typeof Worker === "undefined") return Promise.resolve(null);
+        try { ensure(); } catch (_) { return Promise.resolve(null); }
+        return ready.then(() => new Promise((resolve) => {
+          const id = Math.random().toString(36).slice(2);
+          const timer = setTimeout(() => { teardown(); resolve(null); }, timeoutMs);
+          const onMsg = (e) => {
+            if (!e.data || e.data.type !== "result" || e.data.id !== id) return;
+            clearTimeout(timer);
+            worker.removeEventListener("message", onMsg);
+            resolve(e.data);
+          };
+          worker.addEventListener("message", onMsg);
+          worker.postMessage(Object.assign({ id: id }, payload));
+        })).catch(() => null);
+      },
+    };
+  }
+
+  // Module worker: transformers.js v2 is ESM, so importScripts() cannot load it.
+  const _embedSrc =
+    'let loadErr=null,extract=null;' +
+    'const boot=(async()=>{try{' +
+    'const m=await import("' + _EMBED_XFORMERS_URL + '");' +
+    'm.env.allowLocalModels=false;m.env.useBrowserCache=true;' +
+    'extract=await m.pipeline("feature-extraction","' + _EMBED_MODEL + '",{quantized:true});' +
+    'self.postMessage({type:"ready"});' +
+    '}catch(e){loadErr=String((e&&e.stack)||e);self.postMessage({type:"loaderror",error:loadErr});}})();' +
+    'self.onmessage=async(e)=>{if(!e.data||e.data.type!=="embed")return;const{id,text}=e.data;await boot;' +
+    'if(loadErr){self.postMessage({type:"result",id,ok:false,error:loadErr});return;}' +
+    'try{const o=await extract(text,{pooling:"mean",normalize:true});' +
+    'self.postMessage({type:"result",id,ok:true,vector:Array.from(o.data)});}' +
+    'catch(ex){self.postMessage({type:"result",id,ok:false,error:String(ex)});}};';
+
+  const _embedWorker = _makeManagedWorker({
+    label: "Embedding model",
+    src: _embedSrc,
+    workerOptions: { type: "module" },
+    loadTimeoutMs: _EMBED_LOAD_TIMEOUT_MS,
+  });
+
+  // Embed one string. Returns number[384], or NULL on any failure whatsoever.
+  // Fail-soft per ruling: never throws, never blocks a round. Null => caller
+  // leaves the embedding column null => match_rounds filters that row out.
+  async function embedText(text) {
+    const s = (text == null ? "" : String(text)).trim();
+    if (!s) return null;
+    const clipped = s.length > 1200 ? s.slice(0, 1200) : s;   // MiniLM caps ~256 word-pieces
+    const msg = await _embedWorker.call({ type: "embed", text: clipped }, _EMBED_EXEC_TIMEOUT_MS);
+    if (!msg || !msg.ok || !Array.isArray(msg.vector)) return null;
+    if (msg.vector.length !== _EMBED_DIM) return null;         // dimension guard
+    for (let i = 0; i < msg.vector.length; i++) {
+      if (typeof msg.vector[i] !== "number" || !isFinite(msg.vector[i])) return null;
+    }
+    return msg.vector;
+  }
+
+  // Drawer self-test (Kimi Ruling 3, non-optional). Explicit PASS/FAIL beats the
+  // silent-null failure mode where vector memory is dead but everything "looks fine."
+  async function runEmbedSelfTest() {
+    logError("[EMBED] Self-test: running… (first run downloads the model, ~20-30MB, one time)");
+    const t0 = Date.now();
+    const v = await embedText("Red Queen council vector memory self test");
+    if (!v) {
+      logError("[EMBED] Self-test: FAIL — embedText returned null. Check CSP connect-src (huggingface.co) and the console for a 'Refused to connect' line.");
+      return false;
+    }
+    logError("[EMBED] Self-test: PASS | Model: " + _EMBED_MODEL + " | Dim: " + v.length + " | Latency: " + (Date.now() - t0) + "ms");
+    return true;
+  }
+
+  // Stage 1: store-only shadow. WRITE-THEN-UPDATE so a slow/cold embed never
+  // delays the round's memory write. Row is inserted first (elsewhere); this
+  // patches the embedding in afterward, best-effort. rowId is the uuid returned
+  // by the insert. Fully fail-soft: any problem just leaves embedding null.
+  async function embedAndStore(rowId, text) {
+    try {
+      if (!rowId || !sbConfigured()) return;
+      const vec = await embedText(text);
+      if (!vec) return;   // model cold, CSP-blocked, or failed — row keeps null embedding
+      await fetch(
+        settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/rq_events?id=eq." + encodeURIComponent(rowId),
+        {
+          method: "PATCH",
+          headers: {
+            apikey: settings.supabaseAnonKey,
+            Authorization: "Bearer " + settings.supabaseAnonKey,
+            "Content-Type": "application/json",
+            Prefer: "return=minimal",
+          },
+          body: JSON.stringify({ embedding: vec }),
+        }
+      ).then((res) => {
+        if (!res.ok) return res.text().catch(() => "").then((b) => {
+          try { console.warn("[RQ][embed] patch rejected", res.status, (b || "").slice(0, 300)); } catch (_) {}
+        });
+      });
+    } catch (e) {
+      try { console.warn("[RQ][embed] embedAndStore error", (e && e.message) || e); } catch (_) {}
+    }
+  }
+
   function extractPython(text) {
     const m = (text || "").match(/```python\s*([\s\S]*?)```/i);
     return m ? m[1].trim() : null;
@@ -1608,6 +1761,22 @@
         c.disabled = true;
         c.textContent = "FETCHING\u2026 see Error Logs";
         try { await listFreeModels(); } finally { c.disabled = false; c.textContent = label; }
+      });
+
+      // v3.4.7 (Kimi Ruling 3) — embedding self-test. Explicit PASS/FAIL in the
+      // Error Logs so a CSP-blocked or cold model can't fail silently.
+      const d = document.createElement("button");
+      d.id = "embedSelfTest";
+      d.type = "button";
+      d.textContent = "EMBED SELF-TEST";
+      d.className = saveSettingsBtn.className || "";
+      d.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      c.parentNode.insertBefore(d, c.nextSibling);
+      d.addEventListener("click", async () => {
+        const label = d.textContent;
+        d.disabled = true;
+        d.textContent = "TESTING\u2026 see Error Logs";
+        try { await runEmbedSelfTest(); } finally { d.disabled = false; d.textContent = label; }
       });
     } catch (e) { /* cosmetic — never block boot */ }
   })();
@@ -2446,15 +2615,52 @@
     // decision stayed invisible to retrieval — the opposite of what the
     // confabulation fix needs. result.divided is READ here, never written,
     // so removing the guard cannot affect consensus weighting.
-    sbInsert("rq_events", [{
-      prompt: clip(query, 900),
-      response: clip(result.divided
-        ? answers.map((a) => `${seatLabel(a.name)}: ${clip(a.text, 120)}`).join(" | ")
-        : (result.text || ""), 900),
-      // "unknown" not "sole" — matches recordLedger's outcome convention now
-      // that every trust state reaches this line, not just sole/divided.
-      consensus_status: result.divided ? "divided" : (result.trust || "unknown"),
-    }]);
+    // v3.4.7 — the response text is what Stage 1 embeds, so build it once and
+    // reuse it for both the row and the embedding (embed the fuller prompt+response
+    // so retrieval matches on question AND verdict, not verdict alone).
+    const _evPrompt = clip(query, 900);
+    const _evResponse = clip(result.divided
+      ? answers.map((a) => `${seatLabel(a.name)}: ${clip(a.text, 120)}`).join(" | ")
+      : (result.text || ""), 900);
+    const _evStatus = result.divided ? "divided" : (result.trust || "unknown");
+    // WRITE-THEN-UPDATE: insert returns the row id, then embedding is patched in
+    // asynchronously. A slow/cold/failed embed never delays or blocks this write.
+    sbInsertReturning("rq_events", {
+      prompt: _evPrompt,
+      response: _evResponse,
+      consensus_status: _evStatus,
+    }).then((row) => {
+      if (row && row.id) embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse);
+    });
+  }
+
+  // Like sbInsert but returns the inserted row (Prefer: return=representation)
+  // so callers can chain on the generated id. Resolves the first row or null;
+  // never rejects. Single-object insert only.
+  function sbInsertReturning(table, obj) {
+    if (!sbConfigured()) return Promise.resolve(null);
+    const payload = rqNormalizeRows([obj]);
+    return fetch(settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/" + table, {
+      method: "POST",
+      headers: {
+        apikey: settings.supabaseAnonKey,
+        Authorization: "Bearer " + settings.supabaseAnonKey,
+        "Content-Type": "application/json",
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify(payload),
+    }).then((res) => {
+      if (res.ok) return res.json().then((rows) => (Array.isArray(rows) ? rows[0] : rows) || null).catch(() => null);
+      return res.text().catch(() => "").then((body) => {
+        const detail = (body || "").slice(0, 500);
+        try { console.warn("[RQ][telemetry] insert rejected", "table:", table, "status:", res.status, "body:", detail); } catch (_) {}
+        logError(`Institutional memory write to ${table} failed (HTTP ${res.status}) — dispatch unaffected. ${detail}`);
+        return null;
+      });
+    }).catch((e) => {
+      logError(`Institutional memory unreachable (${table}): ${e.message || e} — dispatch unaffected.`);
+      return null;
+    });
   }
 
   // v3.4.6 (Kimi, 2026-07-22) — surface the routing artifact that makes
