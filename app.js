@@ -1,4 +1,4 @@
-   /* Red Queen v2.1 — Command Center logic
+     /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4.4-envelope+CHIM+2026-07-19";
+  const RQ_BUILD = "v3.4.5-telemetry-normalize";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -2363,8 +2363,31 @@
   function sbConfigured() {
     return !!(settings.supabaseUrl && settings.supabaseAnonKey);
   }
+  // v3.4.5 — normalize heterogeneous rows for PostgREST bulk insert.
+  // PostgREST rejects a batch whose objects do not all share identical keys
+  // (the "council" summary row omits the numeric seat columns).
+  // CRITICAL: undefined -> null. JSON.stringify silently strips undefined keys,
+  // which re-introduces the very mismatch this function exists to remove.
+  function rqNormalizeRows(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) return rows;
+    const keys = new Set();
+    for (const r of rows) {
+      if (r) for (const k of Object.keys(r)) keys.add(k);
+    }
+    const template = {};
+    keys.forEach((k) => { template[k] = null; });
+    return rows.map((r) => {
+      const out = Object.assign({}, template);
+      for (const k of Object.keys(r || {})) {
+        out[k] = (r[k] === undefined ? null : r[k]);
+      }
+      return out;
+    });
+  }
+
   function sbInsert(table, rows) {
     if (!sbConfigured()) return Promise.resolve();
+    const payload = rqNormalizeRows(rows);
     return fetch(settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/" + table, {
       method: "POST",
       headers: {
@@ -2373,9 +2396,16 @@
         "Content-Type": "application/json",
         Prefer: "return=minimal",
       },
-      body: JSON.stringify(rows),
+      body: JSON.stringify(payload),
     }).then((res) => {
-      if (!res.ok) logError(`Institutional memory write to ${table} failed (HTTP ${res.status}) — dispatch unaffected.`);
+      if (res.ok) return;
+      // v3.4.5 — surface the PostgREST error body. A bare status code cannot
+      // distinguish key mismatch / unknown column / RLS / type error.
+      return res.text().catch(() => "").then((body) => {
+        const detail = (body || "").slice(0, 500);
+        try { console.warn("[RQ][telemetry] insert rejected", "table:", table, "status:", res.status, "body:", detail); } catch (_) {}
+        logError(`Institutional memory write to ${table} failed (HTTP ${res.status}) — dispatch unaffected. ${detail}`);
+      });
     }).catch((e) => {
       logError(`Institutional memory unreachable (${table}): ${e.message || e} — dispatch unaffected.`);
     });
@@ -2410,15 +2440,17 @@
     });
     sbInsert("rq_telemetry", rows);
     if (result.divided || result.trust === "sole") {
+      // v3.4.5 — SECOND 400, distinct from the batch-shape bug above.
+      // This insert wrote event_id/title/summary/cultural_tags/participants/mood.
+      // The live rq_events schema is (id, created_at, prompt, response,
+      // consensus_status). Zero column overlap => every divided/sole round has
+      // been silently rejected. Normalization cannot fix a name mismatch.
       sbInsert("rq_events", [{
-        event_id: dispatchId,
-        title: result.divided ? "Divided Council round" : "Sole Voice round",
-        summary: clip(`Q: ${query} — ` + (result.divided
+        prompt: clip(query, 900),
+        response: clip(result.divided
           ? answers.map((a) => `${seatLabel(a.name)}: ${clip(a.text, 120)}`).join(" | ")
-          : `verdict: ${clip(result.text, 200)}`), 900),
-        cultural_tags: [result.divided ? "divided" : "sole_voice"],
-        participants: answers.map((a) => seatLabel(a.name)),
-        mood: "logged_automatically",
+          : (result.text || ""), 900),
+        consensus_status: result.divided ? "divided" : (result.trust || "sole"),
       }]);
     }
   }
