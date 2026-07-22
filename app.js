@@ -1,4 +1,4 @@
-     /* Red Queen v2.1 — Command Center logic
+  /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4.5-telemetry-normalize";
+  const RQ_BUILD = "v3.4.6-ledger-complete";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -2439,20 +2439,44 @@
       event_type: result.divided ? "consensus_divided" : "consensus_" + (result.trust || "unknown"),
     });
     sbInsert("rq_telemetry", rows);
-    if (result.divided || result.trust === "sole") {
-      // v3.4.5 — SECOND 400, distinct from the batch-shape bug above.
-      // This insert wrote event_id/title/summary/cultural_tags/participants/mood.
-      // The live rq_events schema is (id, created_at, prompt, response,
-      // consensus_status). Zero column overlap => every divided/sole round has
-      // been silently rejected. Normalization cannot fix a name mismatch.
-      sbInsert("rq_events", [{
-        prompt: clip(query, 900),
-        response: clip(result.divided
-          ? answers.map((a) => `${seatLabel(a.name)}: ${clip(a.text, 120)}`).join(" | ")
-          : (result.text || ""), 900),
-        consensus_status: result.divided ? "divided" : (result.trust || "sole"),
-      }]);
-    }
+    // v3.4.6 (Kimi Ruling 1, 2026-07-22) — rq_events is now a FULL LEDGER.
+    // Was: if (result.divided || result.trust === "sole") { ... }
+    // That conditional made rq_events a log of DISAGREEMENTS. Vector memory
+    // built on it would index the council's arguments while every settled
+    // decision stayed invisible to retrieval — the opposite of what the
+    // confabulation fix needs. result.divided is READ here, never written,
+    // so removing the guard cannot affect consensus weighting.
+    sbInsert("rq_events", [{
+      prompt: clip(query, 900),
+      response: clip(result.divided
+        ? answers.map((a) => `${seatLabel(a.name)}: ${clip(a.text, 120)}`).join(" | ")
+        : (result.text || ""), 900),
+      // "unknown" not "sole" — matches recordLedger's outcome convention now
+      // that every trust state reaches this line, not just sole/divided.
+      consensus_status: result.divided ? "divided" : (result.trust || "unknown"),
+    }]);
+  }
+
+  // v3.4.6 (Kimi, 2026-07-22) — surface the routing artifact that makes
+  // agreement look stronger than it is. When two seats fall back to the same
+  // model, "3/3 consensus" is two models wearing three hats. Advisory only:
+  // never blocks a round, never alters weights.
+  function warnSeatDiversity(result) {
+    try {
+      const answers = (result && result.answers) || [];
+      if (answers.length < 2) return;
+      const byModel = {};
+      answers.forEach((a) => {
+        const m = a.model || seatModelLabel(a.name) || "unknown";
+        (byModel[m] = byModel[m] || []).push(seatLabel(a.name));
+      });
+      Object.keys(byModel).forEach((m) => {
+        const seats = byModel[m];
+        if (seats.length > 1) {
+          logError(`[SEAT] Diversity warning: ${seats.length}/${answers.length} seats routed to identical model (${m}) — ${seats.join(", ")}. Consensus weights may be inflated; agreement between them is not independent verification.`);
+        }
+      });
+    } catch (_) { /* advisory only — never break a round */ }
   }
 
   // ==================== v3.0.0: FOUNDATION (Charter §11 items 1–6) ====================
@@ -2999,6 +3023,7 @@
         if (memoryPill && memoryPill.refresh) memoryPill.refresh();
         if (window.__rqRenderSessions) window.__rqRenderSessions();
         if (window.__rqIntro) { window.__rqIntro.remove(); window.__rqIntro = null; }
+        warnSeatDiversity(result);
         logInstitutionalMemory(dispatchId, query, result);
         // Trust-state prefix (v2.4): the bar itself carries the verification
         // level — a sole understudy's opinion must never wear the Council's
