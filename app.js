@@ -1,4 +1,4 @@
-   /* Red Queen v2.1 — Command Center logic
+  /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4.7b-embedding-shadow";
+  const RQ_BUILD = "v3.4.7c-embed-diagnostics";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -1113,10 +1113,17 @@
   // by the insert. Fully fail-soft: any problem just leaves embedding null.
   async function embedAndStore(rowId, text) {
     try {
-      if (!rowId || !sbConfigured() || !vectorMemoryEnabled()) return;
+      // Every early return below used to be silent, which is why a broken
+      // PATCH looked identical to a working one. Stage 1 is a shadow stage
+      // under active verification — it should be loud. Quiet these once
+      // embeddings are landing reliably.
+      if (!rowId) { logError("[EMBED] skipped — insert returned no row id (check Prefer: return=representation and the anon SELECT policy)."); return; }
+      if (!sbConfigured()) { logError("[EMBED] skipped — Supabase not configured."); return; }
+      if (!vectorMemoryEnabled()) { logError("[EMBED] skipped — rq_vector_memory is OFF on this origin."); return; }
+      logError("[EMBED] embedding row " + String(rowId).slice(0, 8) + "…");
       const vec = await embedText(text);
-      if (!vec) return;   // model cold, CSP-blocked, or failed — row keeps null embedding
-      await fetch(
+      if (!vec) { logError("[EMBED] FAIL — embedText returned null for row " + String(rowId).slice(0, 8) + "… (worker cold, timed out, or CSP-blocked)."); return; }
+      const res = await fetch(
         settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/rq_events?id=eq." + encodeURIComponent(rowId),
         {
           method: "PATCH",
@@ -1124,7 +1131,11 @@
             apikey: settings.supabaseAnonKey,
             Authorization: "Bearer " + settings.supabaseAnonKey,
             "Content-Type": "application/json",
-            Prefer: "return=minimal",
+            // representation, not minimal: an UPDATE blocked by RLS returns
+            // 204 with no error, so "success" and "changed nothing" are
+            // indistinguishable under return=minimal. Asking for the row back
+            // makes a zero-row update visible.
+            Prefer: "return=representation",
           },
           // pgvector's text input format is "[0.1,0.2,...]". A raw JSON array
           // happens to serialise to the same characters, but PostgREST decides
@@ -1133,13 +1144,21 @@
           // of them, so it is the form to send.
           body: JSON.stringify({ embedding: "[" + vec.join(",") + "]" }),
         }
-      ).then((res) => {
-        if (!res.ok) return res.text().catch(() => "").then((b) => {
-          try { console.warn("[RQ][embed] patch rejected", res.status, (b || "").slice(0, 300)); } catch (_) {}
-        });
-      });
+      );
+      const body = await res.text().catch(() => "");
+      if (!res.ok) {
+        logError("[EMBED] FAIL — PATCH rejected HTTP " + res.status + " " + (body || "").slice(0, 300));
+        return;
+      }
+      let n = null;
+      try { const j = JSON.parse(body); n = Array.isArray(j) ? j.length : null; } catch (_) {}
+      if (n === 0) {
+        logError("[EMBED] FAIL — PATCH matched ZERO rows. The request succeeded but RLS blocked the update; rq_events needs a policy: for update to anon using (true) with check (true).");
+        return;
+      }
+      logError("[EMBED] OK — row " + String(rowId).slice(0, 8) + "… embedded (" + vec.length + "d).");
     } catch (e) {
-      try { console.warn("[RQ][embed] embedAndStore error", (e && e.message) || e); } catch (_) {}
+      logError("[EMBED] FAIL — embedAndStore threw: " + ((e && e.message) || e));
     }
   }
 
@@ -2681,7 +2700,11 @@
       response: _evResponse,
       consensus_status: _evStatus,
     }).then((row) => {
-      if (row && row.id) embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse);
+      // A missing row here is the other silent failure: the insert succeeded
+      // but returned nothing to attach an embedding to. Name it explicitly
+      // rather than letting the chain end quietly.
+      if (row && row.id) { embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse); }
+      else if (vectorMemoryEnabled()) { logError("[EMBED] no row id returned from the rq_events insert — nothing to embed. Insert itself may have failed; see any preceding institutional-memory error."); }
     });
   }
 
