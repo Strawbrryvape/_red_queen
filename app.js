@@ -1,4 +1,4 @@
-  /* Red Queen v2.1 — Command Center logic
+   /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4.7-embedding-shadow";
+  const RQ_BUILD = "v3.4.7b-embedding-shadow";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -953,6 +953,16 @@
   const _EMBED_LOAD_TIMEOUT_MS = 90000;    // cold model download, once (bigger payload than Pyodide)
   const _EMBED_EXEC_TIMEOUT_MS = 15000;    // per-embed budget
 
+  // Stage gate. Every other staged feature in this file is flagged
+  // (rq_concept_mode / rq_sandbox_feedback / rq_json_envelope / rq_chim);
+  // Stage 1 shipped without one, which made Kimi's own flag-OFF verification
+  // ("behaviour byte-identical to v3.4.6") impossible to actually perform, and
+  // started a 20-30MB model download unannounced on the first round.
+  // Gates STORAGE only — the self-test button stays live either way, so a
+  // CSP or model problem can still be diagnosed with the flag off.
+  //   enable:  localStorage.setItem("rq_vector_memory","on")
+  function vectorMemoryEnabled() { return localStorage.getItem("rq_vector_memory") === "on"; }
+
   function _makeManagedWorker(opts) {
     let worker = null, ready = null;
     function ensure() {
@@ -995,7 +1005,15 @@
         try { ensure(); } catch (_) { return Promise.resolve(null); }
         return ready.then(() => new Promise((resolve) => {
           const id = Math.random().toString(36).slice(2);
-          const timer = setTimeout(() => { teardown(); resolve(null); }, timeoutMs);
+          // terminateOnTimeout is Pyodide's policy, not a universal one: it
+          // exists to kill a runaway user loop. An embed is a fixed forward
+          // pass and cannot run away, so tearing its worker down on a slow
+          // pass would evict the loaded model and force a re-init — exactly
+          // the re-download the two-instance split was created to prevent.
+          const timer = setTimeout(() => {
+            if (opts.terminateOnTimeout !== false) teardown();
+            resolve(null);
+          }, timeoutMs);
           const onMsg = (e) => {
             if (!e.data || e.data.type !== "result" || e.data.id !== id) return;
             clearTimeout(timer);
@@ -1029,6 +1047,7 @@
     src: _embedSrc,
     workerOptions: { type: "module" },
     loadTimeoutMs: _EMBED_LOAD_TIMEOUT_MS,
+    terminateOnTimeout: false,   // keep the model warm; see the note in call()
   });
 
   // Embed one string. Returns number[384], or NULL on any failure whatsoever.
@@ -1052,12 +1071,39 @@
   async function runEmbedSelfTest() {
     logError("[EMBED] Self-test: running… (first run downloads the model, ~20-30MB, one time)");
     const t0 = Date.now();
-    const v = await embedText("Red Queen council vector memory self test");
-    if (!v) {
+    // Three strings, not one. A dimension check alone passes a model that has
+    // loaded but is emitting garbage — 384 finite numbers that mean nothing.
+    // The norm and ordering checks below are what actually prove the vectors
+    // are usable, and both failures would otherwise stay invisible until
+    // Stage 2 retrieval quietly returned nonsense.
+    const a = await embedText("The council reached a divided verdict on the ledger.");
+    const b = await embedText("The seats disagreed about what the ledger recorded.");
+    const c = await embedText("Sourdough starter needs feeding twice a day.");
+    if (!a || !b || !c) {
       logError("[EMBED] Self-test: FAIL — embedText returned null. Check CSP connect-src (huggingface.co) and the console for a 'Refused to connect' line.");
       return false;
     }
-    logError("[EMBED] Self-test: PASS | Model: " + _EMBED_MODEL + " | Dim: " + v.length + " | Latency: " + (Date.now() - t0) + "ms");
+    // L2 norm ≈ 1. normalize:true is what makes the inner product a cosine
+    // similarity; if pooling ever changes, this is the only thing that catches
+    // it before every Stage 2 similarity score is silently wrong.
+    let ss = 0;
+    for (let i = 0; i < a.length; i++) ss += a[i] * a[i];
+    const norm = Math.sqrt(ss);
+    if (Math.abs(norm - 1) > 0.01) {
+      logError("[EMBED] Self-test: FAIL — L2 norm " + norm.toFixed(4) + ", expected ~1. Vectors are not normalised; cosine similarity in Stage 2 would be meaningless.");
+      return false;
+    }
+    // Semantic ordering: a related pair must score above an unrelated pair.
+    let near = 0, far = 0;
+    for (let i = 0; i < a.length; i++) { near += a[i] * b[i]; far += a[i] * c[i]; }
+    if (!(near > far)) {
+      logError("[EMBED] Self-test: FAIL — related pair " + near.toFixed(3) + " scored at or below unrelated pair " + far.toFixed(3) + ". Model loaded but output is not semantically meaningful.");
+      return false;
+    }
+    logError("[EMBED] Self-test: PASS | Model: " + _EMBED_MODEL + " | Dim: " + a.length +
+      " | norm " + norm.toFixed(3) + " | near " + near.toFixed(3) + " > far " + far.toFixed(3) +
+      " | " + (Date.now() - t0) + "ms" +
+      (vectorMemoryEnabled() ? "" : " | NOTE: rq_vector_memory is OFF — vectors are not being stored."));
     return true;
   }
 
@@ -1067,7 +1113,7 @@
   // by the insert. Fully fail-soft: any problem just leaves embedding null.
   async function embedAndStore(rowId, text) {
     try {
-      if (!rowId || !sbConfigured()) return;
+      if (!rowId || !sbConfigured() || !vectorMemoryEnabled()) return;
       const vec = await embedText(text);
       if (!vec) return;   // model cold, CSP-blocked, or failed — row keeps null embedding
       await fetch(
@@ -1080,7 +1126,12 @@
             "Content-Type": "application/json",
             Prefer: "return=minimal",
           },
-          body: JSON.stringify({ embedding: vec }),
+          // pgvector's text input format is "[0.1,0.2,...]". A raw JSON array
+          // happens to serialise to the same characters, but PostgREST decides
+          // whether to cast json->vector by version and column type, and some
+          // builds reject it outright. The bracketed string is accepted by all
+          // of them, so it is the form to send.
+          body: JSON.stringify({ embedding: "[" + vec.join(",") + "]" }),
         }
       ).then((res) => {
         if (!res.ok) return res.text().catch(() => "").then((b) => {
