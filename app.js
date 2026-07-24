@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4.7d-vector-toggle";
+  const RQ_BUILD = "v3.5.0-backfill";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -1111,18 +1111,11 @@
   // delays the round's memory write. Row is inserted first (elsewhere); this
   // patches the embedding in afterward, best-effort. rowId is the uuid returned
   // by the insert. Fully fail-soft: any problem just leaves embedding null.
-  async function embedAndStore(rowId, text) {
+  // Shared PATCH path for both the live round and the backfill. Returns one of
+  // "ok" | "rls" | "http" | "throw" so callers can report precisely instead of
+  // just "it didn't work".
+  async function _patchEmbedding(rowId, vec) {
     try {
-      // Every early return below used to be silent, which is why a broken
-      // PATCH looked identical to a working one. Stage 1 is a shadow stage
-      // under active verification — it should be loud. Quiet these once
-      // embeddings are landing reliably.
-      if (!rowId) { logError("[EMBED] skipped — insert returned no row id (check Prefer: return=representation and the anon SELECT policy)."); return; }
-      if (!sbConfigured()) { logError("[EMBED] skipped — Supabase not configured."); return; }
-      if (!vectorMemoryEnabled()) { logError("[EMBED] skipped — rq_vector_memory is OFF on this origin."); return; }
-      logError("[EMBED] embedding row " + String(rowId).slice(0, 8) + "…");
-      const vec = await embedText(text);
-      if (!vec) { logError("[EMBED] FAIL — embedText returned null for row " + String(rowId).slice(0, 8) + "… (worker cold, timed out, or CSP-blocked)."); return; }
       const res = await fetch(
         settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/rq_events?id=eq." + encodeURIComponent(rowId),
         {
@@ -1146,19 +1139,101 @@
         }
       );
       const body = await res.text().catch(() => "");
-      if (!res.ok) {
-        logError("[EMBED] FAIL — PATCH rejected HTTP " + res.status + " " + (body || "").slice(0, 300));
-        return;
-      }
+      if (!res.ok) return { state: "http", detail: res.status + " " + (body || "").slice(0, 300) };
       let n = null;
       try { const j = JSON.parse(body); n = Array.isArray(j) ? j.length : null; } catch (_) {}
-      if (n === 0) {
-        logError("[EMBED] FAIL — PATCH matched ZERO rows. The request succeeded but RLS blocked the update; rq_events needs a policy: for update to anon using (true) with check (true).");
-        return;
-      }
+      if (n === 0) return { state: "rls", detail: "PATCH matched zero rows" };
+      return { state: "ok", detail: "" };
+    } catch (e) {
+      return { state: "throw", detail: (e && e.message) || String(e) };
+    }
+  }
+
+  async function embedAndStore(rowId, text) {
+    try {
+      // Every early return below used to be silent, which is why a broken
+      // PATCH looked identical to a working one. Stage 1 is a shadow stage
+      // under active verification — it should be loud. Quiet these once
+      // embeddings are landing reliably.
+      if (!rowId) { logError("[EMBED] skipped — insert returned no row id (check Prefer: return=representation and the anon SELECT policy)."); return; }
+      if (!sbConfigured()) { logError("[EMBED] skipped — Supabase not configured."); return; }
+      if (!vectorMemoryEnabled()) { logError("[EMBED] skipped — rq_vector_memory is OFF on this origin."); return; }
+      logError("[EMBED] embedding row " + String(rowId).slice(0, 8) + "…");
+      const vec = await embedText(text);
+      if (!vec) { logError("[EMBED] FAIL — embedText returned null for row " + String(rowId).slice(0, 8) + "… (worker cold, timed out, or CSP-blocked)."); return; }
+      const r = await _patchEmbedding(rowId, vec);
+      if (r.state === "http")  { logError("[EMBED] FAIL — PATCH rejected HTTP " + r.detail); return; }
+      if (r.state === "rls")   { logError("[EMBED] FAIL — PATCH matched ZERO rows. The request succeeded but RLS blocked the update; rq_events needs a policy: for update to anon using (true) with check (true)."); return; }
+      if (r.state === "throw") { logError("[EMBED] FAIL — PATCH threw: " + r.detail); return; }
       logError("[EMBED] OK — row " + String(rowId).slice(0, 8) + "… embedded (" + vec.length + "d).");
     } catch (e) {
       logError("[EMBED] FAIL — embedAndStore threw: " + ((e && e.message) || e));
+    }
+  }
+
+  // ---------- Stage 2 prep: backfill ----------
+  // Stage 1 only embeds rounds going forward, so the ledger's existing history
+  // stays invisible to retrieval. Retrieving against two rows is not a test of
+  // anything — the whole premise of vector memory is surfacing an OLD round
+  // that recency dropped, and that requires the old rounds to carry vectors.
+  //
+  // Runs in the browser deliberately: the vectors must come from the same
+  // MiniLM instance that embeds live rounds, or the comparison space is
+  // inconsistent and every similarity score is quietly wrong. Sequential by
+  // design — one worker, and parallel calls would only queue behind it.
+  let _backfillRunning = false;
+
+  async function backfillEmbeddings(maxRows) {
+    if (_backfillRunning) { logError("[BACKFILL] already running."); return; }
+    if (!sbConfigured()) { logError("[BACKFILL] Supabase not configured."); return; }
+    if (!vectorMemoryEnabled()) { logError("[BACKFILL] rq_vector_memory is OFF — turn it on first."); return; }
+    _backfillRunning = true;
+    const base = settings.supabaseUrl.replace(/\/+$/, "");
+    const cap = Math.max(1, Math.min(maxRows || 200, 500));
+    const hdrs = { apikey: settings.supabaseAnonKey, Authorization: "Bearer " + settings.supabaseAnonKey };
+    let ok = 0, noText = 0, embedFail = 0, patchFail = 0;
+    try {
+      // Never select the embedding column itself — 384 floats per row for data
+      // we are about to overwrite anyway.
+      const res = await fetch(
+        base + "/rest/v1/rq_events?embedding=is.null&select=id,prompt,response&order=created_at.asc&limit=" + cap,
+        { headers: hdrs }
+      );
+      if (!res.ok) {
+        const b = await res.text().catch(() => "");
+        logError("[BACKFILL] FAIL — could not list rows, HTTP " + res.status + " " + b.slice(0, 200));
+        return;
+      }
+      const rows = await res.json();
+      if (!Array.isArray(rows) || rows.length === 0) {
+        logError("[BACKFILL] nothing to do — every round already has an embedding.");
+        return;
+      }
+      logError("[BACKFILL] " + rows.length + " unembedded rounds found. Starting (first one may be slow if the model is cold)…");
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const text = [(row.prompt || ""), (row.response || "")].join("\n\n").trim();
+        if (!text) { noText++; continue; }
+        const vec = await embedText(text);
+        if (!vec) { embedFail++; continue; }
+        const r = await _patchEmbedding(row.id, vec);
+        if (r.state === "ok") ok++;
+        else {
+          patchFail++;
+          // Report the first failure in full, then stop: if the PATCH path is
+          // broken, every remaining row fails the same way and a hundred
+          // identical lines bury the one that matters.
+          logError("[BACKFILL] STOPPED at row " + String(row.id).slice(0, 8) + "… — " + r.state + ": " + r.detail);
+          break;
+        }
+        if ((i + 1) % 10 === 0) logError("[BACKFILL] " + (i + 1) + "/" + rows.length + " processed…");
+      }
+      logError("[BACKFILL] done — " + ok + " embedded, " + embedFail + " embed failures, "
+        + patchFail + " patch failures, " + noText + " skipped (no text).");
+    } catch (e) {
+      logError("[BACKFILL] FAIL — threw: " + ((e && e.message) || e));
+    } finally {
+      _backfillRunning = false;
     }
   }
 
@@ -1873,6 +1948,21 @@
         } catch (_) {
           logError("[EMBED] Could not write the flag — localStorage is unavailable (private browsing?).");
         }
+      });
+      // v3.5.0 — backfill trigger. Manual, never automatic: it walks the whole
+      // ledger and should be a decision, not a surprise on page load.
+      const f2 = document.createElement("button");
+      f2.id = "backfillEmbeddings";
+      f2.type = "button";
+      f2.textContent = "BACKFILL EMBEDDINGS";
+      f2.className = saveSettingsBtn.className || "";
+      f2.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      e2.parentNode.insertBefore(f2, e2.nextSibling);
+      f2.addEventListener("click", async () => {
+        const label = f2.textContent;
+        f2.disabled = true;
+        f2.textContent = "BACKFILLING\u2026 see Error Logs";
+        try { await backfillEmbeddings(200); } finally { f2.disabled = false; f2.textContent = label; }
       });
     } catch (e) { /* cosmetic — never block boot */ }
   })();
