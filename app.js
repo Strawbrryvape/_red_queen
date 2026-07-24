@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.4.7c-embed-diagnostics";
+  const RQ_BUILD = "v3.4.7d-vector-toggle";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -1847,6 +1847,32 @@
         d.disabled = true;
         d.textContent = "TESTING\u2026 see Error Logs";
         try { await runEmbedSelfTest(); } finally { d.disabled = false; d.textContent = label; }
+      });
+
+      // v3.4.7d — vector memory toggle. The flag lives in localStorage, which a
+      // hard cache clear wipes; since every deploy is followed by a hard clear,
+      // the flag was silently reverting to OFF after each one and rounds stopped
+      // embedding with no visible cause. A control in Settings means restoring it
+      // never needs a console, and its label states the current value out loud.
+      const e2 = document.createElement("button");
+      e2.id = "vectorMemoryToggle";
+      e2.type = "button";
+      e2.className = saveSettingsBtn.className || "";
+      e2.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const paintVM = () => {
+        e2.textContent = "VECTOR MEMORY: " + (vectorMemoryEnabled() ? "ON" : "OFF");
+      };
+      paintVM();
+      d.parentNode.insertBefore(e2, d.nextSibling);
+      e2.addEventListener("click", () => {
+        try {
+          const now = !vectorMemoryEnabled();
+          localStorage.setItem("rq_vector_memory", now ? "on" : "off");
+          paintVM();
+          logError("[EMBED] Vector memory storage is now " + (now ? "ON" : "OFF") + ".");
+        } catch (_) {
+          logError("[EMBED] Could not write the flag — localStorage is unavailable (private browsing?).");
+        }
       });
     } catch (e) { /* cosmetic — never block boot */ }
   })();
