@@ -1,4 +1,4 @@
-  /* Red Queen v2.1 — Command Center logic
+   /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.5.0-backfill";
+  const RQ_BUILD = "v3.5.2a-k3-toggle";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -144,6 +144,48 @@
   // with the accurate cause of death recorded in her memory.
   const CEREBRAS_MAX_TOKENS = 4000;
 
+  // ---------- Kimi primary seat (Moonshot) ----------
+  // moonshot-v1-8k is retired: unavailable to new accounts since 2026-07-17 and
+  // scheduled for full platform sunset 2026-08-31. kimi-k3 is the flagship
+  // replacement on the same OpenAI-compatible endpoint, so the swap is a model
+  // string and a token ceiling — no new provider, no CSP change.
+  const KIMI_MODEL = "kimi-k3";
+
+  // K3 ALWAYS reasons; thinking mode cannot be switched off, and the reasoning
+  // trace is billed and counted as output. The shared MAX_TOKENS of 1000 would
+  // therefore be spent thinking, and the seat would return an empty answer —
+  // exactly how Cerebras GLM 4.7 failed on 2026-07-24 ("spent its entire token
+  // budget reasoning and never produced a final answer, truncated mid-<think>"),
+  // and that had four times the headroom this seat currently gets.
+  //
+  // 8000 is a deliberate over-allocation, not a measurement. Council answers are
+  // short; the budget exists for the reasoning trace in front of them. If the
+  // seat starts truncating, raise this first — the diagnostic in callKimi names
+  // it explicitly. If cost matters more than depth, lower it and watch for
+  // finish_reason: length.
+  const KIMI_MAX_TOKENS = 8000;
+
+  // ---------- K3 spend gate ----------
+  // K3 is metered and billed per token including its reasoning trace, and those
+  // credits are also needed for other projects. This toggle decides who answers
+  // for the Kimi seat WITHOUT touching the key, so nothing has to be deleted and
+  // re-pasted to switch modes.
+  //
+  // DEFAULT OFF, deliberately. localStorage is per-device and starts empty, so
+  // an ON default would mean every new device — and every device after a hard
+  // cache clear — silently begins spending. Off is the safe failure.
+  //
+  //   ON  : Kimi seat = kimi-k3 via Moonshot, base weight 1.0 (primary voice,
+  //         which is what makes a VERIFIED outcome reachable at all)
+  //   OFF : Kimi seat = OpenRouter free-tier walk, base weight 0.5, exactly as
+  //         it has been running. No Moonshot request is made, so no spend.
+  function kimiK3Enabled() { return localStorage.getItem("rq_kimi_k3") === "on"; }
+
+  // The seat is occupied whenever a Moonshot key is present; this decides only
+  // who answers for it.
+  function kimiOnOpenRouter() {
+    return !!settings.keyKimi && !kimiK3Enabled() && !!settings.keyOpenRouter;
+  }
   // ---------- Understudy state (Groq filling Claude's seat, Cerebras filling Gemini's) ----------
   function groqUnderstudy() {
     return !settings.keyClaude && !!settings.keyGroq;
@@ -240,6 +282,11 @@
   function configuredProvider(name) {
     if (name === "claude" && groqUnderstudy()) return "groq";
     if (name === "gemini" && cerebrasUnderstudy()) return "cerebras";
+    // With K3 off, OpenRouter is the seat's CONFIGURED occupant, not a failover
+    // it degraded into. Without this the base weight would read 1.0 while a
+    // free-tier model answered, and every shadow-weight line and A/B
+    // weight_base would overstate the seat.
+    if (name === "kimi" && kimiOnOpenRouter()) return "openrouter";
     return "primary";
   }
   function seatBaseWeight(name) {
@@ -566,14 +613,37 @@
         Authorization: "Bearer " + settings.keyKimi,
       },
       body: JSON.stringify({
-        model: "moonshot-v1-8k",
+        model: KIMI_MODEL,
         messages: [{ role: "user", content: query }],
-        max_tokens: MAX_TOKENS,
+        // max_completion_tokens, not max_tokens: this is the parameter the
+        // OpenAI-compatible reasoning path expects, and it is what Moonshot's
+        // own K3 examples send. max_tokens is the legacy name and its handling
+        // on reasoning models is not something to gamble a seat on.
+        max_completion_tokens: KIMI_MAX_TOKENS,
+        // reasoning_effort is supported ("max" appears in Moonshot's docs) and
+        // would be the knob for trading depth against cost. Left unset on
+        // purpose — the valid enum isn't confirmed, and an invalid value is a
+        // 400 that drops the seat. Worth testing deliberately, not guessing.
       }),
     }, "Kimi");
     if (!res.ok) throw new Error(`Kimi HTTP ${res.status}${res.status === 429 ? " — rate limit OR insufficient Moonshot balance" : ""}`);
     const data = await res.json();
-    return data.choices?.[0]?.message?.content || "";
+    const choice = data.choices?.[0];
+    const text = choice?.message?.content || "";
+
+    // An empty answer from a reasoning model is almost never "the model had
+    // nothing to say" — it is the budget being consumed before the answer
+    // started. Say so, rather than letting the seat fall back for an unnamed
+    // reason and reappear as a fallback label in the ledger.
+    if (!text) {
+      const fin = choice?.finish_reason || "unknown";
+      const hadReasoning = !!(choice?.message?.reasoning_content);
+      if (fin === "length" || hadReasoning) {
+        throw new Error(`Kimi ${KIMI_MODEL} returned no answer — finish_reason: ${fin}${hadReasoning ? ", reasoning present but truncated before the answer" : ""}. Raise KIMI_MAX_TOKENS (currently ${KIMI_MAX_TOKENS}).`);
+      }
+      throw new Error(`Kimi ${KIMI_MODEL} returned an empty response (finish_reason: ${fin}).`);
+    }
+    return text;
   }
 
   async function callClaude(query) {
@@ -963,6 +1033,72 @@
   //   enable:  localStorage.setItem("rq_vector_memory","on")
   function vectorMemoryEnabled() { return localStorage.getItem("rq_vector_memory") === "on"; }
 
+  // ---------- Stage 2 retrieval parameters (Kimi, amended rulings §3) ----------
+  // Floor was ruled up from 0.3 to 0.6 once the real distribution was measured:
+  // the first retrieval test returned 1.000 self then 0.674 / 0.657 / 0.647 /
+  // 0.609, so 0.3 excluded nothing and was theatre. Top-K is "up to 5 ABOVE the
+  // floor", never "exactly 5 regardless of relevance".
+  //
+  // Note for whoever tunes this next: on the 25-row corpus every non-self
+  // neighbour measured so far sits above 0.6, so the floor returns ~4 rows, not
+  // the 1-2 the ruling anticipated. Revisit past 100 rows.
+  const RQ_TOP_K       = 5;
+  const RQ_SIM_FLOOR   = 0.6;
+
+  // ---------- prompt_class (Kimi Ruling 1) ----------
+  // HARD CONSTRAINT from the ruling: this output is written to a database
+  // column and NEVER rendered into any system prompt, seat context, or digest.
+  // If this value is ever concatenated into a string a model will read, that is
+  // the BSL state_update failure returning under a new name.
+  //
+  // Honest about what it is: a keyword heuristic. No model call, deterministic,
+  // free. It will misfile things — "what is the smallest prime" and "what is
+  // the Red Queen" are the same shape lexically and different classes
+  // semantically. Good enough to spot a gross pattern across hundreds of future
+  // rounds; NOT good enough to found a conclusion on. Hand-label the existing
+  // 25 for the cross-tab.
+  function classifyPrompt(prompt) {
+    try {
+      if (typeof prompt !== "string" || !prompt.trim()) return "open_ended";
+      const p = prompt.toLowerCase();
+
+      // meta_system first, deliberately. "What is the Red Queen?" is lexically a
+      // factual question and is not one in practice, and this is the class most
+      // worth measuring before retrieval goes live — whatever dominates the
+      // corpus dominates what retrieval surfaces.
+      const metaTerms = [
+        "red queen", "the council", "your seat", "the seats", "this system",
+        "the ledger", "consensus threshold", "your architecture", "yourself",
+        "your memory", "sentience", "sentient", "conscious", "do you feel",
+        "how are you", "what do you want", "your own",
+      ];
+      if (metaTerms.some((t) => p.indexOf(t) !== -1)) return "meta_system";
+
+      const decisionTerms = [
+        "should we", "should i", "which should", "pick ", "choose ", "rank ",
+        "prioriti", "vote", "name the next", "what should we build",
+        "recommend", "best option", "decide",
+      ];
+      if (decisionTerms.some((t) => p.indexOf(t) !== -1)) return "decision";
+
+      // Arithmetic and units are the strong signals. A bare "what is" is not —
+      // it collides with meta_system (already returned above) and with
+      // open-ended definition requests.
+      const hasMath   = /[0-9]\s*[\^*+\-/]|\*\*|\bdigit sum\b|\bprime\b|\bfactorial\b|\bsqrt\b/.test(p);
+      const hasUnits  = /\b(how many|how much|what year|what date|percent|kg|km|miles|bytes)\b/.test(p);
+      const isCompute = /\b(calculate|compute|solve|convert)\b/.test(p);
+      if (hasMath || hasUnits || isCompute) return "factual";
+
+      // Default. Deliberately the fallback: misfiling an open-ended prompt as
+      // factual would inflate the factual DIVIDED rate and could manufacture
+      // the "comparator is broken" signal — the one result that would redirect
+      // the whole roadmap. Better to under-claim factual.
+      return "open_ended";
+    } catch (_) {
+      return "open_ended";
+    }
+  }
+
   function _makeManagedWorker(opts) {
     let worker = null, ready = null;
     function ensure() {
@@ -1171,6 +1307,105 @@
     }
   }
 
+  // ---------- Stage 2: shadow retrieval + A/B log ----------
+  // SHADOW ONLY. Nothing here touches the prompt, the seats, or the consensus.
+  // It records what retrieval WOULD have surfaced alongside what the memory
+  // context actually surfaced, and writes both to rq_retrieval_log for review.
+  // injected is hard-coded false; flipping it is Stage 3 and needs Kimi's
+  // second ratification plus 20 clean samples.
+  //
+  // Runs after the round is already logged, fully detached. It cannot delay a
+  // round and cannot fail one.
+  async function runRetrievalShadow(roundId, queryText, promptClass, seatDegraded) {
+    if (!vectorMemoryEnabled() || !sbConfigured()) return;
+    const base = settings.supabaseUrl.replace(/\/+$/, "");
+    const hdrs = {
+      apikey: settings.supabaseAnonKey,
+      Authorization: "Bearer " + settings.supabaseAnonKey,
+      "Content-Type": "application/json",
+    };
+    try {
+      const vec = await embedText(queryText);
+      if (!vec) { logError("[RETRIEVAL] skipped — query embed returned null."); return; }
+
+      // match_count is TOP_K + 1: the current round's own row would otherwise
+      // self-match at ~1.000 and consume a slot before we can filter it.
+      const rpc = await fetch(base + "/rest/v1/rpc/match_rounds", {
+        method: "POST",
+        headers: hdrs,
+        body: JSON.stringify({
+          query_embedding: "[" + vec.join(",") + "]",
+          match_count: RQ_TOP_K + 1,
+          min_similarity: RQ_SIM_FLOOR,
+        }),
+      });
+      if (!rpc.ok) {
+        const b = await rpc.text().catch(() => "");
+        logError("[RETRIEVAL] FAIL — match_rounds RPC HTTP " + rpc.status + " " + b.slice(0, 300));
+        return;
+      }
+      let rows = await rpc.json().catch(() => []);
+      if (!Array.isArray(rows)) rows = [];
+
+      const vectorRounds = rows
+        .filter((r) => r && r.id !== roundId)      // self-match exclusion (ruled)
+        .slice(0, RQ_TOP_K)
+        .map((r) => ({
+          id: r.id,
+          prompt: clip(r.prompt || "", 100),
+          consensus_status: r.consensus_status || null,
+          similarity: typeof r.similarity === "number" ? Number(r.similarity.toFixed(4)) : null,
+        }));
+
+      // What the memory context actually surfaced this round. Captured as a
+      // side effect of buildMemoryContext rather than recomputed, so the two
+      // can never drift apart.
+      const sel = _lastMemorySelection || { chim: false, entries: [], digested: 0 };
+
+      // corpus_size: how many rows retrieval could have drawn from. Cheap
+      // count-only request — Range 0-0 returns the total in Content-Range
+      // without transferring any rows.
+      let corpusSize = null;
+      try {
+        const cres = await fetch(base + "/rest/v1/rq_events?select=id&embedding=not.is.null", {
+          headers: Object.assign({}, hdrs, { Prefer: "count=exact", Range: "0-0" }),
+        });
+        const cr = cres.headers.get("content-range") || "";
+        const n = parseInt(cr.split("/")[1], 10);
+        if (!isNaN(n)) corpusSize = n;
+      } catch (_) { /* count is diagnostic; never block the log row */ }
+
+      const res = await fetch(base + "/rest/v1/rq_retrieval_log", {
+        method: "POST",
+        headers: Object.assign({}, hdrs, { Prefer: "return=minimal" }),
+        body: JSON.stringify({
+          round_id: roundId || null,
+          query_text: clip(queryText || "", 100),
+          query_truncated: (queryText || "").length > 100,
+          prompt_class: promptClass || null,
+          chim_enabled: !!sel.chim,
+          chim_rounds: sel.entries || [],
+          vector_rounds: vectorRounds,
+          top_k: RQ_TOP_K,
+          similarity_floor: RQ_SIM_FLOOR,
+          seat_degraded: !!seatDegraded,
+          corpus_size: corpusSize,
+          injected: false,
+        }),
+      });
+      if (!res.ok) {
+        const b = await res.text().catch(() => "");
+        logError("[RETRIEVAL] FAIL — log insert HTTP " + res.status + " " + b.slice(0, 300));
+        return;
+      }
+      logError("[RETRIEVAL] logged — " + vectorRounds.length + " vector hit(s) above "
+        + RQ_SIM_FLOOR + ", " + (sel.entries ? sel.entries.length : 0) + " context round(s), corpus "
+        + (corpusSize === null ? "?" : corpusSize)
+        + (seatDegraded ? " [SEAT DEGRADED]" : ""));
+    } catch (e) {
+      logError("[RETRIEVAL] FAIL — threw: " + ((e && e.message) || e));
+    }
+  }
   // ---------- Stage 2 prep: backfill ----------
   // Stage 1 only embeds rounds going forward, so the ledger's existing history
   // stays invisible to retrieval. Retrieving against two rows is not a test of
@@ -1959,10 +2194,51 @@
       f2.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
       e2.parentNode.insertBefore(f2, e2.nextSibling);
       f2.addEventListener("click", async () => {
+        // Kimi's v3.5.0 amendment: backfill walks the whole ledger and should be
+        // a decision, not a fat-fingered Settings tap.
+        let pending = "all";
+        try {
+          const cres = await fetch(
+            settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/rq_events?select=id&embedding=is.null",
+            { headers: { apikey: settings.supabaseAnonKey, Authorization: "Bearer " + settings.supabaseAnonKey, Prefer: "count=exact", Range: "0-0" } }
+          );
+          const n = parseInt((cres.headers.get("content-range") || "").split("/")[1], 10);
+          if (!isNaN(n)) pending = String(n);
+        } catch (_) { /* fall back to the vague wording rather than blocking */ }
+        const est = (pending === "all") ? "about a second each" : (Math.max(1, Math.round(Number(pending) * 0.7)) + "s");
+        if (!window.confirm("This will embed " + pending + " unembedded round(s).\nEstimated time: ~" + est + ".\n\nProceed?")) return;
         const label = f2.textContent;
         f2.disabled = true;
         f2.textContent = "BACKFILLING\u2026 see Error Logs";
         try { await backfillEmbeddings(200); } finally { f2.disabled = false; f2.textContent = label; }
+      });
+      // v3.5.2 — K3 spend gate. Sits next to the vector memory toggle so both
+      // metered/heavy features are visible in one place, with their live state
+      // stated on the button rather than assumed.
+      const k3 = document.createElement("button");
+      k3.id = "kimiK3Toggle";
+      k3.type = "button";
+      k3.className = saveSettingsBtn.className || "";
+      k3.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const paintK3 = () => {
+        k3.textContent = kimiK3Enabled()
+          ? "KIMI SEAT: K3 (paid \u2014 spending credits)"
+          : "KIMI SEAT: FREE TIER (OpenRouter)";
+      };
+      paintK3();
+      f2.parentNode.insertBefore(k3, f2.nextSibling);
+      k3.addEventListener("click", () => {
+        try {
+          const now = !kimiK3Enabled();
+          localStorage.setItem("rq_kimi_k3", now ? "on" : "off");
+          paintK3();
+          refreshAllSeatHealth();
+          logError(now
+            ? "[K3] Kimi seat is now kimi-k3 (Moonshot, PAID). Base weight 1.0 — a primary voice, so VERIFIED consensus becomes reachable. Every round from here spends credits."
+            : "[K3] Kimi seat is now the OpenRouter free-tier walk. Base weight 0.5. No Moonshot requests, no spend.");
+        } catch (_) {
+          logError("[K3] Could not write the toggle — localStorage is unavailable (private browsing?).");
+        }
       });
     } catch (e) { /* cosmetic — never block boot */ }
   })();
@@ -2131,7 +2407,17 @@
     } else if (settings.keyCerebras) {
       calls.push({ name: "gemini", fn: callCerebras }); // Cerebras understudies Gemini's seat (free tier)
     }
-    if (settings.keyKimi) calls.push({ name: "kimi", fn: callKimi });
+    if (settings.keyKimi) {
+      if (kimiK3Enabled()) {
+        calls.push({ name: "kimi", fn: callKimi });
+      } else if (settings.keyOpenRouter) {
+        // Routed, not failed. No Moonshot request is made, so this costs nothing
+        // and produces no "primary failed" noise in the log.
+        calls.push({ name: "kimi", fn: (q) => callOpenRouter(q, "kimi") });
+      } else {
+        logError("[K3] Kimi K3 is OFF and no OpenRouter key is set — the Kimi seat has no free occupant and sits out this round. Settings \u2192 KIMI K3 to enable it, or add an OpenRouter key.");
+      }
+    }
     if (settings.keyClaude) {
       calls.push({ name: "claude", fn: callClaude });
     } else if (settings.keyGroq) {
@@ -2143,6 +2429,7 @@
       seatProvider[c.name] =
         (c.name === "claude" && groqUnderstudy()) ? "groq" :
         (c.name === "gemini" && cerebrasUnderstudy()) ? "cerebras" :
+        (c.name === "kimi" && kimiOnOpenRouter()) ? "openrouter" :
         "primary";
     });
 
@@ -2205,7 +2492,10 @@
             },
           });
         }
-        if (orAvailable) {
+        // Skip when the seat's configured occupant IS OpenRouter (Kimi with K3
+        // toggled off): failing over from a provider to itself would just walk
+        // the same model list twice and log it as a failover that never was.
+        if (orAvailable && primaryTag !== "openrouter") {
           chain.push({
             tag: "openrouter",
             run: (qq) => callOpenRouter(qq, c.name),
@@ -2628,9 +2918,26 @@
   // compacted, assembled newest-backwards under the hard char cap, then
   // emitted oldest-first for natural reading order. With CHIM on, rounds that
   // don't fit are compacted into a state digest instead of being dropped.
+  // Stage 2 A/B: what buildMemoryContext actually surfaced this round, recorded
+  // as a side effect rather than recomputed by the harness. A parallel
+  // reimplementation would drift from the real selection logic the first time
+  // either changed, and then the A/B would be comparing retrieval against a
+  // fiction. Read by runRetrievalShadow; never injected anywhere.
+  let _lastMemorySelection = { chim: false, entries: [], digested: 0 };
+
+  function _selEntry(entry, idx) {
+    return {
+      round: idx + 1,
+      prompt: clip((entry && entry.prompt) || "", 100),
+      outcome: (entry && entry.outcome) || null,
+    };
+  }
+
   function buildMemoryContext() {
+    _lastMemorySelection = { chim: chimEnabled(), entries: [], digested: 0 };
     if (!memoryEnabled() || ledger.length === 0) return "";
     const lines = [];
+    const picked = [];
     // Defensive clamp: even if CHAR_CAP is mis-tuned above HARD_MAX, the
     // injection can never exceed the ceiling that protects free-tier prompts.
     let budget = Math.min(MEMORY_CONTEXT_CHAR_CAP, MEMORY_CONTEXT_HARD_MAX);
@@ -2646,10 +2953,12 @@
         if (line.length + 1 > recentBudget) break;
         recentBudget -= line.length + 1;
         lines.unshift(line);
+        picked.unshift(_selEntry(ledger[i], i));
         oldestShown = i;
       }
       const older = ledger.slice(0, oldestShown); // everything not shown in full
       const digest = buildStateDigest(older, digestBudget);
+      _lastMemorySelection = { chim: true, entries: picked, digested: older.length };
       if (lines.length === 0 && !digest) return "";
       const body = (digest ? digest + "\n" : "") + lines.join("\n");
       return MEMORY_HEADER + body + "\n=== CURRENT QUESTION ===\n";
@@ -2662,7 +2971,9 @@
       if (line.length + 1 > budget) break;
       budget -= line.length + 1;
       lines.unshift(line);
+      picked.unshift(_selEntry(ledger[i], i));
     }
+    _lastMemorySelection = { chim: false, entries: picked, digested: 0 };
     if (lines.length === 0) return "";
     return MEMORY_HEADER + lines.join("\n") + "\n=== CURRENT QUESTION ===\n";
   }
@@ -2809,18 +3120,58 @@
       ? answers.map((a) => `${seatLabel(a.name)}: ${clip(a.text, 120)}`).join(" | ")
       : (result.text || ""), 900);
     const _evStatus = result.divided ? "divided" : (result.trust || "unknown");
+    const _evClass = classifyPrompt(query);
+
+    // seat_degraded for the A/B log. Reuses warnSeatDiversity's identity rule
+    // (a.model || seatModelLabel) rather than a second implementation, so the
+    // flag and the warning can never disagree about what counts as degraded.
+    let _seatDegraded = false;
+    try {
+      const seen = {};
+      ((result && result.answers) || []).forEach((a) => {
+        const m = a.model || seatModelLabel(a.name) || "unknown";
+        seen[m] = (seen[m] || 0) + 1;
+        if (seen[m] > 1) _seatDegraded = true;
+      });
+    } catch (_) { _seatDegraded = true; }   // unknown means assume degraded
+
     // WRITE-THEN-UPDATE: insert returns the row id, then embedding is patched in
     // asynchronously. A slow/cold/failed embed never delays or blocks this write.
+    //
+    // prompt_class is a diagnostic column and must never be able to cost a
+    // ledger row. If the migration has not been run yet the insert 400s on an
+    // unknown column, so a failure retries once WITHOUT it. The ledger is source
+    // of truth; the classification is an index on top of it, and v3.4.6 exists
+    // precisely so every round lands.
     sbInsertReturning("rq_events", {
       prompt: _evPrompt,
       response: _evResponse,
       consensus_status: _evStatus,
+      prompt_class: _evClass,
+    }).then((row) => {
+      if (row && row.id) return row;
+      // sbInsertReturning also returns null when Supabase simply isn't
+      // configured. Don't report a schema problem in that case, and don't
+      // retry — there is nothing to retry against.
+      if (!sbConfigured()) return null;
+      logError("[CLASS] insert with prompt_class returned no row — retrying without it. If this repeats, rq-stage2-setup.sql has not been run.");
+      return sbInsertReturning("rq_events", {
+        prompt: _evPrompt,
+        response: _evResponse,
+        consensus_status: _evStatus,
+      });
     }).then((row) => {
       // A missing row here is the other silent failure: the insert succeeded
       // but returned nothing to attach an embedding to. Name it explicitly
       // rather than letting the chain end quietly.
-      if (row && row.id) { embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse); }
-      else if (vectorMemoryEnabled()) { logError("[EMBED] no row id returned from the rq_events insert — nothing to embed. Insert itself may have failed; see any preceding institutional-memory error."); }
+      if (row && row.id) {
+        embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse);
+        // Detached on purpose — shadow retrieval must not delay the round or
+        // the embedding write, and its failures are diagnostic only.
+        runRetrievalShadow(row.id, _evPrompt, _evClass, _seatDegraded);
+      } else if (vectorMemoryEnabled()) {
+        logError("[EMBED] no row id returned from the rq_events insert — nothing to embed. Insert itself may have failed; see any preceding institutional-memory error.");
+      }
     });
   }
 
@@ -3532,5 +3883,21 @@
   // log on load. (added 2026-07-19)
   try {
     logError("BUILD " + RQ_BUILD + " loaded. If this line is absent after a deploy, you are on a cached build — hard-clear and reload.");
+    // The flag lives in localStorage, which a hard cache clear wipes — and every
+    // deploy here is followed by a hard clear. It has silently reverted to OFF
+    // three separate times, each costing a debugging session, because nothing
+    // announced it. State it at boot, next to the build stamp, every time.
+    try {
+      logError(vectorMemoryEnabled()
+        ? "[EMBED] Vector memory is ON — rounds will be embedded and stored."
+        : "[EMBED] Vector memory is OFF — rounds will NOT be embedded. Settings → VECTOR MEMORY to enable. (A hard cache clear resets this.)");
+      // Spend state gets the same treatment as the flag that cost three
+      // sessions: stated at boot, never assumed.
+      if (settings.keyKimi) {
+        logError(kimiK3Enabled()
+          ? "[K3] Kimi seat is on kimi-k3 (PAID — this session spends Moonshot credits). Settings → KIMI SEAT to switch to free tier."
+          : "[K3] Kimi seat is on the free tier (OpenRouter). No Moonshot spend. Settings → KIMI SEAT to enable K3.");
+      }
+    } catch (_) {}
   } catch (_) {}
 })();
