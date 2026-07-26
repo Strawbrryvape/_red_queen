@@ -1,4 +1,4 @@
-  /* Red Queen v2.1 — Command Center logic
+ /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.5.4-indexical-audit";
+  const RQ_BUILD = "v3.5.5-floor-readout";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -1050,7 +1050,17 @@
   // neighbour measured so far sits above 0.6, so the floor returns ~4 rows, not
   // the 1-2 the ruling anticipated. Revisit past 100 rows.
   const RQ_TOP_K       = 5;
-  const RQ_SIM_FLOOR   = 0.6;
+  // v3.5.5: the floor is now TUNABLE at runtime. It was a constant, which meant
+  // every floor experiment cost a deploy and a hard-clear — and the hard-clear
+  // wipes rq_vector_memory, so testing the floor kept switching off the thing
+  // being tested. 0.6 remains the ratified default; localStorage only overrides
+  // it, and the value in force is stated at boot and on every retrieval line so
+  // a round can never be scored against a floor nobody remembers setting.
+  const RQ_SIM_FLOOR_DEFAULT = 0.6;
+  function simFloor() {
+    var v = parseFloat(localStorage.getItem("rq_sim_floor"));
+    return (isFinite(v) && v >= 0 && v <= 1) ? v : RQ_SIM_FLOOR_DEFAULT;
+  }
 
   // ---------- Stage 3: injection ----------
   // Kimi's gate on Stage 3 was 20 clean A/B samples plus re-ratification. The
@@ -1466,7 +1476,7 @@
         consensus_status: r.consensus_status || null,
         similarity: typeof r.similarity === "number" ? Number(r.similarity.toFixed(4)) : null,
       }));
-    const hits = candidates.filter((c) => typeof c.similarity === "number" && c.similarity >= RQ_SIM_FLOOR);
+    const hits = candidates.filter((c) => typeof c.similarity === "number" && c.similarity >= simFloor());
     const best = (candidates.length && typeof candidates[0].similarity === "number") ? candidates[0].similarity : null;
     return { candidates: candidates, hits: hits, best: best };
   }
@@ -1590,7 +1600,7 @@
         chim_rounds: sel.entries || [],
         vector_rounds: _logShape(shaped.hits),
         top_k: RQ_TOP_K,
-        similarity_floor: RQ_SIM_FLOOR,
+        similarity_floor: simFloor(),
         seat_degraded: !!seatDegraded,
         corpus_size: corpusSize,
         injected: !!injected,
@@ -1622,7 +1632,7 @@
         }
       }
 
-      logError("[RETRIEVAL] logged — " + shaped.hits.length + " hit(s) above " + RQ_SIM_FLOOR +
+      logError("[RETRIEVAL] logged — " + shaped.hits.length + " hit(s) above " + simFloor() +
         " of " + shaped.candidates.length + " candidate(s)" +
         (typeof shaped.best === "number" ? ", best " + shaped.best.toFixed(3) : "") +
         ", " + (sel.entries ? sel.entries.length : 0) + " context round(s), corpus " +
@@ -1633,6 +1643,75 @@
       logError("[RETRIEVAL] FAIL — threw: " + ((e && e.message) || e));
     }
   }
+  // ---------- v3.5.5: floor readout ----------
+  // Reads back what retrieval actually saw. Answers, in one tap, the question
+  // every Stage 3 conclusion is currently blocked on: are we getting zero hits
+  // because nothing is relevant, or because the floor is above where the
+  // neighbours live? The 0.6 floor was calibrated on a 25-row corpus whose
+  // non-self neighbours sat at 0.609-0.674; similarity falls as a corpus grows,
+  // so a floor tuned at 25 rows is not the same instrument at 51.
+  async function floorReadout() {
+    if (!sbConfigured()) { logError("[FLOOR] Supabase not configured \u2014 nothing to read."); return; }
+    const base = settings.supabaseUrl.replace(/\/+$/, "");
+    try {
+      const res = await fetch(
+        base + "/rest/v1/rq_retrieval_log?select=created_at,prompt_class,injected,corpus_size,best_similarity,similarity_floor,vector_rounds,vector_candidates&order=created_at.desc&limit=15",
+        { headers: { apikey: settings.supabaseAnonKey, Authorization: "Bearer " + settings.supabaseAnonKey } }
+      );
+      if (!res.ok) {
+        const b = await res.text().catch(() => "");
+        logError("[FLOOR] read failed HTTP " + res.status + " " + b.slice(0, 200) +
+          (res.status === 400 ? " \u2014 if this mentions best_similarity, rq-stage3-setup.sql has not been run." : ""));
+        return;
+      }
+      const rows = await res.json();
+      if (!Array.isArray(rows) || !rows.length) { logError("[FLOOR] no retrieval rows yet \u2014 run a round with VECTOR MEMORY on."); return; }
+
+      let hitRounds = 0, scored = 0, sumBest = 0, maxBest = 0, injectedRows = 0;
+      const wouldClear = { 0.4: 0, 0.45: 0, 0.5: 0, 0.55: 0, 0.6: 0 };
+      logError("[FLOOR] last " + rows.length + " retrieval round(s), newest first \u2014 floor in force is " + simFloor() + ":");
+      rows.forEach((r) => {
+        const hits = Array.isArray(r.vector_rounds) ? r.vector_rounds.length : 0;
+        const cands = Array.isArray(r.vector_candidates) ? r.vector_candidates.length : null;
+        const best = typeof r.best_similarity === "number" ? r.best_similarity : null;
+        if (hits > 0) hitRounds++;
+        if (best !== null) { scored++; sumBest += best; if (best > maxBest) maxBest = best; 
+          Object.keys(wouldClear).forEach((k) => { if (best >= parseFloat(k)) wouldClear[k]++; }); }
+        if (r.injected) injectedRows++;
+        logError("  " + String(r.created_at || "").slice(5, 16).replace("T", " ") +
+          " | " + (r.prompt_class || "?") +
+          " | hits " + hits + (cands === null ? "" : "/" + cands + " cand") +
+          " | best " + (best === null ? "\u2014 (pre-v3.5.3 row)" : best.toFixed(3)) +
+          " | floor " + (r.similarity_floor == null ? "?" : r.similarity_floor) +
+          " | corpus " + (r.corpus_size == null ? "?" : r.corpus_size) +
+          (r.injected ? " | INJECTED" : ""));
+      });
+
+      logError("[FLOOR] SUMMARY \u2014 " + hitRounds + "/" + rows.length + " round(s) returned at least one hit; " +
+        injectedRows + " logged injected:true" +
+        (injectedRows === rows.length ? " (no control arm in this window \u2014 run some rounds with injection OFF)" :
+         injectedRows === 0 ? " (all control arm)" : ""));
+      if (!scored) {
+        logError("[FLOOR] No best_similarity values in this window. Either these rows predate v3.5.3 or the migration has not run \u2014 the verdict below needs scored rows.");
+        return;
+      }
+      logError("[FLOOR] best-candidate score across " + scored + " scored round(s): mean " +
+        (sumBest / scored).toFixed(3) + ", max " + maxBest.toFixed(3) + ".");
+      logError("[FLOOR] rounds that WOULD have returned a hit at each floor: " +
+        Object.keys(wouldClear).map((k) => k + " \u2192 " + wouldClear[k]).join("  |  ") + "  (of " + scored + ")");
+      const mean = sumBest / scored;
+      if (hitRounds === 0 && mean >= 0.5) {
+        logError("[FLOOR] READ: zero hits but a mean best of " + mean.toFixed(3) + " \u2014 the neighbours are THERE and the floor is sitting above them. This is the case for lowering it. Collect ten scored rounds before ruling.");
+      } else if (hitRounds === 0) {
+        logError("[FLOOR] READ: zero hits AND a low mean best (" + mean.toFixed(3) + ") \u2014 retrieval is finding nothing genuinely close. Lowering the floor would admit noise, not signal. Suspect corpus composition instead.");
+      } else {
+        logError("[FLOOR] READ: retrieval is clearing the floor on " + hitRounds + " of " + rows.length + " round(s). The floor is doing work rather than blocking everything.");
+      }
+    } catch (e) {
+      logError("[FLOOR] read threw: " + ((e && e.message) || e));
+    }
+  }
+
   // ---------- Stage 2 prep: backfill ----------
   // Stage 1 only embeds rounds going forward, so the ledger's existing history
   // stays invisible to retrieval. Retrieving against two rows is not a test of
@@ -2503,6 +2582,54 @@
       };
       paintK3();
       f2.parentNode.insertBefore(k3, f2.nextSibling);
+      // v3.5.5 — FLOOR READOUT. The retrieval diagnostic has been writing
+      // best_similarity and vector_candidates to Supabase since v3.5.3, and the
+      // only way to read it was SQL on a desktop. The floor decision is the one
+      // thing every Stage 3 conclusion waits on, so it has to be answerable from
+      // the phone, after any round, without leaving the app.
+      const fr = document.createElement("button");
+      fr.id = "floorReadout";
+      fr.type = "button";
+      fr.textContent = "FLOOR READOUT (last 15 rounds)";
+      fr.className = saveSettingsBtn.className || "";
+      fr.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      k3.parentNode.insertBefore(fr, k3.nextSibling);
+      fr.addEventListener("click", async () => {
+        const label = fr.textContent;
+        fr.disabled = true; fr.textContent = "FETCHING\u2026 see Error Logs";
+        try { await floorReadout(); } finally { fr.disabled = false; fr.textContent = label; }
+      });
+
+      // Floor control. Cycles the candidate values rather than offering a free
+      // text box: an arbitrary float typed on a phone is how you end up with a
+      // corpus scored at 0.06 and a week of confusing results.
+      const fl = document.createElement("button");
+      fl.id = "floorCycle";
+      fl.type = "button";
+      fl.className = saveSettingsBtn.className || "";
+      fl.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const FLOOR_STEPS = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65];
+      const paintFloor = () => {
+        const f = simFloor();
+        fl.textContent = "SIMILARITY FLOOR: " + f + (f === RQ_SIM_FLOOR_DEFAULT ? " (ratified default)" : " (OVERRIDE)");
+      };
+      paintFloor();
+      fr.parentNode.insertBefore(fl, fr.nextSibling);
+      fl.addEventListener("click", () => {
+        try {
+          const cur = simFloor();
+          let i = FLOOR_STEPS.indexOf(cur);
+          const next = FLOOR_STEPS[(i + 1) % FLOOR_STEPS.length];
+          localStorage.setItem("rq_sim_floor", String(next));
+          paintFloor();
+          logError("[FLOOR] Similarity floor is now " + next +
+            (next === RQ_SIM_FLOOR_DEFAULT ? " (back to the ratified default)." :
+             " \u2014 an OVERRIDE of the ratified " + RQ_SIM_FLOOR_DEFAULT + ". Rounds run at this value are not comparable to rounds run at the default; note the change alongside the build stamp."));
+        } catch (_) {
+          logError("[FLOOR] Could not write the override \u2014 localStorage is unavailable (private browsing?).");
+        }
+      });
+
       k3.addEventListener("click", () => {
         try {
           const now = !kimiK3Enabled();
@@ -2537,7 +2664,7 @@
           localStorage.setItem("rq_inject", now ? "on" : "off");
           paintInj();
           logError(now
-            ? "[INJECT] Stage 3 injection is ON. Retrieved rounds above the " + RQ_SIM_FLOOR + " floor are now placed in every seat's context before the round. Requires VECTOR MEMORY to be ON."
+            ? "[INJECT] Stage 3 injection is ON. Retrieved rounds above the " + simFloor() + " floor are now placed in every seat's context before the round. Requires VECTOR MEMORY to be ON."
             : "[INJECT] Stage 3 injection is OFF. Seats read recency/CHIM only \u2014 this is the A/B control arm.");
         } catch (_) {
           logError("[INJECT] Could not write the toggle \u2014 localStorage is unavailable (private browsing?).");
@@ -4139,7 +4266,7 @@
         const inj = await retrieveForInjection(query);
         _vectorBlock = inj ? buildVectorBlock(inj.hits, vecBudget) : "";
         if (inj && !inj.hits.length) {
-          logError("[INJECT] retrieval returned 0 row(s) above " + RQ_SIM_FLOOR +
+          logError("[INJECT] retrieval returned 0 row(s) above " + simFloor() +
             (typeof inj.best === "number" ? " (best candidate " + inj.best.toFixed(3) + " of " + inj.candidates.length + ")" : "") +
             " — nothing injected; context is recency/CHIM only. If this repeats with a healthy best score, the FLOOR is the suspect, not retrieval.");
         }
@@ -4346,6 +4473,10 @@
       }
       // Injection changes what the seats READ, so it gets the same boot line as
       // the flag that cost three debugging sessions by reverting silently.
+      if (simFloor() !== RQ_SIM_FLOOR_DEFAULT) {
+        logError("[FLOOR] \u26A0 Similarity floor is OVERRIDDEN to " + simFloor() + " (ratified default is " +
+          RQ_SIM_FLOOR_DEFAULT + "). Rounds this session are not comparable to default-floor rounds.");
+      }
       logError(injectionEnabled()
         ? "[INJECT] Stage 3 injection is ON — retrieved rounds will be placed in seat context. A/B rows this session record injected:true."
         : "[INJECT] Stage 3 injection is OFF — control arm. Settings → STAGE 3 INJECTION to enable.");
