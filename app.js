@@ -1,4 +1,4 @@
-   /* Red Queen v2.1 — Command Center logic
+  /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.5.2a-k3-toggle";
+  const RQ_BUILD = "v3.5.3a-stage3-uihook";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -142,7 +142,14 @@
   // 4000 the diagnosis is confirmed UNBOUNDED REASONER (thinks past any
   // budget) and the seat recasts per Kimi's standing eviction ruling —
   // with the accurate cause of death recorded in her memory.
-  const CEREBRAS_MAX_TOKENS = 4000;
+  // v3.5.3 (2026-07-26): 4000 -> 8000. THIRD observed truncation, and the first
+  // with a measured cost — on 2026-07-26 GLM burned its whole budget inside
+  // <think> at 9:18:38 and again at 9:31:04, and because the Gemini seat's
+  // OpenRouter floor was dead (both entries 404) the seat VANISHED mid-round and
+  // was logged as HOLD in adjudication. That is the 2026-07-17 disappearance
+  // replayed. GLM 4.7 is a reasoning model; 4000 was never headroom for one.
+  // Edit 12 fixes the floor so a truncation stops being fatal either way.
+  const CEREBRAS_MAX_TOKENS = 8000;
 
   // ---------- Kimi primary seat (Moonshot) ----------
   // moonshot-v1-8k is retired: unavailable to new accounts since 2026-07-17 and
@@ -1045,6 +1052,36 @@
   const RQ_TOP_K       = 5;
   const RQ_SIM_FLOOR   = 0.6;
 
+  // ---------- Stage 3: injection ----------
+  // Kimi's gate on Stage 3 was 20 clean A/B samples plus re-ratification. The
+  // operator OVERRODE it 2026-07-26 to avoid a standstill. The gate was
+  // protecting the COMPARISON, not the calendar, so injection ships behind its
+  // own flag and `injected` records the real value per round: the control arm
+  // survives, the standstill does not.
+  //
+  // DEFAULT OFF, same reasoning as every other flag here — localStorage is
+  // per-device and starts empty, so an ON default would mean every new device,
+  // and every device after a hard cache clear, silently changes what the seats
+  // are reading. Off is the safe failure.
+  function injectionEnabled() { return localStorage.getItem("rq_inject") === "on"; }
+
+  // Ratified context budget: 40% vector / 40% CHIM / 20% verbatim recency.
+  // Only the vector share is named here; the remaining 60% goes to
+  // buildMemoryContext, which already splits CHIM against recency internally at
+  // CHIM_DIGEST_BUDGET_FRAC. Applied ONLY when injection is on — with it off the
+  // memory budget is untouched and behaviour is identical to v3.5.2a.
+  const RQ_INJECT_VECTOR_FRAC = 0.40;
+
+  // ---------- Floor diagnostic ----------
+  // The shadow used to ask match_rounds to pre-filter at RQ_SIM_FLOOR, which made
+  // "0 vector hits" indistinguishable from four rows sitting at 0.59. On
+  // 2026-07-26 two consecutive council-topical rounds logged 0 hits at corpus
+  // 50/51 and there was no way to tell which case they were — and that is the
+  // one number Stage 3 depends on, because injecting zero rows is a no-op that
+  // deploys cleanly and changes nothing. Ask for the top rows at floor 0, filter
+  // locally, record the whole distribution.
+  const RQ_DIAG_FLOOR  = 0;
+
   // ---------- prompt_class (Kimi Ruling 1) ----------
   // HARD CONSTRAINT from the ruling: this output is written to a database
   // column and NEVER rendered into any system prompt, seat context, or digest.
@@ -1057,9 +1094,25 @@
   // semantically. Good enough to spot a gross pattern across hundreds of future
   // rounds; NOT good enough to found a conclusion on. Hand-label the existing
   // 25 for the cross-tab.
+  // ---------- Operator notes ----------
+  // An operator note is not a question. On 2026-07-26 a thank-you round with no
+  // question and no stakes was put through the full anonymised cross-examination:
+  // seats were made to hunt errors in each other's acknowledgements, one conceded
+  // that its acknowledgement was not a defensible position, and the round was
+  // stamped DIVIDED. That is the machinery working correctly on input it should
+  // never have been handed — and those tags are the denominator of every
+  // DIVIDED-rate figure this project reports.
+  //
+  // EXPLICIT, not heuristic. classifyPrompt is a keyword guess; misreading a real
+  // question as a note would silently skip consensus on it, which is a far worse
+  // failure than typing five characters. Start the message with NOTE: or #note.
+  const OPERATOR_NOTE_RE = /^\s*(?:#note\b|note\s*:)/i;
+  function isOperatorNote(q) { return OPERATOR_NOTE_RE.test(String(q || "")); }
+
   function classifyPrompt(prompt) {
     try {
       if (typeof prompt !== "string" || !prompt.trim()) return "open_ended";
+      if (isOperatorNote(prompt)) return "operator_note";
       const p = prompt.toLowerCase();
 
       // meta_system first, deliberately. "What is the Red Queen?" is lexically a
@@ -1307,17 +1360,21 @@
     }
   }
 
-  // ---------- Stage 2: shadow retrieval + A/B log ----------
-  // SHADOW ONLY. Nothing here touches the prompt, the seats, or the consensus.
-  // It records what retrieval WOULD have surfaced alongside what the memory
-  // context actually surfaced, and writes both to rq_retrieval_log for review.
-  // injected is hard-coded false; flipping it is Stage 3 and needs Kimi's
-  // second ratification plus 20 clean samples.
+  // ---------- Stage 2/3: retrieval (shadow log + injection) ----------
+  // ONE retrieval path, TWO consumers. Stage 2 records what retrieval WOULD have
+  // surfaced; Stage 3 injects it. They must not be two implementations — a
+  // parallel one drifts the first time either changes, and the A/B would then be
+  // comparing injection against a fiction. Same reason _lastMemorySelection is a
+  // side effect of buildMemoryContext rather than a recomputation.
   //
-  // Runs after the round is already logged, fully detached. It cannot delay a
-  // round and cannot fail one.
-  async function runRetrievalShadow(roundId, queryText, promptClass, seatDegraded) {
-    if (!vectorMemoryEnabled() || !sbConfigured()) return;
+  // Nothing here can delay or fail a round: the shadow runs fully detached after
+  // the round, and the injection path is bounded by RQ_INJECT_TIMEOUT_MS and
+  // degrades to recency/CHIM on any problem at all.
+  let _retrievalCache = null;   // { key, candidates, hits, best, corpusSize, at }
+
+  // Raw retrieval. Returns { rows, corpusSize } or null. Never throws.
+  async function runRetrieval(queryText) {
+    if (!vectorMemoryEnabled() || !sbConfigured()) return null;
     const base = settings.supabaseUrl.replace(/\/+$/, "");
     const hdrs = {
       apikey: settings.supabaseAnonKey,
@@ -1326,41 +1383,32 @@
     };
     try {
       const vec = await embedText(queryText);
-      if (!vec) { logError("[RETRIEVAL] skipped — query embed returned null."); return; }
+      if (!vec) { logError("[RETRIEVAL] skipped — query embed returned null."); return null; }
 
       // match_count is TOP_K + 1: the current round's own row would otherwise
       // self-match at ~1.000 and consume a slot before we can filter it.
+      //
+      // min_similarity is RQ_DIAG_FLOOR (0), NOT RQ_SIM_FLOOR. Asking the RPC to
+      // pre-filter meant a "0 hits" log line was indistinguishable from four rows
+      // sitting at 0.59, which is exactly the ambiguity that made 2026-07-26's two
+      // zero-hit rounds unreadable. Filter to the real floor locally instead, and
+      // record the whole distribution.
       const rpc = await fetch(base + "/rest/v1/rpc/match_rounds", {
         method: "POST",
         headers: hdrs,
         body: JSON.stringify({
           query_embedding: "[" + vec.join(",") + "]",
           match_count: RQ_TOP_K + 1,
-          min_similarity: RQ_SIM_FLOOR,
+          min_similarity: RQ_DIAG_FLOOR,
         }),
       });
       if (!rpc.ok) {
         const b = await rpc.text().catch(() => "");
         logError("[RETRIEVAL] FAIL — match_rounds RPC HTTP " + rpc.status + " " + b.slice(0, 300));
-        return;
+        return null;
       }
       let rows = await rpc.json().catch(() => []);
       if (!Array.isArray(rows)) rows = [];
-
-      const vectorRounds = rows
-        .filter((r) => r && r.id !== roundId)      // self-match exclusion (ruled)
-        .slice(0, RQ_TOP_K)
-        .map((r) => ({
-          id: r.id,
-          prompt: clip(r.prompt || "", 100),
-          consensus_status: r.consensus_status || null,
-          similarity: typeof r.similarity === "number" ? Number(r.similarity.toFixed(4)) : null,
-        }));
-
-      // What the memory context actually surfaced this round. Captured as a
-      // side effect of buildMemoryContext rather than recomputed, so the two
-      // can never drift apart.
-      const sel = _lastMemorySelection || { chim: false, entries: [], digested: 0 };
 
       // corpus_size: how many rows retrieval could have drawn from. Cheap
       // count-only request — Range 0-0 returns the total in Content-Range
@@ -1373,35 +1421,192 @@
         const cr = cres.headers.get("content-range") || "";
         const n = parseInt(cr.split("/")[1], 10);
         if (!isNaN(n)) corpusSize = n;
-      } catch (_) { /* count is diagnostic; never block the log row */ }
+      } catch (_) { /* count is diagnostic; never block */ }
 
-      const res = await fetch(base + "/rest/v1/rq_retrieval_log", {
+      return { rows: rows, corpusSize: corpusSize };
+    } catch (e) {
+      logError("[RETRIEVAL] FAIL — threw: " + ((e && e.message) || e));
+      return null;
+    }
+  }
+
+  // Split the raw rows into everything we looked at (candidates) and what
+  // actually cleared the floor (hits). The candidate list is the floor
+  // diagnostic: without it, tuning RQ_SIM_FLOOR is guesswork.
+  function shapeRetrieval(rows, excludeId) {
+    const candidates = (rows || [])
+      .filter((r) => r && r.id !== excludeId)      // self-match exclusion (ruled)
+      .slice(0, RQ_TOP_K)
+      .map((r) => ({
+        id: r.id,
+        prompt: clip(r.prompt || "", 100),
+        response: r.response || "",
+        consensus_status: r.consensus_status || null,
+        similarity: typeof r.similarity === "number" ? Number(r.similarity.toFixed(4)) : null,
+      }));
+    const hits = candidates.filter((c) => typeof c.similarity === "number" && c.similarity >= RQ_SIM_FLOOR);
+    const best = (candidates.length && typeof candidates[0].similarity === "number") ? candidates[0].similarity : null;
+    return { candidates: candidates, hits: hits, best: best };
+  }
+
+  // The log row never carries response text — that is 900 chars per row of data
+  // already stored in rq_events, and the A/B is reviewed on prompts and scores.
+  function _logShape(list) {
+    return (list || []).map((c) => ({
+      id: c.id,
+      prompt: c.prompt,
+      consensus_status: c.consensus_status,
+      similarity: c.similarity,
+    }));
+  }
+
+  // ---------- Stage 3: pre-round retrieval for injection ----------
+  const RQ_INJECT_TIMEOUT_MS = 12000;
+
+  async function retrieveForInjection(queryText) {
+    if (!injectionEnabled()) return null;
+    const key = clip(queryText, 900);
+    try {
+      const res = await Promise.race([
+        runRetrieval(key),
+        new Promise((r) => setTimeout(() => r("__timeout__"), RQ_INJECT_TIMEOUT_MS)),
+      ]);
+      if (res === "__timeout__") {
+        logError("[INJECT] retrieval exceeded " + (RQ_INJECT_TIMEOUT_MS / 1000) + "s — round proceeds on recency/CHIM only.");
+        return null;
+      }
+      if (!res) return null;
+      // excludeId is null on purpose: this round's row does not exist yet, so
+      // there is nothing of its own to self-match against.
+      const shaped = shapeRetrieval(res.rows, null);
+      _retrievalCache = {
+        key: key,
+        candidates: shaped.candidates,
+        hits: shaped.hits,
+        best: shaped.best,
+        corpusSize: res.corpusSize,
+        at: Date.now(),
+      };
+      return _retrievalCache;
+    } catch (e) {
+      logError("[INJECT] retrieval threw (" + ((e && e.message) || e) + ") — round proceeds on recency/CHIM only.");
+      return null;
+    }
+  }
+
+  // The injected block. The wording is load-bearing, not decoration. The finding
+  // behind Stage 3 is that a seat attributes correctly when a citable source sits
+  // in context and substitutes a nearby number when it has to reach (probe 2 vs
+  // probe 1). So this block states what these rows are, that they were chosen by
+  // meaning rather than recency, and that they may be cited — and it says
+  // explicitly that absence here is not evidence of absence, because "retrieval
+  // returned nothing" must not become a fresh licence to invent.
+  function buildVectorBlock(hits, charBudget) {
+    if (!hits || !hits.length || charBudget < 200) return "";
+    let out =
+      "=== RETRIEVED EARLIER ROUNDS (semantic match — may predate the recent ledger below) ===\n" +
+      "Selected by MEANING, not recency, from this council's stored history. Each row\n" +
+      "carries its trust tag and a similarity score. You may cite these rows. Treat\n" +
+      "DIVIDED and PROVISIONAL rows as unsettled, exactly as in the ledger.\n" +
+      "If something is not in this block, that means retrieval did not surface it — it\n" +
+      "does NOT mean it did not happen. Do not fill that gap with a plausible answer;\n" +
+      "say you cannot know it from what you were given.\n";
+    for (let i = 0; i < hits.length; i++) {
+      const h = hits[i];
+      const tag = String(h.consensus_status || "unknown").toUpperCase();
+      const line = "[match " + (typeof h.similarity === "number" ? h.similarity.toFixed(3) : "?") +
+        " | " + tag + "] Q: \"" + clip(h.prompt, 120) + "\"" +
+        (h.response ? " \u2192 \"" + clip(h.response, 220) + "\"" : "") + "\n";
+      if (out.length + line.length > charBudget) break;
+      out += line;
+    }
+    return out + "\n";
+  }
+
+  // ---------- Stage 2: A/B log ----------
+  // Runs after the round is already logged, fully detached. Cannot delay a round
+  // and cannot fail one. `injected` now records the REAL value rather than a
+  // hard-coded false — that is what keeps a control arm after the operator
+  // overrode the 20-sample gate on 2026-07-26.
+  async function runRetrievalShadow(roundId, queryText, promptClass, seatDegraded, injected) {
+    if (!vectorMemoryEnabled() || !sbConfigured()) return;
+    const base = settings.supabaseUrl.replace(/\/+$/, "");
+    const hdrs = {
+      apikey: settings.supabaseAnonKey,
+      Authorization: "Bearer " + settings.supabaseAnonKey,
+      "Content-Type": "application/json",
+    };
+    try {
+      const key = clip(queryText, 900);
+      let shaped, corpusSize;
+      const cached = (_retrievalCache && _retrievalCache.key === key) ? _retrievalCache : null;
+      if (cached) {
+        // Injection already ran exactly this retrieval before the round. Redoing
+        // it would re-embed the same text and could return a different corpus
+        // count than the one actually injected — the log would then describe a
+        // retrieval that never happened.
+        shaped = { candidates: cached.candidates, hits: cached.hits, best: cached.best };
+        corpusSize = cached.corpusSize;
+      } else {
+        const res = await runRetrieval(key);
+        if (!res) return;
+        shaped = shapeRetrieval(res.rows, roundId);
+        corpusSize = res.corpusSize;
+      }
+
+      // What the memory context actually surfaced this round. Captured as a side
+      // effect of buildMemoryContext rather than recomputed, so the two can never
+      // drift apart.
+      const sel = _lastMemorySelection || { chim: false, entries: [], digested: 0 };
+
+      const row = {
+        round_id: roundId || null,
+        query_text: clip(queryText || "", 100),
+        query_truncated: (queryText || "").length > 100,
+        prompt_class: promptClass || null,
+        chim_enabled: !!sel.chim,
+        chim_rounds: sel.entries || [],
+        vector_rounds: _logShape(shaped.hits),
+        top_k: RQ_TOP_K,
+        similarity_floor: RQ_SIM_FLOOR,
+        seat_degraded: !!seatDegraded,
+        corpus_size: corpusSize,
+        injected: !!injected,
+      };
+      // Floor-diagnostic columns. Same doctrine as prompt_class: a diagnostic
+      // must never cost the row it annotates, so if rq-stage3-setup.sql has not
+      // been run the insert 400s and we retry once without them.
+      const diag = {
+        vector_candidates: _logShape(shaped.candidates),
+        best_similarity: shaped.best,
+      };
+
+      const post = (body) => fetch(base + "/rest/v1/rq_retrieval_log", {
         method: "POST",
         headers: Object.assign({}, hdrs, { Prefer: "return=minimal" }),
-        body: JSON.stringify({
-          round_id: roundId || null,
-          query_text: clip(queryText || "", 100),
-          query_truncated: (queryText || "").length > 100,
-          prompt_class: promptClass || null,
-          chim_enabled: !!sel.chim,
-          chim_rounds: sel.entries || [],
-          vector_rounds: vectorRounds,
-          top_k: RQ_TOP_K,
-          similarity_floor: RQ_SIM_FLOOR,
-          seat_degraded: !!seatDegraded,
-          corpus_size: corpusSize,
-          injected: false,
-        }),
+        body: JSON.stringify(body),
       });
+
+      let res = await post(Object.assign({}, row, diag));
       if (!res.ok) {
         const b = await res.text().catch(() => "");
-        logError("[RETRIEVAL] FAIL — log insert HTTP " + res.status + " " + b.slice(0, 300));
-        return;
+        logError("[RETRIEVAL] log insert with floor diagnostics failed (HTTP " + res.status +
+          ") — retrying without them. If this repeats, rq-stage3-setup.sql has not been run. " + b.slice(0, 200));
+        res = await post(row);
+        if (!res.ok) {
+          const b2 = await res.text().catch(() => "");
+          logError("[RETRIEVAL] FAIL — log insert HTTP " + res.status + " " + b2.slice(0, 300));
+          return;
+        }
       }
-      logError("[RETRIEVAL] logged — " + vectorRounds.length + " vector hit(s) above "
-        + RQ_SIM_FLOOR + ", " + (sel.entries ? sel.entries.length : 0) + " context round(s), corpus "
-        + (corpusSize === null ? "?" : corpusSize)
-        + (seatDegraded ? " [SEAT DEGRADED]" : ""));
+
+      logError("[RETRIEVAL] logged — " + shaped.hits.length + " hit(s) above " + RQ_SIM_FLOOR +
+        " of " + shaped.candidates.length + " candidate(s)" +
+        (typeof shaped.best === "number" ? ", best " + shaped.best.toFixed(3) : "") +
+        ", " + (sel.entries ? sel.entries.length : 0) + " context round(s), corpus " +
+        (corpusSize === null ? "?" : corpusSize) +
+        (injected ? " [INJECTED]" : "") +
+        (seatDegraded ? " [SEAT DEGRADED]" : ""));
     } catch (e) {
       logError("[RETRIEVAL] FAIL — threw: " + ((e && e.message) || e));
     }
@@ -2036,7 +2241,33 @@
       logError(`\u26A0 NO OPENROUTER FLOOR — ${seatsWithNoFloor.join(", ")} seat(s) have zero live fallback models. If their primary and understudy both fail, the seat VANISHES from the council (root cause of the 2026-07-17 Gemini disappearance). Run LIST FREE MODELS and swap.`);
     }
     if (!dead) logError(`\u2713 CATALOG CHECK — all configured OpenRouter models present in the live free catalog (${cat.free.size} free of ${cat.total} total).`);
+    repairDeadFloors(cat);
     return cat;
+  }
+
+  // ---------- v3.5.3: dead-floor self-repair ----------
+  // Repairs ONLY a seat whose ENTIRE configured list is dead — zero floor, the
+  // condition that made the Gemini seat vanish mid-deliberation on 2026-07-17 and
+  // again on 2026-07-26. A seat with even one live entry is left alone.
+  // Family-safe picks only, so Kimi's diversity rule is preserved. In-memory
+  // only: a reload returns to whatever is written in OR_SEAT_MODELS.
+  function repairDeadFloors(cat) {
+    if (!cat || !cat.free) return;
+    Object.keys(OR_SEAT_MODELS).forEach((seat) => {
+      const list = OR_SEAT_MODELS[seat] || [];
+      if (!list.length) return;
+      if (list.some((m) => cat.free.has(m))) return;   // seat still has a floor
+      const banned = familiesUsedExcept(seat);
+      const picks = Array.from(cat.free).filter((m) => !banned.has(orFamily(m))).sort().slice(0, 2);
+      if (!picks.length) {
+        logError("\u26A0 FLOOR REPAIR — " + seat + " seat has no live models AND no family-safe replacement exists in the live free catalog. Escalate to Kimi; this seat will vanish if its primary fails.");
+        return;
+      }
+      OR_SEAT_MODELS[seat] = picks;
+      logError("\u2714 FLOOR REPAIR — " + seat + " seat had ZERO live fallback models (" + list.join(", ") +
+        " \u2014 all 404). Repaired IN MEMORY from the live free catalog: " + picks.join(", ") +
+        ". Family-safe. NOT persisted \u2014 paste these into OR_SEAT_MODELS to make it permanent.");
+    });
   }
 
   // Print the live free catalog, annotated for the diversity rule.
@@ -2238,6 +2469,33 @@
             : "[K3] Kimi seat is now the OpenRouter free-tier walk. Base weight 0.5. No Moonshot requests, no spend.");
         } catch (_) {
           logError("[K3] Could not write the toggle — localStorage is unavailable (private browsing?).");
+        }
+      });
+      // v3.5.3 — Stage 3 injection toggle. Sits with the other two metered/
+      // behaviour-changing flags. This is the first flag that changes what the
+      // SEATS READ, so its state has to be visible without a console: a round run
+      // with it silently on is not comparable to one run with it off, and the A/B
+      // is the whole point.
+      const inj = document.createElement("button");
+      inj.id = "injectToggle";
+      inj.type = "button";
+      inj.className = saveSettingsBtn.className || "";
+      inj.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const paintInj = () => {
+        inj.textContent = "STAGE 3 INJECTION: " + (injectionEnabled() ? "ON" : "OFF");
+      };
+      paintInj();
+      k3.parentNode.insertBefore(inj, k3.nextSibling);
+      inj.addEventListener("click", () => {
+        try {
+          const now = !injectionEnabled();
+          localStorage.setItem("rq_inject", now ? "on" : "off");
+          paintInj();
+          logError(now
+            ? "[INJECT] Stage 3 injection is ON. Retrieved rounds above the " + RQ_SIM_FLOOR + " floor are now placed in every seat's context before the round. Requires VECTOR MEMORY to be ON."
+            : "[INJECT] Stage 3 injection is OFF. Seats read recency/CHIM only \u2014 this is the A/B control arm.");
+        } catch (_) {
+          logError("[INJECT] Could not write the toggle \u2014 localStorage is unavailable (private browsing?).");
         }
       });
     } catch (e) { /* cosmetic — never block boot */ }
@@ -2470,10 +2728,19 @@
         // nine impersonated voices from three models, tripled output,
         // renewed truncation. Examples beat instructions; identity must
         // be explicit and singular.
-        q = q.replace("{{SEAT_IDENTITY}}",
+        const identityLine =
           `YOUR IDENTITY: You are the ${cap} seat of this council — one seat only. ` +
           `The other seats deliberate separately and answer for themselves. ` +
-          `Write YOUR position only. Never simulate, quote, or draft responses for other seats.`);
+          `Write YOUR position only. Never simulate, quote, or draft responses for other seats.`;
+        // v3.5.3: the token lives ONLY inside MEMORY_HEADER, so a round with
+        // memory off or an empty ledger dispatched with NO identity block —
+        // .replace() on an absent needle does nothing, silently. That is the
+        // exact 2026-07-14 "answered as the whole council" condition, latent
+        // since v2.9.1 and armed by every FORGET and New Session. Prepend when
+        // the token is absent.
+        q = q.indexOf("{{SEAT_IDENTITY}}") !== -1
+          ? q.replace("{{SEAT_IDENTITY}}", identityLine)
+          : identityLine + "\n\n" + q;
         const primaryTag = seatProvider[c.name]; // configured occupant at dispatch start
 
         const chain = [];
@@ -2535,6 +2802,15 @@
     calls.length = 0;
     calls.push(...wrapped);
 
+    // K3's B4 (round 78: one seat reported a work product absent from context
+    // while another quoted it verbatim). The composed prompt is built ONCE in
+    // dispatch and handed to every seat, so ASSEMBLY is identical by
+    // construction — the only per-seat difference is the identity line. What
+    // remains is DELIVERY: seats run on models with different context windows and
+    // truncate differently. Log the size; the next occurrence is then decidable.
+    logError("[CONTEXT] composed prompt " + query.length + " chars, identical for all " +
+      calls.length + " seat(s). A seat reporting missing context at this size is hitting its own window, not an assembly bug.");
+
     calls.forEach((c) => agents[c.name].classList.add("thinking"));
 
     // stagger launches ~700ms apart to avoid same-millisecond burst tripping RPM limits
@@ -2585,6 +2861,15 @@
     // v3.4.2: feed computed results back to the seats (toggle rq_sandbox_feedback;
     // OFF by default, so consensus is unchanged until deliberately enabled).
     await runSandboxFeedback(answers, calls);
+
+    // Operator note: the seats answered, but there is nothing to adjudicate.
+    // _noteRound is read rather than testing `query`, because by this point
+    // `query` is the COMPOSED prompt and the note prefix sits far inside it,
+    // after the CURRENT QUESTION marker.
+    if (_noteRound) {
+      logError("[NOTE] Operator note — consensus and adjudication SKIPPED. Seat responses recorded; no verdict claimed and no DIVIDED tag issued.");
+      return { text: null, divided: true, answers, note: true };
+    }
 
     // MALFORMED_RESPONSE rule (Kimi review, 2026-07-12, Claude amendment):
     // enforced ONLY when the query itself demands a FINAL DIRECTIVE —
@@ -2933,14 +3218,19 @@
     };
   }
 
-  function buildMemoryContext() {
+  // budgetOverride (v3.5.3): Stage 3 hands the vector block 40% of the context
+  // budget and this function the remaining 60%. Omitted, behaviour is unchanged.
+  function buildMemoryContext(budgetOverride) {
     _lastMemorySelection = { chim: chimEnabled(), entries: [], digested: 0 };
     if (!memoryEnabled() || ledger.length === 0) return "";
     const lines = [];
     const picked = [];
     // Defensive clamp: even if CHAR_CAP is mis-tuned above HARD_MAX, the
     // injection can never exceed the ceiling that protects free-tier prompts.
-    let budget = Math.min(MEMORY_CONTEXT_CHAR_CAP, MEMORY_CONTEXT_HARD_MAX);
+    let budget = Math.min(
+      (typeof budgetOverride === "number" && budgetOverride > 0) ? budgetOverride : MEMORY_CONTEXT_CHAR_CAP,
+      MEMORY_CONTEXT_HARD_MAX
+    );
 
     if (chimEnabled()) {
       // Reserve a slice for the digest so old rounds never fall off the cliff.
@@ -3168,7 +3458,7 @@
         embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse);
         // Detached on purpose — shadow retrieval must not delay the round or
         // the embedding write, and its failures are diagnostic only.
-        runRetrievalShadow(row.id, _evPrompt, _evClass, _seatDegraded);
+        runRetrievalShadow(row.id, _evPrompt, _evClass, _seatDegraded, _injectedThisRound);
       } else if (vectorMemoryEnabled()) {
         logError("[EMBED] no row id returned from the rq_events insert — nothing to embed. Insert itself may have failed; see any preceding institutional-memory error.");
       }
@@ -3710,6 +4000,12 @@
 
   // ---------- Dispatch ----------
   let busy = false;
+  // Per-round state set in dispatch and read further down the call chain.
+  // Module-scoped rather than threaded through as parameters because both are
+  // read in functions several frames deep (runLiveCouncil, logInstitutionalMemory)
+  // that already take five arguments each.
+  let _injectedThisRound = false;   // did a vector block actually reach the seats
+  let _noteRound = false;           // was this an operator note (skip consensus)
 
   async function dispatch(query) {
     if (busy) return;
@@ -3734,9 +4030,42 @@
       // v2.9: memory injection — the council receives the shared ledger
       // context ahead of the current question. The RAW query (not the
       // composed one) is what gets displayed, logged, and remembered.
-      const memoryContext = buildMemoryContext();
-      const composedQuery = (memoryContext ? memoryContext + query : query) +
-        (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "");
+      // ---------- Stage 3: retrieve first, then split the context budget ----------
+      // 40% vector / 40% CHIM / 20% verbatim recency, per Kimi's ratified split.
+      // With injection OFF this path is byte-identical to v3.5.2a: same call, same
+      // budget, and no retrieval request is made at all.
+      _noteRound = isOperatorNote(query);
+      let _vectorBlock = "";
+      let _memBudget = MEMORY_CONTEXT_CHAR_CAP;
+      _injectedThisRound = false;
+      if (injectionEnabled()) {
+        const vecBudget = Math.floor(MEMORY_CONTEXT_CHAR_CAP * RQ_INJECT_VECTOR_FRAC);
+        _memBudget = MEMORY_CONTEXT_CHAR_CAP - vecBudget;
+        const inj = await retrieveForInjection(query);
+        _vectorBlock = inj ? buildVectorBlock(inj.hits, vecBudget) : "";
+        if (inj && !inj.hits.length) {
+          logError("[INJECT] retrieval returned 0 row(s) above " + RQ_SIM_FLOOR +
+            (typeof inj.best === "number" ? " (best candidate " + inj.best.toFixed(3) + " of " + inj.candidates.length + ")" : "") +
+            " — nothing injected; context is recency/CHIM only. If this repeats with a healthy best score, the FLOOR is the suspect, not retrieval.");
+        }
+        _injectedThisRound = !!_vectorBlock;
+      }
+      const memoryContext = buildMemoryContext(_memBudget);
+      // The vector block goes INSIDE the memory envelope, immediately before the
+      // CURRENT QUESTION marker, so the marker stays adjacent to the question.
+      // Putting it in front of MEMORY_HEADER would separate the two and leave the
+      // seat reading retrieved history before it has been told what history is.
+      let _composedBody;
+      if (memoryContext) {
+        const _mark = "=== CURRENT QUESTION ===\n";
+        const _at = memoryContext.lastIndexOf(_mark);
+        _composedBody = (_at === -1)
+          ? _vectorBlock + memoryContext + query
+          : memoryContext.slice(0, _at) + _vectorBlock + memoryContext.slice(_at) + query;
+      } else {
+        _composedBody = _vectorBlock + query;
+      }
+      const composedQuery = _composedBody + (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "");
       try {
         result = await runLiveCouncil(composedQuery);
       } catch (e) {
@@ -3849,6 +4178,11 @@
     const q = queryInput.value.trim();
     if (!q) return;
     queryInput.value = "";
+    // v2.2 UI package (K3 Swarm spec §3). Setting .value in code does NOT fire an
+    // input event, so ui-plus.js's char counter and auto-grow textarea would stay
+    // frozen at the pre-send size after every dispatch. Harmless no-op when
+    // ui-plus.js is absent — nothing is listening.
+    try { queryInput.dispatchEvent(new Event("input", { bubbles: true })); } catch (_) {}
     closeSheet();
     dispatch(q);
   });
@@ -3897,6 +4231,19 @@
         logError(kimiK3Enabled()
           ? "[K3] Kimi seat is on kimi-k3 (PAID — this session spends Moonshot credits). Settings → KIMI SEAT to switch to free tier."
           : "[K3] Kimi seat is on the free tier (OpenRouter). No Moonshot spend. Settings → KIMI SEAT to enable K3.");
+      }
+      // Injection changes what the seats READ, so it gets the same boot line as
+      // the flag that cost three debugging sessions by reverting silently.
+      logError(injectionEnabled()
+        ? "[INJECT] Stage 3 injection is ON — retrieved rounds will be placed in seat context. A/B rows this session record injected:true."
+        : "[INJECT] Stage 3 injection is OFF — control arm. Settings → STAGE 3 INJECTION to enable.");
+      // Catalog check moved forward to boot when a key exists. It used to fire on
+      // first dispatch, fire-and-forget — which meant Edit 12's floor repair could
+      // not land until AFTER that round had already walked a dead list. Still
+      // fire-and-forget: advisory work must never delay a round or a page load.
+      if (settings.keyOpenRouter && !catalogChecked) {
+        catalogChecked = true;
+        validateOrSeatModels().catch(() => {});
       }
     } catch (_) {}
   } catch (_) {}
