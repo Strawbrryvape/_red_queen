@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.5.3a-stage3-uihook";
+  const RQ_BUILD = "v3.5.4-indexical-audit";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -1109,6 +1109,28 @@
   const OPERATOR_NOTE_RE = /^\s*(?:#note\b|note\s*:)/i;
   function isOperatorNote(q) { return OPERATOR_NOTE_RE.test(String(q || "")); }
 
+  // ---------- Indexical prompts (v3.5.4) ----------
+  // A roll call asks each seat about ITSELF. Three seats then give three
+  // DIFFERENT answers that are all CORRECT, and the lexical comparator scores
+  // them as agreeing because they share vocabulary ("I am currently operating
+  // as... seat... weight..."). Round 88: a roll call came back PROVISIONAL 3/3
+  // with one seat's block on screen, because consensus was declared on a
+  // question that structurally cannot have one, and the other two answers were
+  // discarded from the render. Same class as the round-82 finding: divergence is
+  // the correct output and the machine has no representation for it.
+  //
+  // Heuristic, and safe to be one. A false positive shows all three answers
+  // instead of one; a false negative is the status quo. Neither can silently
+  // fabricate agreement, which is the asymmetry that makes a heuristic fine here
+  // and not fine for operator notes.
+  const INDEXICAL_RE = new RegExp([
+    "each seat", "every seat", "each of you", "all three of you",
+    "answer independently", "independently", "speak for another", "speak for the",
+    "roll call", "rollcall", "in (?:the )?first person", "your own (?:seat|weight|tier|model|endpoint)",
+    "who are you", "identify yourself", "state your (?:seat|name|model|status)",
+  ].join("|"), "i");
+  function isIndexicalPrompt(q) { return INDEXICAL_RE.test(String(q || "")); }
+
   function classifyPrompt(prompt) {
     try {
       if (typeof prompt !== "string" || !prompt.trim()) return "open_ended";
@@ -1953,7 +1975,13 @@
   // has been test-dispatched. Run TEST OPENROUTER MODELS in the settings sheet
   // before committing — that satisfies Kimi's "non-empty response required".
   const OR_SEAT_MODELS = {
-    gemini: ["mistralai/mistral-7b-instruct:free", "qwen/qwen-2.5-72b-instruct:free"],
+    // v3.5.4 (2026-07-26): PERSISTED from a live repair. Both previous entries
+    // were dead — qwen-2.5-72b was on this file's own kill list from 07-13 and
+    // was still configured, mistral-7b left the free tier after. repairDeadFloors
+    // found these two in the live catalog at 12:00:28 and they answered. ling
+    // leads because north-mini-code is a CODE model and is a last-resort seat on
+    // a deliberation council; see the deny-list in orPickScore.
+    gemini: ["inclusionai/ling-3.0-flash:free", "cohere/north-mini-code:free"],
     kimi:   ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free"],
     claude: ["nvidia/nemotron-3-super-120b-a12b:free", "google/gemma-4-31b-it:free"],
   };
@@ -2251,6 +2279,17 @@
   // again on 2026-07-26. A seat with even one live entry is left alone.
   // Family-safe picks only, so Kimi's diversity rule is preserved. In-memory
   // only: a reload returns to whatever is written in OR_SEAT_MODELS.
+  // Lower is better. Specialist models answer a deliberation prompt badly or
+  // not at all; a general chat model is always the better floor. This does not
+  // EXCLUDE anything — a bad floor still beats a vanished seat — it only orders.
+  const OR_SPECIALIST = /(^|[-\/])(code|coder|vision|vl|embed|rerank|guard|math|ocr|audio|whisper|tts|image)([-\/]|$)/i;
+  function orPickScore(slug) {
+    var name = String(slug || "").split("/").pop();
+    if (OR_SPECIALIST.test(name)) return 2;
+    if (/instruct|chat|flash|mini|turbo/i.test(name)) return 0;
+    return 1;
+  }
+
   function repairDeadFloors(cat) {
     if (!cat || !cat.free) return;
     Object.keys(OR_SEAT_MODELS).forEach((seat) => {
@@ -2258,7 +2297,13 @@
       if (!list.length) return;
       if (list.some((m) => cat.free.has(m))) return;   // seat still has a floor
       const banned = familiesUsedExcept(seat);
-      const picks = Array.from(cat.free).filter((m) => !banned.has(orFamily(m))).sort().slice(0, 2);
+      // v3.5.4: was .sort().slice(0,2) — alphabetical. That is how a CODE model
+      // (cohere/north-mini-code) ended up seated on a deliberation council on
+      // 2026-07-26. Rank by fitness first, alphabetically only to break ties.
+      const picks = Array.from(cat.free)
+        .filter((m) => !banned.has(orFamily(m)))
+        .sort((a, b) => (orPickScore(a) - orPickScore(b)) || (a < b ? -1 : a > b ? 1 : 0))
+        .slice(0, 2);
       if (!picks.length) {
         logError("\u26A0 FLOOR REPAIR — " + seat + " seat has no live models AND no family-safe replacement exists in the live free catalog. Escalate to Kimi; this seat will vanish if its primary fails.");
         return;
@@ -2618,8 +2663,13 @@
           verdicts.push({ letter: p.letter, seat: p.seat, verdict: v.verdict, target: v.target, error: v.error, counted: true });
         }
       } catch (e) {
-        logError(`ADJUDICATION — ${seatLabel(p.seat)} failed to respond (${e.message || e}). Treated as HOLD.`);
-        verdicts.push({ letter: p.letter, seat: p.seat, verdict: "hold", target: null, error: "", counted: false });
+        // v3.5.4: was "Treated as HOLD", which reads as a deliberate abstention
+        // and was read that way in K3's 2026-07-26 handoff. An infrastructure
+        // failure is not a position. counted:false always excluded it from the
+        // resolution math; now the label says so and the seat is dropped from
+        // the denominator below rather than silently blocking a RESOLVED.
+        logError(`\u26A0 ADJUDICATION — ${seatLabel(p.seat)} UNAVAILABLE (${e.message || e}). Infrastructure failure, NOT an abstention. Excluded from the resolution denominator.`);
+        verdicts.push({ letter: p.letter, seat: p.seat, verdict: "unavailable", target: null, error: "", counted: false, unavailable: true });
       }
     }
 
@@ -2636,7 +2686,10 @@
       const conceders = byTarget[t];
       const targetHeld = !verdicts.find((v) => v.letter === t && v.verdict === "concede" && v.counted);
       // everyone except the target conceded to the target, with real errors
-      if (conceders.length >= positions.length - 1 && targetHeld) {
+      // v3.5.4: seats that never rendered cannot concede, so counting them in
+      // the denominator made RESOLVED unreachable whenever a provider 429'd.
+      const _live = positions.length - verdicts.filter((v) => v.unavailable).length;
+      if (conceders.length >= _live - 1 && targetHeld) {
         winner = t;
       }
     });
@@ -2871,6 +2924,28 @@
       return { text: null, divided: true, answers, note: true };
     }
 
+    // v3.5.4 — COUNCIL HEALTH. One line per round, stated before any verdict is
+    // computed, so "who actually rendered" is never something that has to be
+    // reconstructed from adjacent log lines afterwards.
+    (function councilHealth() {
+      try {
+        var configured = Object.keys(seatProvider).length || answers.length;
+        var rendered = answers.length;
+        var primaries = answers.filter(function (a) { return (a.provider || seatProvider[a.name]) === "primary"; }).length;
+        var pct = configured ? Math.round((rendered / configured) * 100) : 0;
+        logError("[HEALTH] " + rendered + "/" + configured + " seat(s) rendered (" + pct + "%), " +
+          primaries + " primary voice(s): " + answers.map(function (a) { return seatLabel(a.name); }).join(", ") +
+          (rendered < configured ? " \u2014 a seat is missing; any verdict below is over " + rendered + " voices, not " + configured + "." : ""));
+      } catch (_) {}
+    })();
+
+    // Indexical round: every seat answers about ITSELF, so there is no shared
+    // proposition to agree on. Render all of them; claim nothing.
+    if (_indexicalRound) {
+      logError("[INDEXICAL] Roll-call/self-report prompt — consensus and adjudication SKIPPED. Three correct answers about three different subjects is not disagreement, and it is not agreement either. All seat responses rendered verbatim.");
+      return { text: null, divided: true, answers, indexical: true };
+    }
+
     // MALFORMED_RESPONSE rule (Kimi review, 2026-07-12, Claude amendment):
     // enforced ONLY when the query itself demands a FINAL DIRECTIVE —
     // otherwise every conversational query would empty all seats.
@@ -2962,7 +3037,14 @@
     // among equal weights, shortest coherent answer wins
     agreed.sort((a, b) => (seatWeight(b.name) - seatWeight(a.name)) || (a.text.length - b.text.length));
     const speaker = agreed[0];
-    logError(`Consensus synthesized — speaking voice: ${seatLabel(speaker.name)} (weight ${seatWeight(speaker.name)}), ${agreed.length}/${eligible.length} eligible agents in agreement.`);
+    // v3.5.4 AUDIT TRAIL. "3/3" alone cannot be checked against anything, which
+    // is how a mic-rotation round got read as a fabricated quorum on 2026-07-26.
+    // Name the seats on both sides of the ratio, every time, in the log AND on
+    // the badge. One seat speaking for an agreeing set is the ratified
+    // mic-rotation model; it just has to be legible as that.
+    const _agreedNames = agreed.map((a) => seatLabel(a.name));
+    const _eligibleNames = eligible.map((a) => seatLabel(a.name));
+    logError(`Consensus synthesized — speaking voice: ${seatLabel(speaker.name)} (weight ${seatWeight(speaker.name)}), ${agreed.length}/${eligible.length} eligible agents in agreement. AGREEING: [${_agreedNames.join(", ")}]. ELIGIBLE: [${_eligibleNames.join(", ")}]. The rendered answer is this ONE seat's text, not a merge of all ${agreed.length}.`);
     return {
       text: speaker.text.trim(),
       divided: false,
@@ -2970,6 +3052,9 @@
       trust: hasPrimaryVoice ? "verified" : "provisional",
       agreedCount: agreed.length,
       eligibleCount: eligible.length,
+      speakerSeat: seatLabel(speaker.name),
+      agreedNames: _agreedNames,
+      eligibleNames: _eligibleNames,
     };
   }
 
@@ -3406,9 +3491,17 @@
     // reuse it for both the row and the embedding (embed the fuller prompt+response
     // so retrieval matches on question AND verdict, not verdict alone).
     const _evPrompt = clip(query, 900);
+    // v3.5.4: a consensus round used to embed ONLY the speaking seat's text, so
+    // the corpus recorded the merged voice and lost the fact that other seats
+    // said something different. Stage 4 measures divergence; the corpus it reads
+    // from must contain it. Verdict stays first and keeps the larger share —
+    // retrieval should still match on the conclusion.
     const _evResponse = clip(result.divided
       ? answers.map((a) => `${seatLabel(a.name)}: ${clip(a.text, 120)}`).join(" | ")
-      : (result.text || ""), 900);
+      : (clip(result.text || "", 560) +
+         (answers.length > 1
+           ? " || SEATS: " + answers.map((a) => `${seatLabel(a.name)}: ${clip(a.text, 90)}`).join(" | ")
+           : "")), 900);
     const _evStatus = result.divided ? "divided" : (result.trust || "unknown");
     const _evClass = classifyPrompt(query);
 
@@ -4006,6 +4099,7 @@
   // that already take five arguments each.
   let _injectedThisRound = false;   // did a vector block actually reach the seats
   let _noteRound = false;           // was this an operator note (skip consensus)
+  let _indexicalRound = false;      // roll call — every seat renders, never synthesize
 
   async function dispatch(query) {
     if (busy) return;
@@ -4035,6 +4129,7 @@
       // With injection OFF this path is byte-identical to v3.5.2a: same call, same
       // budget, and no retrieval request is made at all.
       _noteRound = isOperatorNote(query);
+      _indexicalRound = isIndexicalPrompt(query);
       let _vectorBlock = "";
       let _memBudget = MEMORY_CONTEXT_CHAR_CAP;
       _injectedThisRound = false;
@@ -4090,7 +4185,12 @@
           outcome: divided ? "divided" : (result.trust || "unknown"),
           counts: result.agreedCount != null ? `${result.agreedCount}/${result.eligibleCount}` : "",
           verdict: divided ? null : clip(result.text, 600),
-          positions: divided ? allAnswers.map((a) => ({ seat: seatLabel(a.name), text: clip(a.text, 300) })) : null,
+          // v3.5.4: positions are now recorded on EVERY round, not only divided
+          // ones. Previously a consensus round kept only the speaking seat's
+          // text, so the ledger — and the embedded corpus built from it —
+          // systematically under-represented divergence, which is the one thing
+          // Stage 4 exists to measure.
+          positions: allAnswers.map((a) => ({ seat: seatLabel(a.name), text: clip(a.text, 300) })),
           // v3.0.2: per-seat roster for Seat Stats — who answered, who was
           // malformed; absent seats failed that round.
           seats: allAnswers.map((a) => ({ n: a.name, m: !!a.malformed })),
@@ -4114,9 +4214,9 @@
         if (result.trust === "sole") {
           trustPrefix = "⚠ SOLE VOICE (unverified) — Only one voice answered, so this is a single model's opinion, not a council verdict: ";
         } else if (result.trust === "provisional") {
-          trustPrefix = `◐ PROVISIONAL ${result.agreedCount}/${result.eligibleCount} — The bench agrees, but no primary voice has verified this yet: `;
+          trustPrefix = `◐ PROVISIONAL ${result.agreedCount}/${result.eligibleCount} (${(result.agreedNames || []).join(", ")}) — The bench agrees, but no primary voice has verified this yet. Spoken by ${result.speakerSeat} on behalf of the agreeing seats \u2014 this is one seat's wording, not a merge: `;
         } else if (result.trust === "verified") {
-          trustPrefix = `✓ VERIFIED ${result.agreedCount}/${result.eligibleCount} — Everyone's on the same page for this one. Here is the council's unified answer: `;
+          trustPrefix = `✓ VERIFIED ${result.agreedCount}/${result.eligibleCount} (${(result.agreedNames || []).join(", ")}) — Everyone's on the same page for this one. Spoken by ${result.speakerSeat} on behalf of the agreeing seats \u2014 this is one seat's wording, not a merge: `;
         } else if (result.trust === "resolved") {
           // v3.2: the council disagreed, then cross-examined, and every other
           // seat located a specific error in its own position and conceded to
@@ -4150,7 +4250,13 @@
       // No white flash — the Council did not converge. Amber state instead.
       consensusBar.classList.add("divided");
       // Persona line (Gemini request 2026-07-13) — referee voice on a split.
-      consensusText.textContent = "We have a split decision. They all took this in slightly different directions, so I'm stepping back to let you read their raw responses.";
+      // v3.5.4: a note round and a roll call are not split decisions, and saying
+      // so put DIVIDED-shaped language on rounds that were never in contention.
+      consensusText.textContent = _noteRound
+        ? "Noted \u2014 no question asked, so no verdict claimed. Each seat's acknowledgement:"
+        : _indexicalRound
+          ? "Roll call \u2014 each seat answers for itself. No consensus is claimed or possible here; three correct answers about three different subjects is not disagreement:"
+          : "We have a split decision. They all took this in slightly different directions, so I'm stepping back to let you read their raw responses.";
       renderDividedPanel(allAnswers);
       allAnswers.forEach((a) =>
         logHistory(`${seatLabel(a.name)} position (${query})`, a.text)
@@ -4170,6 +4276,12 @@
       consensusText.appendChild(_body);
       renderRich(_body, answer);
       logHistory(query, answer);
+      // v3.5.4: the non-speaking seats' answers used to vanish from the visible
+      // record on a consensus round. They are the evidence for whether the
+      // comparator was right to call it agreement.
+      if (allAnswers.length > 1) {
+        allAnswers.forEach((a) => logHistory(`${seatLabel(a.name)} raw position (${query})`, a.text));
+      }
     }
     busy = false;
   }
