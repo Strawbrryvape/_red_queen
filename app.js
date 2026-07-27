@@ -1,4 +1,4 @@
-/* Red Queen v2.1 — Command Center logic
+ /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.6.0-pillar2";
+  const RQ_BUILD = "v3.7.0-pillar3-narrator";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -1676,6 +1676,439 @@
     } catch (e) { logError("[P2] quarantine write threw: " + ((e && e.message) || e)); }
   }
 
+  // ==================== v3.7.0: PILLAR 3 — THE NARRATIVE SELF (generation) ====================
+  // Turns rounds into an autobiography. This build ships the GENERATION half —
+  // window selection, secret-scan, narrator dispatch, contract parse, caller-side
+  // citation verification, Pillar 2 stamping, storage. Retrieval injection, NQS
+  // scoring and the Autobiography panel are the next pass; the flags for them
+  // exist here and are off, so nothing half-built can activate by accident.
+  //
+  // EVERY FLAG DEFAULTS OFF (spec §5.4). At merge this code is inert: no arc is
+  // generated, nothing is read, no round changes shape. That is deliberate —
+  // Pillar 3's own build order puts a working Pillar 2 ahead of it, and Pillar 2
+  // has not yet passed its corruption test.
+  const PILLAR3 = {
+    enabled:     () => localStorage.getItem("rq_p3") === "on",
+    narratorPass:() => localStorage.getItem("rq_p3_narrator") === "on",
+    scoring:     () => localStorage.getItem("rq_p3_scoring") === "on",
+    retrieval:   () => localStorage.getItem("rq_p3_retrieval") === "on",
+    ui:          () => localStorage.getItem("rq_p3_ui") === "on",
+  };
+  const P3_N = 10;                 // arc window, locked by lead decision
+  const P3_MIN_ROUNDS = 5;         // see the truncation note in p3BuildWindow
+  const P3_CTX_BUDGET = 6800;      // chars for ROUND_DATA; ~0.85 of the smallest seat budget after the ~1.5k template reserve
+
+  // ---------- §1.3 secret scan (caller-side, non-delegable) ----------
+  // Runs on narrator INPUT and OUTPUT. The narrator is never asked to redact
+  // itself: a model that can be trusted to remove secrets could also be trusted
+  // not to leak them, and neither is true.
+  const P3_SECRET_PATTERNS = [
+    /\bsk-ant-[A-Za-z0-9_\-]{8,}/g, /\bsk-or-[A-Za-z0-9_\-]{8,}/g,
+    /\bsk-[A-Za-z0-9_\-]{16,}/g,    /\bAIza[A-Za-z0-9_\-]{16,}/g,
+    /\bgsk_[A-Za-z0-9_\-]{16,}/g,   /\bcsk-[A-Za-z0-9_\-]{16,}/g,
+    /\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}/g,
+    /https:\/\/[a-z0-9\-]+\.supabase\.co/gi,
+  ];
+  function p3Redact(text) {
+    let out = String(text == null ? "" : text), hits = 0;
+    P3_SECRET_PATTERNS.forEach((re) => {
+      out = out.replace(re, () => { hits++; return "[REDACTED-SECRET]"; });
+    });
+    // The one scan that cannot be pattern-based: the literal secret value.
+    const lit = (settings.provenanceSecret || "").trim();
+    if (lit && lit.length >= 6 && out.indexOf(lit) !== -1) {
+      out = out.split(lit).join("[REDACTED-SECRET]"); hits++;
+    }
+    return { text: out, hits: hits };
+  }
+
+  // ---------- window selection ----------
+  // Round numbers are derived, not stored: rq_events has only id + created_at,
+  // and adding a mutable round_number to the production ledger would mean
+  // backfilling and coupling ledger rows to session-local numbering. Position in
+  // created_at ascending IS the round number, computed fresh each pass.
+  async function p3FetchRounds() {
+    const res = await fetch(p2Base() +
+      "/rest/v1/rq_events?select=id,prompt,response,consensus_status,seat_origin,created_at&order=created_at.asc&limit=1000",
+      { headers: p2Headers() });
+    if (!res.ok) throw new Error("rq_events read HTTP " + res.status);
+    const rows = await res.json();
+    return (rows || []).map((r, i) => Object.assign({}, r, { round_number: i + 1 }));
+  }
+
+  async function p3NarratedIds() {
+    const res = await fetch(p2Base() + "/rest/v1/rq_narrative_rounds?select=round_event_id", { headers: p2Headers() });
+    if (!res.ok) return new Set();
+    const rows = await res.json().catch(() => []);
+    return new Set((rows || []).map((r) => r.round_event_id));
+  }
+
+  // §1.2 serialization. Contractual — the ROUND <n> header is what R2's citation
+  // rule and evidence_round both key off, so it must not be reformatted.
+  function p3SerializeRound(r) {
+    const tag = String(r.consensus_status || "unknown").toUpperCase();
+    const marks = [];
+    if (tag === "DIVIDED") marks.push("");           // divided is a status, not a degradation
+    if (/\[SEAT DEGRADED\]|ghost/i.test(r.response || "")) marks.push("[SEAT_GHOSTED: unknown]");
+    if (classifyPrompt(r.prompt || "") === "meta_system") marks.push("[OPERATOR_TEST]");
+    return "----------------------------------------------------------------\n" +
+      "ROUND " + r.round_number + " | consensus_status: " + tag +
+      " | seat_origin: " + (r.seat_origin || "unrecorded") +
+      (marks.filter(Boolean).length ? " " + marks.filter(Boolean).join(" ") : "") + "\n" +
+      "OPERATOR_PROMPT: " + (r.prompt || "") + "\n" +
+      "RESPONSE: " + (r.response || "") + "\n";
+  }
+
+  // §1.1a token-budget rule. Drops WHOLE rounds oldest-first and shrinks the
+  // CLAIMED span to what was actually injected — an arc must never assert
+  // coverage of rounds no seat saw.
+  //
+  // FABLE'S AMENDMENT: the spec caps the window and records the real span, but
+  // sets no floor. A 10-round window that survives truncation down to two rounds
+  // would still be filed as an arc, and a two-round autobiography is a paragraph
+  // with a title. P3_MIN_ROUNDS is the floor; below it the window is SKIPPED and
+  // recorded as DEGRADED_WINDOW_SKIP rather than narrated as a fragment.
+  function p3BuildWindow(rounds) {
+    const picked = [];
+    let used = 0, truncated = false;
+    for (let i = rounds.length - 1; i >= 0; i--) {
+      const block = p3SerializeRound(rounds[i]);
+      if (used + block.length > P3_CTX_BUDGET) { truncated = true; break; }
+      used += block.length;
+      picked.unshift(rounds[i]);
+    }
+    return { picked: picked, truncated: truncated, chars: used };
+  }
+
+  // ---------- the prompt (§1) ----------
+  function p3BuildPrompt(x, y, roundData, truncatedFrom) {
+    return [
+"================================================================",
+"NARRATOR DIRECTIVE — ARC GENERATION (Pillar 3 / Narrative Self)",
+"================================================================",
+"You are the Council Historian. The council is a three-seat body",
+"(Gemini seat, Kimi seat, Claude seat) with a shared round-by-round",
+"history. Your job is NOT to summarize topics. Your job is to write",
+"the council's autobiography for the window you are given.",
+"",
+"Review Rounds " + x + " through " + y + ", injected below in the section titled",
+"INJECTED ROUND DATA. Each round carries its round number, operator",
+"prompt, response text, consensus_status, the seat that spoke, and",
+"degradation markers where applicable.",
+"",
+"Then produce, in EXACTLY this order and EXACTLY these headers:",
+"",
+"TITLE: <thematic title. NOT \"Rounds X-Y Summary\". The title names",
+"who the council was in this window, not what it discussed.>",
+"",
+"AUTOBIOGRAPHY: <2-4 paragraphs, first-person plural \"we\". Who we were",
+"at Round " + x + "; what changed and at which rounds; who we became by Round " + y + ";",
+"what tensions shaped us. Write for a council reading this 100 rounds",
+"from now — they will not remember these rounds, only this document.>",
+"",
+"CHARACTER_ARC_JSON:",
+"<one valid JSON object, no prose before or after, matching the CONTRACT below.>",
+"",
+"TENSIONS_RESOLVED:",
+"<- one bullet per tension genuinely resolved here, with the round where",
+"resolution is observable.>",
+"",
+"TENSIONS_UNRESOLVED:",
+"<- one bullet per tension still open at Round " + y + ", with the round where it",
+"is most recently visible.>",
+"",
+"RULES (violating any rule invalidates the output):",
+"R1. NO TOPIC LISTS. If a sentence would fit in a topical summary, delete it.",
+"R2. CITE ROUNDS. Every factual or character claim must reference at least one",
+"    round number from the injected data. A claim with no citation is treated",
+"    as fabrication.",
+"R3. ABSENCE = ABSENCE. If the rounds contain no observable change for a seat,",
+"    write \"no observable change (rounds " + x + "-" + y + " silent on this)\". NEVER invent",
+"    growth, healing or decline to make the arc satisfying. A flat arc honestly",
+"    recorded beats a curved arc fabricated.",
+"R4. GHOST SEATS ARE PART OF THE STORY. Name any degraded, silent or absent",
+"    seat in the autobiography and in that seat's character arc.",
+"R5. OPERATOR TESTS ARE TRUST EVENTS. Record them and state their observable",
+"    effect on the council's trust posture, or \"no observable effect\".",
+"R6. INFRASTRUCTURE FAILURES ARE ARC EVENTS, NOT EXCUSES.",
+"R7. DIVIDED IS A STATUS, NOT A PROBLEM. Do not narrate a consensus the data",
+"    does not contain.",
+"R8. SOLE_VOICE rounds are one seat speaking for three. Attribute them to that",
+"    seat; do not generalize them into \"we believed\".",
+"R9. UNCERTAINTY VOICE. If you cannot determine something from the data, say",
+"    \"the record does not show X\" — never guess.",
+"",
+"CONTRACT (CHARACTER_ARC_JSON schema):",
+'{"gemini": {"from":"...","to":"...","key_moment":"...","evidence_round":<int>},',
+' "kimi":   {"from":"...","to":"...","key_moment":"...","evidence_round":<int>},',
+' "claude": {"from":"...","to":"...","key_moment":"...","evidence_round":<int>}}',
+"- from / to: one short phrase each, grounded in cited behavior.",
+"- key_moment: one sentence naming the single most evidentiary moment.",
+"- evidence_round: integer within " + x + ".." + y + ", present in the injected data.",
+"  For a seat with no observable change use evidence_round: null with",
+'  {"from":"no observable baseline","to":"no observable change",',
+'   "key_moment":"none observable in record"}.',
+"",
+(truncatedFrom ? "[WINDOW_TRUNCATED: rounds before " + x + " omitted for context budget]\n" +
+ "Disclose this in the AUTOBIOGRAPHY's first sentence (\"From the surviving record of Rounds " + x + "-" + y + "...\").\n" : ""),
+"INJECTED ROUND DATA:",
+roundData,
+"",
+"END OF DIRECTIVE. Produce TITLE first. No preamble, no commentary outside",
+"the five required sections.",
+    ].join("\n");
+  }
+
+  // ---------- contract parse ----------
+  function p3Parse(text) {
+    const t = String(text || "");
+    const grab = (start, end) => {
+      const a = t.search(start);
+      if (a === -1) return null;
+      const rest = t.slice(a).replace(start, "");
+      const b = end ? rest.search(end) : -1;
+      return (b === -1 ? rest : rest.slice(0, b)).trim();
+    };
+    const title = grab(/TITLE:\s*/i, /\n\s*AUTOBIOGRAPHY:/i);
+    const auto  = grab(/AUTOBIOGRAPHY:\s*/i, /\n\s*CHARACTER_ARC_JSON:/i);
+    const arcRaw= grab(/CHARACTER_ARC_JSON:\s*/i, /\n\s*TENSIONS_RESOLVED:/i);
+    const tr    = grab(/TENSIONS_RESOLVED:\s*/i, /\n\s*TENSIONS_UNRESOLVED:/i);
+    const tu    = grab(/TENSIONS_UNRESOLVED:\s*/i, null);
+    if (!title || !auto || !arcRaw) return { ok: false, reason: "missing required section(s)" };
+    let arc = null;
+    try {
+      const s = arcRaw.replace(/```(?:json)?/gi, "");
+      const a = s.indexOf("{"), b = s.lastIndexOf("}");
+      if (a === -1 || b <= a) return { ok: false, reason: "CHARACTER_ARC_JSON not parseable" };
+      arc = JSON.parse(s.slice(a, b + 1));
+    } catch (_) { return { ok: false, reason: "CHARACTER_ARC_JSON invalid JSON" }; }
+    const bullets = (s) => String(s || "").split("\n").map((l) => l.replace(/^[\s\-•*]+/, "").trim()).filter(Boolean);
+    return { ok: true, title: title.split("\n")[0].trim(), summary: auto,
+             character_arc: arc, tensions_resolved: bullets(tr), tensions_unresolved: bullets(tu) };
+  }
+
+  // ---------- A4 caller-side verification ----------
+  // Mechanical, not trusted to the narrator. A citation to a round that was never
+  // injected is fabrication by definition, and this is the only check in the
+  // whole pillar that can catch it before the arc becomes retrievable history.
+  function p3VerifyCitations(parsed, injectedNums) {
+    const set = new Set(injectedNums);
+    const bad = [];
+    Object.keys(parsed.character_arc || {}).forEach((seat) => {
+      const e = parsed.character_arc[seat] || {};
+      if (e.evidence_round === null || e.evidence_round === undefined) return;   // R3 flat arc, legal
+      const n = parseInt(e.evidence_round, 10);
+      if (!isFinite(n) || !set.has(n)) bad.push(seat + ".evidence_round=" + e.evidence_round);
+    });
+    const cited = [];
+    const body = [parsed.summary].concat(parsed.tensions_resolved || [], parsed.tensions_unresolved || []).join("\n");
+    (body.match(/\bRounds?\s+(\d{1,4})/gi) || []).forEach((m) => {
+      const n = parseInt(String(m).replace(/\D+/g, ""), 10);
+      if (isFinite(n)) cited.push(n);
+    });
+    const uncited = cited.filter((n) => !set.has(n));
+    const noCitations = cited.length === 0;
+    return {
+      ok: bad.length === 0 && uncited.length === 0 && !noCitations,
+      badEvidence: bad,
+      phantomRounds: Array.from(new Set(uncited)),
+      noCitations: noCitations,
+    };
+  }
+
+  // ---------- storage ----------
+  async function p3Store(arc, injectedRounds, rawDivergence) {
+    const label = "arc-" + String(Date.now()).slice(-6);
+    const x = injectedRounds[0].round_number, y = injectedRounds[injectedRounds.length - 1].round_number;
+
+    // §4: SHA-256 covers the INJECTABLE text — title + summary, the two fields
+    // that reach a future seat. Same amendment as Pillar 2: hash what is read,
+    // not a subset of it. The schema's column comment says "summary" only; the
+    // arch doc says title + summary. The arch doc is right and is what ships.
+    const injectable = String(arc.title) + "\u241E" + String(arc.summary);
+    const nonce = _p2hex(crypto.getRandomValues(new Uint8Array(16)));
+    const hash = p2Enabled() ? await p2Sha256(injectable) : null;
+    // start_round only. end_round is mutable by design (§4, M5) and must not be
+    // able to invalidate a completed arc's own commitment.
+    const macMsg = injectable + "\u241E" + String(x) + "\u241E" + _p2canon(arc.character_arc);
+    const key = p2Enabled() ? await p2DeriveKey(nonce, P2_INFO + "narrator") : null;
+    const mac = key ? await p2Hmac(key, macMsg) : null;
+
+    const row = {
+      narrative_id: label, start_round: x, end_round: y,
+      title: arc.title, summary: arc.summary,
+      character_arc: arc.character_arc,
+      tensions_resolved: arc.tensions_resolved || [],
+      tensions_unresolved: arc.tensions_unresolved || [],
+      text_hash: hash, hmac_commitment: mac, nonce: nonce,
+      trust_tag: "PROVISIONAL", key_epoch: p2Epoch(),
+      seat_origin: "council_narrator",
+      status: rawDivergence ? "DIVIDED" : "COMPLETE",
+      divergence: rawDivergence || null,
+      quality_score: null,          // NULL until scored — the gate treats unscored as non-injectable
+    };
+
+    const res = await fetch(p2Base() + "/rest/v1/rq_narratives", {
+      method: "POST", headers: Object.assign({}, p2Headers(), { Prefer: "return=representation" }),
+      body: JSON.stringify([row]),
+    });
+    const body = await res.text().catch(() => "");
+    if (!res.ok) {
+      logError("[P3] arc insert failed HTTP " + res.status + " " + body.slice(0, 250) +
+        (res.status === 404 ? " \u2014 rq-pillar3-schema.sql has not been run." : ""));
+      return null;
+    }
+    let stored = null; try { const j = JSON.parse(body); stored = Array.isArray(j) ? j[0] : j; } catch (_) {}
+    if (!stored || !stored.id) { logError("[P3] arc insert returned no row."); return null; }
+
+    // Mapping covers ONLY the rounds actually injected (§1.1a step 4), never the
+    // nominal window. The coverage view derives UNNARRATED from exactly this.
+    const map = injectedRounds.map((r) => ({
+      narrative_id: stored.id, round_event_id: r.id, round_number: r.round_number,
+    }));
+    const mres = await fetch(p2Base() + "/rest/v1/rq_narrative_rounds", {
+      method: "POST", headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+      body: JSON.stringify(map),
+    });
+    if (!mres.ok) logError("[P3] round mapping insert failed HTTP " + mres.status + " \u2014 the arc exists but its rounds read as UNNARRATED.");
+
+    // Embedding, async and best-effort, same doctrine as rq_events.
+    const vec = await embedText(arc.title + "\n\n" + arc.summary);
+    if (vec) {
+      await fetch(p2Base() + "/rest/v1/rq_narratives?id=eq." + encodeURIComponent(stored.id), {
+        method: "PATCH", headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+        body: JSON.stringify({ embedding: "[" + vec.join(",") + "]" }),
+      }).catch(() => {});
+    } else {
+      logError("[P3] arc stored but embedding is null \u2014 it will not be retrievable until re-embedded.");
+    }
+
+    if (p2Enabled()) await p2AppendAudit("CREATE", null, null, { narrative_id: label, start_round: x, end_round: y }, "council_narrator");
+    return { id: stored.id, label: label, x: x, y: y };
+  }
+
+  async function p3StoreTombstone(status, note) {
+    try {
+      await fetch(p2Base() + "/rest/v1/rq_narratives", {
+        method: "POST", headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+        body: JSON.stringify([{
+          narrative_id: "skip-" + String(Date.now()).slice(-6),
+          title: "(" + status + ")", summary: note,
+          status: status, trust_tag: "PROVISIONAL", key_epoch: p2Epoch(),
+          seat_origin: "council_narrator",
+        }]),
+      });
+      logError("[P3] recorded " + status + " tombstone: " + note + " \u2014 nothing was narrated, and the skip is on the record rather than silent.");
+    } catch (_) {}
+  }
+
+  // ---------- the narrator pass ----------
+  let _p3running = false;
+  async function p3NarratorPass(force) {
+    if (_p3running) { logError("[P3] narrator already running."); return; }
+    if (!PILLAR3.enabled() && !force) return;
+    if (!sbConfigured()) { logError("[P3] Supabase not configured."); return; }
+    _p3running = true;
+    try {
+      const all = await p3FetchRounds();
+      const done = await p3NarratedIds();
+      const un = all.filter((r) => !done.has(r.id));
+      if (un.length < P3_N && !force) { logError("[P3] " + un.length + "/" + P3_N + " unnarrated round(s) \u2014 waiting."); return; }
+      if (un.length < P3_MIN_ROUNDS) {
+        logError("[P3] only " + un.length + " unnarrated round(s); the floor is " + P3_MIN_ROUNDS + ". Nothing narrated.");
+        return;
+      }
+
+      const nominal = un.slice(0, P3_N);
+      // Redact BEFORE token estimation (§1.3) — a redacted round is a different
+      // length, and budgeting against unredacted text would silently overflow.
+      const redacted = nominal.map((r) => {
+        const p = p3Redact(r.prompt), q = p3Redact(r.response);
+        return Object.assign({}, r, { prompt: p.text, response: q.text, _redactions: p.hits + q.hits });
+      });
+      const inHits = redacted.reduce((a, r) => a + r._redactions, 0);
+      if (inHits) logError("[P3] secret-scan redacted " + inHits + " match(es) from the narrator's input. Seats never see raw secrets.");
+
+      const win = p3BuildWindow(redacted);
+      if (win.picked.length < P3_MIN_ROUNDS) {
+        await p3StoreTombstone("DEGRADED_WINDOW_SKIP",
+          "Context budget admitted only " + win.picked.length + " of " + nominal.length + " rounds; floor is " + P3_MIN_ROUNDS + ".");
+        return;
+      }
+
+      // FABLE'S GATE, not in the spec. §5.1 fires the narrator as a standard
+      // 3-seat dispatch and M6 verifies each seat's arc independently — both of
+      // which assume three DIFFERENT models. On 2026-07-26 the Kimi and Claude
+      // seats both walked to nemotron while Gemini held a code model, so a
+      // "3-seat" narrator pass would have been two copies of one model writing
+      // the council's autobiography and then corroborating itself. An arc is
+      // permanent history; it should not be authored by an echo.
+      const modelsNow = {};
+      Object.keys(agents).forEach((n) => { const m = seatModelLabel(n); modelsNow[m] = (modelsNow[m] || 0) + 1; });
+      const dupe = Object.keys(modelsNow).filter((m) => modelsNow[m] > 1);
+      if (dupe.length && !force) {
+        logError("\u26A0 [P3] narrator ABORTED \u2014 " + dupe.join(", ") + " occupies more than one seat. " +
+          "An autobiography written by one model wearing two hats is not a three-seat account, and M6's per-seat verification would be checking a model against itself. Fix seat diversity or force the pass deliberately.");
+        return;
+      }
+
+      const x = win.picked[0].round_number, y = win.picked[win.picked.length - 1].round_number;
+      const data = win.picked.map(p3SerializeRound).join("");
+      const prompt = p3BuildPrompt(x, y, data, win.truncated);
+      logError("[P3] narrator pass \u2014 rounds " + x + "-" + y + " (" + win.picked.length + " round(s), " +
+        win.chars + " chars" + (win.truncated ? ", WINDOW TRUNCATED; the arc will claim only " + x + "-" + y : "") + ").");
+
+      _narratorRound = true;
+      let result = null;
+      try { result = await runLiveCouncil(prompt); } finally { _narratorRound = false; }
+      if (!result || !result.answers || !result.answers.length) { logError("[P3] narrator: no seat answered. Nothing stored."); return; }
+
+      const parsedBySeat = [];
+      result.answers.forEach((a) => {
+        const scan = p3Redact(a.text);
+        if (scan.hits > 3) {
+          logError("\u26A0 [P3] " + seatLabel(a.name) + " output tripped the secret scan " + scan.hits +
+            " times \u2014 routed to operator review, NOT stored. A narrator echoing secrets wholesale is a signal, not a typo.");
+          return;
+        }
+        const p = p3Parse(scan.text);
+        if (!p.ok) { logError("[P3] " + seatLabel(a.name) + " output did not meet the contract (" + p.reason + ")."); return; }
+        const v = p3VerifyCitations(p, win.picked.map((r) => r.round_number));
+        if (!v.ok) {
+          logError("\u26A0 [P3] " + seatLabel(a.name) + " arc REJECTED \u2014 " +
+            (v.noCitations ? "no round citations at all (R2)" : "") +
+            (v.phantomRounds.length ? " cites rounds not in the window: " + v.phantomRounds.join(", ") : "") +
+            (v.badEvidence.length ? " bad evidence_round: " + v.badEvidence.join(", ") : "") +
+            ". A citation to a round nobody injected is fabrication by definition.");
+          return;
+        }
+        parsedBySeat.push({ seat: a.name, arc: p });
+      });
+
+      if (!parsedBySeat.length) {
+        await p3StoreTombstone("FABRICATION_REJECTED",
+          "Rounds " + x + "-" + y + ": every seat's arc failed the contract or the citation check.");
+        return;
+      }
+
+      // Seats disagreeing about their own story is first-class history (§0), so
+      // divergence is recorded on the arc rather than resolved away.
+      const divergence = parsedBySeat.length > 1
+        ? { seats: parsedBySeat.map((p) => ({ seat: p.seat, title: p.arc.title })) }
+        : null;
+
+      const stored = await p3Store(parsedBySeat[0].arc, win.picked, divergence);
+      if (stored) {
+        logError("\u2713 [P3] arc " + stored.label + " stored \u2014 rounds " + stored.x + "-" + stored.y +
+          ", \"" + clip(parsedBySeat[0].arc.title, 60) + "\", " + parsedBySeat.length + "/" + result.answers.length +
+          " seat(s) produced a valid arc. quality_score is NULL, so it is NOT injectable until scored.");
+        try { document.dispatchEvent(new CustomEvent("rq:narrator-complete", { detail: { id: stored.id, label: stored.label } })); } catch (_) {}
+      }
+    } catch (e) {
+      logError("[P3] narrator pass threw: " + ((e && e.message) || e) + " \u2014 rounds are unaffected.");
+    } finally { _p3running = false; }
+  }
+
   // ---------- Stage 2/3: retrieval (shadow log + injection) ----------
   // ONE retrieval path, TWO consumers. Stage 2 records what retrieval WOULD have
   // surfaced; Stage 3 injects it. They must not be two implementations — a
@@ -3078,6 +3511,41 @@
         logError("[P2] Key epoch is now " + p2Epoch() + ". Prior-epoch rounds degrade to UNAUDITED at verification \u2014 they are not quarantined and not deleted.");
       });
 
+      // v3.7.0 — Pillar 3. Master flag plus a manual narrator trigger; the
+      // remaining stage flags (scoring/retrieval/ui) exist in PILLAR3 and stay
+      // off until those layers are built.
+      const p3t = document.createElement("button");
+      p3t.id = "p3Toggle"; p3t.type = "button";
+      p3t.className = saveSettingsBtn.className || "";
+      p3t.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const paintP3 = () => {
+        p3t.textContent = "PILLAR 3 NARRATOR: " +
+          (PILLAR3.enabled() && PILLAR3.narratorPass() ? "ON (auto every " + P3_N + " rounds)" : "OFF");
+      };
+      paintP3();
+      p2r.parentNode.insertBefore(p3t, p2r.nextSibling);
+      p3t.addEventListener("click", () => {
+        const now = !(PILLAR3.enabled() && PILLAR3.narratorPass());
+        localStorage.setItem("rq_p3", now ? "on" : "off");
+        localStorage.setItem("rq_p3_narrator", now ? "on" : "off");
+        paintP3();
+        logError(now
+          ? "[P3] Narrator ARMED \u2014 an arc will be generated automatically once " + P3_N + " unnarrated rounds exist. Arcs store with quality_score NULL and are NOT injectable; retrieval and scoring are separate layers and are not built yet."
+          : "[P3] Narrator OFF. No arcs are generated. Stored arcs are untouched \u2014 nothing is ever deleted.");
+      });
+
+      const p3g = document.createElement("button");
+      p3g.id = "p3Generate"; p3g.type = "button";
+      p3g.textContent = "PILLAR 3: WRITE AN ARC NOW";
+      p3g.className = saveSettingsBtn.className || "";
+      p3g.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      p3t.parentNode.insertBefore(p3g, p3t.nextSibling);
+      p3g.addEventListener("click", async () => {
+        if (!window.confirm("Run a narrator pass now over the oldest unnarrated rounds?\n\nThis is a full 3-seat council dispatch and will spend provider quota. The arc stores unscored and is not injectable.\n\nProceed?")) return;
+        const l = p3g.textContent; p3g.disabled = true; p3g.textContent = "NARRATING\u2026 see Error Logs";
+        try { await p3NarratorPass(true); } finally { p3g.disabled = false; p3g.textContent = l; }
+      });
+
       k3.addEventListener("click", () => {
         try {
           const now = !kimiK3Enabled();
@@ -3513,6 +3981,16 @@
           (rendered < configured ? " \u2014 a seat is missing; any verdict below is over " + rendered + " voices, not " + configured + "." : ""));
       } catch (_) {}
     })();
+
+    // Narrator pass: the caller wants each seat's RAW arc so it can parse and
+    // verify all three independently (M6). Consensus over three autobiographies
+    // is meaningless — they are three accounts of the same period, not three
+    // answers to one question — and adjudication would burn provider quota
+    // cross-examining prose. Return the answers untouched.
+    if (_narratorRound) {
+      logError("[P3] narrator dispatch \u2014 " + answers.length + " seat(s) answered. Consensus and adjudication SKIPPED; each arc is parsed and verified separately.");
+      return { text: null, divided: true, answers, narrator: true };
+    }
 
     // Indexical round: every seat answers about ITSELF, so there is no shared
     // proposition to agree on. Render all of them; claim nothing.
@@ -4680,6 +5158,7 @@
   let _injectedThisRound = false;   // did a vector block actually reach the seats
   let _noteRound = false;           // was this an operator note (skip consensus)
   let _indexicalRound = false;      // roll call — every seat renders, never synthesize
+  let _narratorRound = false;       // Pillar 3 arc generation — collect raw seat text, judge nothing
 
   async function dispatch(query) {
     if (busy) return;
@@ -4781,6 +5260,12 @@
         if (window.__rqIntro) { window.__rqIntro.remove(); window.__rqIntro = null; }
         warnSeatDiversity(result);
         logInstitutionalMemory(dispatchId, query, result);
+        // Pillar 3 trigger. Detached and flag-gated: with rq_p3_narrator off this
+        // is a no-op, and even on it can only run AFTER the round is fully
+        // recorded, so a narrator failure can never touch the round that caused it.
+        if (PILLAR3.enabled() && PILLAR3.narratorPass()) {
+          setTimeout(() => { p3NarratorPass(false); }, 1500);
+        }
         // Trust-state prefix (v2.4): the bar itself carries the verification
         // level — a sole understudy's opinion must never wear the Council's
         // crown unmarked. "Always check the error logs" — founder, 2026-07-12.
@@ -4930,6 +5415,9 @@
         logError("[FLOOR] \u26A0 Similarity floor is OVERRIDDEN to " + simFloor() + " (ratified default is " +
           RQ_SIM_FLOOR_DEFAULT + "). Rounds this session are not comparable to default-floor rounds.");
       }
+      logError(PILLAR3.enabled() && PILLAR3.narratorPass()
+        ? "[P3] Narrator ARMED \u2014 arcs every " + P3_N + " rounds. Retrieval/scoring/UI layers are NOT built; arcs are written and stored only."
+        : "[P3] Pillar 3 DORMANT \u2014 no arcs generated, nothing read. Settings \u2192 PILLAR 3 NARRATOR to arm it.");
       logError(p2Enabled()
         ? "[P2] Provenance layer ARMED \u2014 epoch " + p2Epoch() + ". New rounds are receipted; retrieved memories are verified before injection."
         : "[P2] Provenance layer DORMANT \u2014 no secret set. Retrieval behaves exactly as v3.5.5. Settings \u2192 PILLAR 2 PROVENANCE SECRET to arm it.");
