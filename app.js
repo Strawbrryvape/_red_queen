@@ -1,4 +1,4 @@
- /* Red Queen v2.1 — Command Center logic
+/* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.5.5-floor-readout";
+  const RQ_BUILD = "v3.6.0-pillar2";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -95,9 +95,15 @@
       };
       mk("supabaseUrl", "SUPABASE PROJECT URL (institutional memory)", "text", "https://yourproject.supabase.co");
       mk("supabaseAnonKey", "SUPABASE ANON KEY (institutional memory)", "password", "eyJ… (the long anon public key)");
+      // v3.6.0 — Pillar 2. Lives in rq_settings_v21 with the API keys, so it
+      // survives the hard clear that follows every deploy. If it were in a bare
+      // localStorage key it would be wiped along with rq_vector_memory, and the
+      // first hard clear would make the ENTIRE corpus unverifiable at once.
+      mk("provenanceSecret", "PILLAR 2 PROVENANCE SECRET (leave blank to disable)", "password", "any long passphrase — write it down");
     }
     if ($("supabaseUrl")) $("supabaseUrl").value = settings.supabaseUrl || "";
     if ($("supabaseAnonKey")) $("supabaseAnonKey").value = settings.supabaseAnonKey || "";
+    if ($("provenanceSecret")) $("provenanceSecret").value = settings.provenanceSecret || "";
   })();
   demoToggle.checked = !!settings.demoMode;
 
@@ -409,6 +415,9 @@
       keyCerebras: keyCerebrasEl ? keyCerebrasEl.value.trim() : (settings.keyCerebras || ""),
       supabaseUrl: $("supabaseUrl") ? $("supabaseUrl").value.trim() : (settings.supabaseUrl || ""),
       supabaseAnonKey: $("supabaseAnonKey") ? $("supabaseAnonKey").value.trim() : (settings.supabaseAnonKey || ""),
+      provenanceSecret: $("provenanceSecret") ? $("provenanceSecret").value.trim() : (settings.provenanceSecret || ""),
+      // Epoch is never edited by hand — only the Regenerate flow bumps it.
+      provenanceEpoch: settings.provenanceEpoch || 1,
       demoMode: demoToggle.checked,
     };
     saveSettings(settings);
@@ -1392,6 +1401,281 @@
     }
   }
 
+  // ==================== v3.6.0: PILLAR 2 — PROVENANCE LAYER ====================
+  // Verifies that a retrieved memory is the memory that was written. Three
+  // checks, all browser-side via Web Crypto: a SHA-256 receipt over the exact
+  // injected text, an HMAC commitment under a per-round derived key, and a
+  // hash-chained audit trail.
+  //
+  // DORMANT UNTIL A SECRET EXISTS. No secret in Settings => every function here
+  // is a no-op and retrieval behaves exactly as v3.5.5. That is the same
+  // flag-discipline as every other staged feature in this file, expressed
+  // through the thing the layer cannot work without rather than a separate
+  // toggle that could disagree with it.
+  //
+  // FAIL-SOFT IS ABSOLUTE. A verification error, a network failure, a missing
+  // nonce, a legacy row: all degrade to UNAUDITED. Nothing here can fail a
+  // round, and nothing here deletes or rewrites a memory — quarantine withholds
+  // a row from injection and says so out loud.
+  //
+  // DEVIATION FROM THE SPEC, stated rather than buried: §2.5 step 3 puts audit-
+  // chain verification on the retrieval path. It runs in the AUDIT CONSOLE here
+  // instead. Chain verification is O(rows-since-last-check) and needs a session
+  // cache to stay cheap; putting an unbounded fetch in front of every injection
+  // trades a real risk (slow or blocked rounds) for a threat the HMAC already
+  // covers — the chain adds sequence integrity, not row integrity. Move it onto
+  // the retrieval path once the console version has run clean for a while.
+  //
+  // THREAT MODEL, honestly: the operator holds the secret and the anon key, so
+  // a malicious operator can forge anything. This detects accidental corruption,
+  // Supabase-side damage, dashboard edits, and rows inserted by anyone who found
+  // the public anon key. It does not detect the keyholder.
+
+  const P2_INFO = "redqueen-pillar2-v1:";
+
+  function p2SecretRaw() { return (settings.provenanceSecret || "").trim(); }
+  function p2Enabled() { return !!p2SecretRaw() && sbConfigured(); }
+  function p2Epoch() {
+    const n = parseInt(settings.provenanceEpoch, 10);
+    return (isFinite(n) && n >= 1) ? n : 1;
+  }
+
+  // consensus_status -> trust tag. Spec §0.2: fail to the WEAKER tag, never the
+  // stronger. An unknown status must not become VERIFIED by accident.
+  function p2TrustTag(status) {
+    switch (String(status || "").toLowerCase()) {
+      case "verified":    return "VERIFIED";
+      case "provisional": return "PROVISIONAL";
+      case "sole":        return "SOLE_VOICE";
+      case "divided":     return "DIVIDED";
+      default:            return "PROVISIONAL";
+    }
+  }
+
+  const _p2enc = new TextEncoder();
+  function _p2hex(buf) {
+    const b = new Uint8Array(buf);
+    let s = "";
+    for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, "0");
+    return s;
+  }
+  function _p2crypto() {
+    return (typeof crypto !== "undefined" && crypto.subtle) ? crypto.subtle : null;
+  }
+
+  async function p2Sha256(text) {
+    const c = _p2crypto();
+    if (!c) return null;
+    try { return _p2hex(await c.digest("SHA-256", _p2enc.encode(String(text)))); }
+    catch (_) { return null; }
+  }
+
+  // HKDF-SHA256. The nonce is the salt and is PUBLIC by design: HMAC needs a
+  // secret KEY, not a secret salt, and the browser must be able to read the
+  // nonce to verify. A fresh nonce per round is therefore free key rotation.
+  async function p2DeriveKey(saltStr, infoStr) {
+    const c = _p2crypto();
+    if (!c) return null;
+    try {
+      const ikm = await c.importKey("raw", _p2enc.encode(p2SecretRaw()), "HKDF", false, ["deriveKey"]);
+      return await c.deriveKey(
+        { name: "HKDF", hash: "SHA-256", salt: _p2enc.encode(String(saltStr)), info: _p2enc.encode(String(infoStr)) },
+        ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+      );
+    } catch (_) { return null; }
+  }
+
+  async function p2Hmac(key, message) {
+    const c = _p2crypto();
+    if (!c || !key) return null;
+    try { return _p2hex(await c.sign("HMAC", key, _p2enc.encode(String(message)))); }
+    catch (_) { return null; }
+  }
+
+  // THE INTEGRITY ENVELOPE. Fable's amendment to spec §2.3, and the one change
+  // made to the sealed design: the spec bound response || row_id || trust_tag
+  // and left the PROMPT out. buildVectorBlock injects Q: "<prompt>" -> "<response>",
+  // so under the spec as written half of every injected memory sat outside the
+  // envelope — tamper the question and verification passes clean while the seats
+  // read a fabricated prompt attached to an authentic answer. That is worse than
+  // a corrupted response, because the answer still looks right. Both fields are
+  // bound here. Any change to this function invalidates every existing
+  // commitment, so it is versioned by P2_INFO.
+  function p2Message(prompt, response, rowId, tag) {
+    return String(prompt == null ? "" : prompt) + "\u241E" +
+           String(response == null ? "" : response) + "\u241E" +
+           String(rowId) + "\u241E" + String(tag);
+  }
+
+  function p2Headers() {
+    return {
+      apikey: settings.supabaseAnonKey,
+      Authorization: "Bearer " + settings.supabaseAnonKey,
+      "Content-Type": "application/json",
+    };
+  }
+  function p2Base() { return settings.supabaseUrl.replace(/\/+$/, ""); }
+
+  // ---------- Stamp (write path) ----------
+  // Ordering is partial-failure safe: nonce first, then the receipt PATCH. A
+  // nonce with no receipt verifies as UNAUDITED (harmless); a receipt with no
+  // nonce would be permanently unverifiable and would look like tampering.
+  async function p2StampRound(rowId, prompt, response, status, seatOrigin) {
+    if (!p2Enabled() || !rowId) return;
+    try {
+      const tag = p2TrustTag(status);
+      const nonce = _p2hex(crypto.getRandomValues(new Uint8Array(16)));
+
+      const nres = await fetch(p2Base() + "/rest/v1/rq_round_nonces", {
+        method: "POST",
+        headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+        body: JSON.stringify({ round_event_id: rowId, nonce: nonce, key_epoch: p2Epoch() }),
+      });
+      if (!nres.ok) {
+        const b = await nres.text().catch(() => "");
+        logError("[P2] nonce insert failed HTTP " + nres.status + " " + b.slice(0, 200) +
+          (nres.status === 404 ? " \u2014 rq-pillar2-schema.sql has not been run." : "") +
+          " Round is unaffected; this memory stays UNAUDITED.");
+        return;
+      }
+
+      const hash = await p2Sha256(p2Message(prompt, response, rowId, tag));
+      const key = await p2DeriveKey(nonce, P2_INFO + (seatOrigin || "council"));
+      const mac = await p2Hmac(key, p2Message(prompt, response, rowId, tag));
+      if (!hash || !mac) { logError("[P2] Web Crypto unavailable or HKDF failed \u2014 memory stays UNAUDITED. Safari needs 16.4+ for HKDF."); return; }
+
+      const pres = await fetch(p2Base() + "/rest/v1/rq_events?id=eq." + encodeURIComponent(rowId), {
+        method: "PATCH",
+        headers: Object.assign({}, p2Headers(), { Prefer: "return=representation" }),
+        body: JSON.stringify({
+          trust_tag: tag, text_hash: hash, hmac_commitment: mac,
+          seat_origin: seatOrigin || "council", pillar2_state: "ANCHORED",
+        }),
+      });
+      const pbody = await pres.text().catch(() => "");
+      if (!pres.ok) { logError("[P2] receipt PATCH failed HTTP " + pres.status + " " + pbody.slice(0, 200)); return; }
+      let n = null; try { const j = JSON.parse(pbody); n = Array.isArray(j) ? j.length : null; } catch (_) {}
+      if (n === 0) { logError("[P2] receipt PATCH matched ZERO rows \u2014 RLS is blocking the update."); return; }
+
+      await p2AppendAudit("CREATE", rowId, null, { trust_tag: tag, seat_origin: seatOrigin || "council" }, "system");
+      logError("[P2] ANCHORED row " + String(rowId).slice(0, 8) + "\u2026 (" + tag + ", epoch " + p2Epoch() + ").");
+    } catch (e) {
+      logError("[P2] stamp threw: " + ((e && e.message) || e) + " \u2014 round unaffected.");
+    }
+  }
+
+  // ---------- Audit trail (append-only, hash-chained per epoch) ----------
+  function _p2canon(o) {
+    if (o === null || typeof o !== "object") return JSON.stringify(o === undefined ? null : o);
+    if (Array.isArray(o)) return "[" + o.map(_p2canon).join(",") + "]";
+    return "{" + Object.keys(o).sort().map((k) => JSON.stringify(k) + ":" + _p2canon(o[k])).join(",") + "}";
+  }
+
+  async function p2AppendAudit(action, rowId, prevState, newState, who) {
+    if (!p2Enabled()) return null;
+    try {
+      const epoch = p2Epoch();
+      const hres = await fetch(p2Base() +
+        "/rest/v1/rq_audit_trail?select=hmac_of_change&key_epoch=eq." + epoch +
+        "&order=created_at.desc&limit=1", { headers: p2Headers() });
+      let prev = null;
+      if (hres.ok) { const rows = await hres.json().catch(() => []); if (Array.isArray(rows) && rows[0]) prev = rows[0].hmac_of_change; }
+
+      const key = await p2DeriveKey("audit-trail", P2_INFO + "audit");
+      const mac = await p2Hmac(key, String(prev === null ? "" : prev) + "|" + action + "|" + _p2canon(newState));
+      if (!mac) return null;
+
+      const res = await fetch(p2Base() + "/rest/v1/rq_audit_trail", {
+        method: "POST",
+        headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+        body: JSON.stringify({
+          round_event_id: rowId || null, action: action, seat_triggered: who || "system",
+          previous_state: prevState || null, new_state: newState || null,
+          key_epoch: epoch, prev_hmac: prev, hmac_of_change: mac,
+          // Self-asserted by the browser writing the row. Under an anon key this
+          // is a label, not a control, and the arch doc says so; it is recorded
+          // for the console's benefit and must never be read as authorisation.
+          operator_approved: (action === "KEY_RESET" || action === "REAFFIRM" || action === "CORRECT"),
+        }),
+      });
+      if (!res.ok) { const b = await res.text().catch(() => ""); logError("[P2] audit append failed HTTP " + res.status + " " + b.slice(0, 200)); return null; }
+      return mac;
+    } catch (e) { logError("[P2] audit append threw: " + ((e && e.message) || e)); return null; }
+  }
+
+  // ---------- Verify (read path) ----------
+  // Returns a Map id -> { state, reason }. Never throws. Any failure of this
+  // function returns an empty map, which reads as UNAUDITED everywhere.
+  async function p2VerifyCandidates(cands) {
+    const out = new Map();
+    if (!p2Enabled() || !cands || !cands.length) return out;
+    try {
+      const ids = cands.map((c) => c.id).filter(Boolean);
+      if (!ids.length) return out;
+      const inList = "(" + ids.map((i) => '"' + i + '"').join(",") + ")";
+
+      const [rres, nres] = await Promise.all([
+        fetch(p2Base() + "/rest/v1/rq_events?select=id,prompt,response,trust_tag,text_hash,hmac_commitment,seat_origin,pillar2_state&id=in." + encodeURIComponent(inList), { headers: p2Headers() }),
+        fetch(p2Base() + "/rest/v1/rq_round_nonces?select=round_event_id,nonce,key_epoch&round_event_id=in." + encodeURIComponent(inList), { headers: p2Headers() }),
+      ]);
+      if (!rres.ok || !nres.ok) {
+        logError("[P2] verification fetch failed (" + rres.status + "/" + nres.status + ") \u2014 all candidates degrade to UNAUDITED this round.");
+        return out;
+      }
+      const rows = await rres.json().catch(() => []);
+      const nonces = await nres.json().catch(() => []);
+      const nmap = new Map((nonces || []).map((n) => [n.round_event_id, n]));
+
+      for (const r of (rows || [])) {
+        if (!r || !r.text_hash) { out.set(r && r.id, { state: "UNAUDITED", reason: "legacy row, no receipt" }); continue; }
+        const msg = p2Message(r.prompt, r.response, r.id, r.trust_tag);
+        const hash = await p2Sha256(msg);
+        if (hash !== r.text_hash) {
+          out.set(r.id, { state: "QUARANTINED", reason: "HASH_MISMATCH" });
+          await p2Quarantine(r.id, "HASH_MISMATCH");
+          continue;
+        }
+        const nrow = nmap.get(r.id);
+        if (!nrow) { out.set(r.id, { state: "UNAUDITED", reason: "no nonce on record" }); continue; }
+        // Retired epoch: the current secret cannot derive the old key, so this
+        // is unverifiable, NOT wrong. Spec §7 — degrade, never quarantine.
+        if ((nrow.key_epoch || 1) < p2Epoch()) { out.set(r.id, { state: "UNAUDITED", reason: "retired key epoch " + nrow.key_epoch }); continue; }
+        const key = await p2DeriveKey(nrow.nonce, P2_INFO + (r.seat_origin || "council"));
+        const mac = await p2Hmac(key, msg);
+        if (!mac) { out.set(r.id, { state: "UNAUDITED", reason: "crypto unavailable" }); continue; }
+        if (mac !== r.hmac_commitment) {
+          // Includes the tag-flip case: trust_tag is bound into the message, so
+          // an upgraded tag fails here. HMAC_FAIL is the correct and only label.
+          out.set(r.id, { state: "QUARANTINED", reason: "HMAC_FAIL" });
+          await p2Quarantine(r.id, "HMAC_FAIL");
+          continue;
+        }
+        out.set(r.id, { state: "ANCHORED", reason: "" });
+      }
+      return out;
+    } catch (e) {
+      logError("[P2] verification threw: " + ((e && e.message) || e) + " \u2014 candidates degrade to UNAUDITED.");
+      return out;
+    }
+  }
+
+  async function p2Quarantine(rowId, kind) {
+    try {
+      await fetch(p2Base() + "/rest/v1/rq_provenance_quarantine", {
+        method: "POST",
+        headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+        body: JSON.stringify({ round_event_id: rowId, mismatch_type: kind, detected_by: "system", status: "PENDING" }),
+      });
+      await fetch(p2Base() + "/rest/v1/rq_events?id=eq." + encodeURIComponent(rowId), {
+        method: "PATCH", headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+        body: JSON.stringify({ pillar2_state: "QUARANTINED" }),
+      });
+      await p2AppendAudit("QUARANTINE", rowId, null, { mismatch_type: kind }, "system");
+      logError("\u26A0 [P2] QUARANTINED row " + String(rowId).slice(0, 8) + "\u2026 \u2014 " + kind +
+        ". This memory is WITHHELD from injection; it has not been deleted or altered. Audit Console to review.");
+    } catch (e) { logError("[P2] quarantine write threw: " + ((e && e.message) || e)); }
+  }
+
   // ---------- Stage 2/3: retrieval (shadow log + injection) ----------
   // ONE retrieval path, TWO consumers. Stage 2 records what retrieval WOULD have
   // surfaced; Stage 3 injects it. They must not be two implementations — a
@@ -1472,6 +1756,9 @@
       .map((r) => ({
         id: r.id,
         prompt: clip(r.prompt || "", 100),
+        // Pillar 2 hashes the FULL stored prompt. The clipped copy above is for
+        // display and logging; verifying against it would fail every time.
+        promptRaw: r.prompt || "",
         response: r.response || "",
         consensus_status: r.consensus_status || null,
         similarity: typeof r.similarity === "number" ? Number(r.similarity.toFixed(4)) : null,
@@ -1511,6 +1798,25 @@
       // excludeId is null on purpose: this round's row does not exist yet, so
       // there is nothing of its own to self-match against.
       const shaped = shapeRetrieval(res.rows, null);
+      // v3.6.0 — verify before injecting. Quarantined rows are DROPPED from the
+      // hits actually placed in seat context; the drop is announced, never
+      // silent, because "the council stopped citing that round" is exactly the
+      // kind of change that must not happen invisibly.
+      if (p2Enabled() && shaped.hits.length) {
+        const verdicts = await p2VerifyCandidates(shaped.hits);
+        shaped.hits.forEach((h) => {
+          const v = verdicts.get(h.id);
+          h.p2 = v ? v.state : "UNAUDITED";
+          h.p2reason = v ? v.reason : "not verified";
+        });
+        const held = shaped.hits.filter((h) => h.p2 === "QUARANTINED");
+        shaped.hits = shaped.hits.filter((h) => h.p2 !== "QUARANTINED");
+        if (held.length) {
+          logError("\u26A0 [P2] " + held.length + " retrieved memory/memories WITHHELD from this round's context: " +
+            held.map((h) => String(h.id).slice(0, 8) + "\u2026 (" + h.p2reason + ")").join(", ") +
+            ". The council will answer without them.");
+        }
+      }
       _retrievalCache = {
         key: key,
         candidates: shaped.candidates,
@@ -1542,12 +1848,25 @@
       "DIVIDED and PROVISIONAL rows as unsettled, exactly as in the ledger.\n" +
       "If something is not in this block, that means retrieval did not surface it — it\n" +
       "does NOT mean it did not happen. Do not fill that gap with a plausible answer;\n" +
-      "say you cannot know it from what you were given.\n";
+      "say you cannot know it from what you were given.\n" +
+      (p2Enabled()
+        ? "PROVENANCE: \u2713 ANCHORED rows have a verified receipt and may be cited as\n" +
+          "precedent. \u26AA UNAUDITED rows predate verification or lost their key epoch \u2014\n" +
+          "read them, but do not cite them as settled. Rows that failed verification\n" +
+          "are withheld entirely and are not shown here.\n"
+        : "");
     for (let i = 0; i < hits.length; i++) {
       const h = hits[i];
       const tag = String(h.consensus_status || "unknown").toUpperCase();
+      // v3.6.0: the provenance state travels WITH the memory into the prompt.
+      // A seat that cannot tell a verified memory from an unverified one will
+      // cite both with equal confidence, which is the failure this pillar exists
+      // to prevent — the badge is only useful if the reader sees it.
+      const p2b = h.p2 === "ANCHORED" ? " | \u2713 ANCHORED"
+                : h.p2 === "UNAUDITED" ? " | \u26AA UNAUDITED \u2014 provenance unverified, do not cite as precedent"
+                : "";
       const line = "[match " + (typeof h.similarity === "number" ? h.similarity.toFixed(3) : "?") +
-        " | " + tag + "] Q: \"" + clip(h.prompt, 120) + "\"" +
+        " | " + tag + p2b + "] Q: \"" + clip(h.prompt, 120) + "\"" +
         (h.response ? " \u2192 \"" + clip(h.response, 220) + "\"" : "") + "\n";
       if (out.length + line.length > charBudget) break;
       out += line;
@@ -1710,6 +2029,92 @@
     } catch (e) {
       logError("[FLOOR] read threw: " + ((e && e.message) || e));
     }
+  }
+
+  // ---------- v3.6.0: Pillar 2 audit console ----------
+  // Everything the layer knows, on demand, in the drawer. This is where the
+  // chain verification lives (see the deviation note in the module header).
+  async function p2Console() {
+    if (!sbConfigured()) { logError("[P2] Supabase not configured."); return; }
+    if (!p2Enabled()) { logError("[P2] No provenance secret set \u2014 the layer is dormant. Settings \u2192 PILLAR 2 PROVENANCE SECRET to arm it."); return; }
+    const H = p2Headers(), B = p2Base();
+    try {
+      const [st, quar, aud] = await Promise.all([
+        fetch(B + "/rest/v1/rq_events?select=pillar2_state", { headers: H }),
+        fetch(B + "/rest/v1/rq_provenance_quarantine?select=round_event_id,mismatch_type,status,created_at&order=created_at.desc&limit=20", { headers: H }),
+        fetch(B + "/rest/v1/rq_audit_trail?select=action,seat_triggered,key_epoch,prev_hmac,hmac_of_change,new_state,created_at&key_epoch=eq." + p2Epoch() + "&order=created_at.asc&limit=1000", { headers: H }),
+      ]);
+      if (!st.ok) {
+        const b = await st.text().catch(() => "");
+        logError("[P2] console read failed HTTP " + st.status + " " + b.slice(0, 200) +
+          (/pillar2_state|column/.test(b) ? " \u2014 rq-pillar2-schema.sql has not been run." : ""));
+        return;
+      }
+      const rows = await st.json().catch(() => []);
+      const tally = {};
+      (rows || []).forEach((r) => { const k = r.pillar2_state || "UNAUDITED"; tally[k] = (tally[k] || 0) + 1; });
+      logError("[P2] LEDGER \u2014 " + (rows || []).length + " row(s): " +
+        Object.keys(tally).sort().map((k) => k + " " + tally[k]).join(", ") + " | current epoch " + p2Epoch() + ".");
+
+      if (quar.ok) {
+        const q = await quar.json().catch(() => []);
+        if (!q.length) logError("[P2] QUARANTINE \u2014 empty. No memory has failed verification.");
+        else {
+          logError("[P2] QUARANTINE \u2014 " + q.length + " entr(y/ies), newest first:");
+          q.forEach((r) => logError("  " + String(r.created_at || "").slice(5, 16).replace("T", " ") +
+            " | " + String(r.round_event_id).slice(0, 8) + "\u2026 | " + r.mismatch_type + " | " + r.status));
+        }
+      }
+
+      // Chain verification, this epoch only. A break tells you WHERE the
+      // sequence diverged, which is the part the per-row HMAC cannot see.
+      if (aud.ok) {
+        const a = await aud.json().catch(() => []);
+        if (!a.length) { logError("[P2] AUDIT CHAIN \u2014 no rows in epoch " + p2Epoch() + " yet."); }
+        else {
+          const key = await p2DeriveKey("audit-trail", P2_INFO + "audit");
+          let prev = null, broken = -1;
+          for (let i = 0; i < a.length; i++) {
+            const want = await p2Hmac(key, String(prev === null ? "" : prev) + "|" + a[i].action + "|" + _p2canon(a[i].new_state));
+            if (want !== a[i].hmac_of_change || (a[i].prev_hmac || null) !== prev) { broken = i; break; }
+            prev = a[i].hmac_of_change;
+          }
+          if (broken === -1) logError("[P2] AUDIT CHAIN \u2014 \u2713 intact across " + a.length + " row(s) in epoch " + p2Epoch() + ".");
+          else logError("\u26A0 [P2] AUDIT CHAIN \u2014 BREAK at row " + (broken + 1) + " of " + a.length +
+            " (" + a[broken].action + ", " + String(a[broken].created_at || "").slice(0, 16) + "). Rows after this point are not sequence-verified.");
+        }
+      }
+    } catch (e) { logError("[P2] console threw: " + ((e && e.message) || e)); }
+  }
+
+  // One-time legacy sweep. Stamps text_hash ONLY on rows written before the
+  // layer existed. They had no nonce, so they get no HMAC and stay UNAUDITED —
+  // this buys text-integrity for history without pretending it was attested.
+  let _p2sweeping = false;
+  async function p2LegacySweep() {
+    if (_p2sweeping) { logError("[P2] sweep already running."); return; }
+    if (!p2Enabled()) { logError("[P2] set a provenance secret first."); return; }
+    _p2sweeping = true;
+    try {
+      const res = await fetch(p2Base() + "/rest/v1/rq_events?select=id,prompt,response,consensus_status&text_hash=is.null&order=created_at.asc&limit=500", { headers: p2Headers() });
+      if (!res.ok) { const b = await res.text().catch(() => ""); logError("[P2] sweep list failed HTTP " + res.status + " " + b.slice(0, 200)); return; }
+      const rows = await res.json().catch(() => []);
+      if (!rows.length) { logError("[P2] sweep \u2014 nothing to do; every row already carries a receipt hash."); return; }
+      logError("[P2] sweep \u2014 " + rows.length + " legacy row(s) without a hash. Stamping text_hash only; they stay UNAUDITED (no nonce ever existed for them).");
+      let ok = 0, fail = 0;
+      for (const r of rows) {
+        const tag = p2TrustTag(r.consensus_status);
+        const hash = await p2Sha256(p2Message(r.prompt, r.response, r.id, tag));
+        if (!hash) { fail++; continue; }
+        const p = await fetch(p2Base() + "/rest/v1/rq_events?id=eq." + encodeURIComponent(r.id), {
+          method: "PATCH", headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+          body: JSON.stringify({ text_hash: hash, trust_tag: tag, pillar2_state: "UNAUDITED" }),
+        });
+        if (p.ok) ok++; else { fail++; logError("[P2] sweep stopped at " + String(r.id).slice(0, 8) + "\u2026 HTTP " + p.status); break; }
+      }
+      logError("[P2] sweep done \u2014 " + ok + " hashed, " + fail + " failed.");
+    } catch (e) { logError("[P2] sweep threw: " + ((e && e.message) || e)); }
+    finally { _p2sweeping = false; }
   }
 
   // ---------- Stage 2 prep: backfill ----------
@@ -2628,6 +3033,49 @@
         } catch (_) {
           logError("[FLOOR] Could not write the override \u2014 localStorage is unavailable (private browsing?).");
         }
+      });
+
+      // v3.6.0 — Pillar 2 console + legacy sweep.
+      const p2b = document.createElement("button");
+      p2b.id = "p2Console"; p2b.type = "button";
+      p2b.textContent = "PILLAR 2 AUDIT CONSOLE";
+      p2b.className = saveSettingsBtn.className || "";
+      p2b.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      fl.parentNode.insertBefore(p2b, fl.nextSibling);
+      p2b.addEventListener("click", async () => {
+        const l = p2b.textContent; p2b.disabled = true; p2b.textContent = "READING\u2026 see Error Logs";
+        try { await p2Console(); } finally { p2b.disabled = false; p2b.textContent = l; }
+      });
+
+      const p2s = document.createElement("button");
+      p2s.id = "p2Sweep"; p2s.type = "button";
+      p2s.textContent = "PILLAR 2: HASH LEGACY ROUNDS";
+      p2s.className = saveSettingsBtn.className || "";
+      p2s.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      p2b.parentNode.insertBefore(p2s, p2b.nextSibling);
+      p2s.addEventListener("click", async () => {
+        if (!window.confirm("Stamp a receipt hash on every round written before Pillar 2.\n\nThey stay UNAUDITED (no nonce ever existed for them) but become tamper-detectable from now on.\n\nProceed?")) return;
+        const l = p2s.textContent; p2s.disabled = true; p2s.textContent = "SWEEPING\u2026 see Error Logs";
+        try { await p2LegacySweep(); } finally { p2s.disabled = false; p2s.textContent = l; }
+      });
+
+      // Regenerate: opens a NEW key epoch. Deliberately behind a confirm that
+      // names the cost, because the cost is real and irreversible — every round
+      // stamped under the old secret becomes unverifiable, permanently, unless
+      // the old secret is restored.
+      const p2r = document.createElement("button");
+      p2r.id = "p2Regen"; p2r.type = "button";
+      p2r.textContent = "PILLAR 2: NEW KEY EPOCH";
+      p2r.className = saveSettingsBtn.className || "";
+      p2r.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      p2s.parentNode.insertBefore(p2r, p2s.nextSibling);
+      p2r.addEventListener("click", async () => {
+        if (!p2Enabled()) { logError("[P2] set a provenance secret first."); return; }
+        if (!window.confirm("Open key epoch " + (p2Epoch() + 1) + "?\n\nDo this ONLY after changing the Provenance Secret.\n\nEvery round stamped under epoch " + p2Epoch() + " becomes UNAUDITED \u2014 readable and un-deleted, but no longer citable as verified. This cannot be undone without the old secret.\n\nProceed?")) return;
+        settings.provenanceEpoch = p2Epoch() + 1;
+        saveSettings(settings);
+        await p2AppendAudit("KEY_RESET", null, { epoch: p2Epoch() - 1 }, { epoch: p2Epoch() }, "operator");
+        logError("[P2] Key epoch is now " + p2Epoch() + ". Prior-epoch rounds degrade to UNAUDITED at verification \u2014 they are not quarantined and not deleted.");
       });
 
       k3.addEventListener("click", () => {
@@ -3676,6 +4124,11 @@
       // rather than letting the chain end quietly.
       if (row && row.id) {
         embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse);
+        // v3.6.0 — stamp the receipt. Detached like the embed: a crypto or
+        // network failure here must never delay or fail a round. Same text that
+        // was written to the row, so the hash covers what retrieval will read.
+        p2StampRound(row.id, _evPrompt, _evResponse, _evStatus,
+          (result && result.speakerSeat) || (result && result.divided ? "council (divided)" : "council"));
         // Detached on purpose — shadow retrieval must not delay the round or
         // the embedding write, and its failures are diagnostic only.
         runRetrievalShadow(row.id, _evPrompt, _evClass, _seatDegraded, _injectedThisRound);
@@ -4477,6 +4930,9 @@
         logError("[FLOOR] \u26A0 Similarity floor is OVERRIDDEN to " + simFloor() + " (ratified default is " +
           RQ_SIM_FLOOR_DEFAULT + "). Rounds this session are not comparable to default-floor rounds.");
       }
+      logError(p2Enabled()
+        ? "[P2] Provenance layer ARMED \u2014 epoch " + p2Epoch() + ". New rounds are receipted; retrieved memories are verified before injection."
+        : "[P2] Provenance layer DORMANT \u2014 no secret set. Retrieval behaves exactly as v3.5.5. Settings \u2192 PILLAR 2 PROVENANCE SECRET to arm it.");
       logError(injectionEnabled()
         ? "[INJECT] Stage 3 injection is ON — retrieved rounds will be placed in seat context. A/B rows this session record injected:true."
         : "[INJECT] Stage 3 injection is OFF — control arm. Settings → STAGE 3 INJECTION to enable.");
