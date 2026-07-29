@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.8.0-p4-meta-export";
+  const RQ_BUILD = "v3.8.1-disjoint-drift";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -2318,6 +2318,101 @@ roundData,
     } catch (e) { logError("[P4] export threw: " + ((e && e.message) || e)); }
   }
 
+  // ---------- v3.8.1: F3 Path A — drift monitor, browser hook ----------
+  // Opens a CANDIDATE case when a new round lands close to an already-ANCHORED
+  // one. Path A only: zero extra calls, because it reads the retrieval that
+  // already ran for injection. Path B (the daily cron scan with a classifier)
+  // stays unbuilt — it needs the edge-function decision.
+  //
+  // A CANDIDATE IS NOT A CONTRADICTION. High cosine similarity means "these two
+  // rounds are about the same thing", which is equally true of a contradiction,
+  // a refinement, and a plain restatement. Nothing here classifies; the case
+  // exists so a human can look. Calling a similarity score a contradiction is
+  // exactly the confabulation this project keeps finding in its own seats.
+  const P4_DRIFT_FLOOR = 0.85;   // deliberately far above the 0.6 retrieval floor
+  function driftEnabled() { return localStorage.getItem("rq_p4_drift") === "on"; }
+
+  async function p4DriftHook(roundId, result) {
+    if (!driftEnabled() || !sbConfigured() || !roundId) return;
+    // Only rounds that CLAIM something can contradict a prior claim. A DIVIDED
+    // round asserts nothing the council stands behind.
+    if (result.divided || !(result.trust === "verified" || result.trust === "provisional")) return;
+    try {
+      const cache = _retrievalCache;
+      if (!cache || !cache.candidates || !cache.candidates.length) return;
+      const near = cache.candidates.filter((c) =>
+        c.id && c.id !== roundId &&
+        typeof c.similarity === "number" && c.similarity >= P4_DRIFT_FLOOR);
+      if (!near.length) return;
+
+      // Only ANCHORED priors. An UNAUDITED or quarantined row is not settled
+      // history and cannot be contradicted in any meaningful sense.
+      const ids = near.map((c) => c.id);
+      const q = "(" + ids.map((i) => '"' + i + '"').join(",") + ")";
+      const pr = await fetch(p2Base() +
+        "/rest/v1/rq_events?select=id,text_hash,pillar2_state,consensus_status&id=in." + encodeURIComponent(q),
+        { headers: p2Headers() });
+      if (!pr.ok) return;
+      const priors = await pr.json().catch(() => []);
+      const anchored = (priors || []).filter((p) =>
+        p.pillar2_state === "ANCHORED" && p.consensus_status === "verified");
+      if (!anchored.length) return;
+
+      for (const p of anchored) {
+        // Dedupe: one case per unordered pair, ever.
+        const ex = await fetch(p2Base() +
+          "/rest/v1/rq_consensus_deltas?select=id&or=(and(prior_event_id.eq." + p.id + ",new_event_id.eq." + roundId +
+          "),and(prior_event_id.eq." + roundId + ",new_event_id.eq." + p.id + "))&limit=1",
+          { headers: p2Headers() });
+        if (ex.ok) { const rows = await ex.json().catch(() => []); if (rows && rows.length) continue; }
+
+        const hit = near.find((c) => c.id === p.id);
+        const res = await fetch(p2Base() + "/rest/v1/rq_consensus_deltas", {
+          method: "POST", headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+          body: JSON.stringify({
+            prior_event_id: p.id, new_event_id: roundId,
+            similarity: hit ? hit.similarity : null,
+            delta_kind: "CANDIDATE", status: "OPEN", detected_by: "browser",
+            prior_text_hash: p.text_hash || null,
+          }),
+        });
+        if (!res.ok) {
+          const b = await res.text().catch(() => "");
+          logError("[P4] delta insert HTTP " + res.status + " " + b.slice(0, 160) +
+            (res.status === 404 ? " \u2014 rq-pillar4-schema.sql has not been run." : ""));
+          return;
+        }
+        logError("[P4] DRIFT CANDIDATE opened \u2014 this round sits " +
+          (hit ? hit.similarity.toFixed(3) : "?") + " from ANCHORED round " + String(p.id).slice(0, 8) +
+          "\u2026 Same topic, both claiming. NOT classified as a contradiction \u2014 that needs a human or a classifier, and neither has looked yet.");
+      }
+    } catch (e) { logError("[P4] drift hook threw: " + ((e && e.message) || e) + " \u2014 round unaffected."); }
+  }
+
+  // Case review. Reading is the whole feature in v1: the operator rules by
+  // running an AUDIT round or by closing the case, and both are deliberate acts.
+  async function p4DriftConsole() {
+    if (!sbConfigured()) { logError("[P4] Supabase not configured."); return; }
+    try {
+      const r = await fetch(p2Base() +
+        "/rest/v1/rq_consensus_deltas?select=id,prior_event_id,new_event_id,similarity,delta_kind,status,detected_by,created_at&order=created_at.desc&limit=25",
+        { headers: p2Headers() });
+      if (!r.ok) {
+        const b = await r.text().catch(() => "");
+        logError("[P4] delta read HTTP " + r.status + " " + b.slice(0, 160)); return;
+      }
+      const rows = await r.json().catch(() => []);
+      if (!rows.length) { logError("[P4] DRIFT \u2014 no cases on record."); return; }
+      const open = rows.filter((x) => x.status === "OPEN").length;
+      logError("[P4] DRIFT \u2014 " + rows.length + " case(s), " + open + " OPEN:");
+      rows.forEach((x) => logError("  " + String(x.created_at).slice(5, 16).replace("T", " ") +
+        " | " + x.delta_kind + " | " + x.status + " | sim " + x.similarity +
+        " | " + String(x.prior_event_id).slice(0, 8) + "\u2026 vs " + String(x.new_event_id).slice(0, 8) +
+        "\u2026 | via " + x.detected_by));
+      if (open) logError("[P4] To rule on a case: read both rounds, then either run an AUDIT round asking the council to reconcile them, or close it in Supabase. Nothing is auto-resolved and no round is ever edited \u2014 P2 receipts would break.");
+    } catch (e) { logError("[P4] drift console threw: " + ((e && e.message) || e)); }
+  }
+
   // ---------- Stage 2/3: retrieval (shadow log + injection) ----------
   // ONE retrieval path, TWO consumers. Stage 2 records what retrieval WOULD have
   // surfaced; Stage 3 injects it. They must not be two implementations — a
@@ -3108,8 +3203,26 @@ roundData,
     // leads because north-mini-code is a CODE model and is a last-resort seat on
     // a deliberation council; see the deny-list in orPickScore.
     gemini: ["inclusionai/ling-3.0-flash:free", "cohere/north-mini-code:free"],
-    kimi:   ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free"],
-    claude: ["nvidia/nemotron-3-super-120b-a12b:free", "google/gemma-4-31b-it:free"],
+    // v3.8.1 (2026-07-28) — THE PERMUTATION BUG, FIXED.
+    // These two chains were PERMUTATIONS of the same pair:
+    //   kimi:   [gemma, nemotron]      claude: [nemotron, gemma]
+    // The family-diversity rule was checked at slot 1 only, so it held on paper
+    // and collapsed the moment either seat walked. Observed live 2026-07-28
+    // 20:51: both seats landed on nemotron, "agreed" at margin 0.238 against a
+    // 0.22 threshold, and the ONLY architecturally distinct model in the round
+    // (GLM 4.7) was excluded as the outlier. Two copies of one model formed a
+    // majority and threw out the independent voice. Round 89 was the same bug.
+    //
+    // Now DISJOINT AT EVERY DEPTH — no model appears in two seats' lists at any
+    // position, so no walk can collide. Families stay distinct too, and none
+    // collide with the non-OpenRouter occupants (Groq Llama on the Claude seat,
+    // Cerebras GLM on the Gemini seat).
+    //
+    // UNVERIFIED BY FABLE — no network here. Run TEST OPENROUTER MODELS after
+    // deploying; anything that 404s, repairDeadFloors replaces from the live
+    // catalog at boot and logs what it chose.
+    kimi:   ["google/gemma-4-31b-it:free", "mistralai/mistral-small-3.2-24b-instruct:free"],
+    claude: ["nvidia/nemotron-3-super-120b-a12b:free", "meta-llama/llama-3.3-70b-instruct:free"],
   };
   const orActiveModel = {}; // seat -> slug currently answering (labels/visuals)
 
@@ -3422,12 +3535,21 @@ roundData,
       const list = OR_SEAT_MODELS[seat] || [];
       if (!list.length) return;
       if (list.some((m) => cat.free.has(m))) return;   // seat still has a floor
+      // v3.8.1: ban the exact SLUGS other seats hold, not only their families.
+      // A family check alone would happily seat the same model twice if its
+      // family were free elsewhere — which is how a repair could re-create the
+      // very collision this build exists to remove.
       const banned = familiesUsedExcept(seat);
+      const takenSlugs = new Set();
+      Object.keys(OR_SEAT_MODELS).forEach((s2) => {
+        if (s2 === seat) return;
+        (OR_SEAT_MODELS[s2] || []).forEach((m) => takenSlugs.add(m));
+      });
       // v3.5.4: was .sort().slice(0,2) — alphabetical. That is how a CODE model
       // (cohere/north-mini-code) ended up seated on a deliberation council on
       // 2026-07-26. Rank by fitness first, alphabetically only to break ties.
       const picks = Array.from(cat.free)
-        .filter((m) => !banned.has(orFamily(m)))
+        .filter((m) => !banned.has(orFamily(m)) && !takenSlugs.has(m))
         .sort((a, b) => (orPickScore(a) - orPickScore(b)) || (a < b ? -1 : a > b ? 1 : 0))
         .slice(0, 2);
       if (!picks.length) {
@@ -3470,6 +3592,31 @@ roundData,
       logError(`  ${seat.toUpperCase()} SEAT — ${live.length} of ${(OR_SEAT_MODELS[seat] || []).length} configured models are live. Family-safe candidates (no collision with other seats): ${ok.length ? ok.join(", ") : "NONE \u2014 every live family is already seated; escalate to Kimi."}`);
     });
     logError("LIST FREE MODELS — advisory only. Nothing was changed. Copy chosen slugs into OR_SEAT_MODELS, then run TEST OPENROUTER MODELS to confirm they answer.");
+  }
+
+  // ---------- v3.8.1: cross-seat collision audit ----------
+  // A CONFIGURATION check, at boot. warnSeatDiversity only fires AFTER a round
+  // has already been scored by two copies of one model; this fires before any
+  // round runs, so a bad chain is caught while it is still theoretical.
+  function auditSeatChains() {
+    try {
+      const where = {};
+      Object.keys(OR_SEAT_MODELS).forEach((seat) => {
+        (OR_SEAT_MODELS[seat] || []).forEach((m, i) => {
+          (where[m] = where[m] || []).push(seat + " slot " + (i + 1));
+        });
+      });
+      const collisions = Object.keys(where).filter((m) =>
+        new Set(where[m].map((x) => x.split(" ")[0])).size > 1);
+      if (collisions.length) {
+        collisions.forEach((m) => logError(
+          "\u26A0 SEAT CHAIN COLLISION \u2014 " + m + " appears in more than one seat's chain (" +
+          where[m].join(", ") + "). If both seats walk to it they agree with themselves, and the " +
+          "consensus engine cannot tell that from independent verification."));
+      } else {
+        logError("\u2713 SEAT CHAINS \u2014 disjoint at every depth; no walk can put one model in two seats.");
+      }
+    } catch (_) {}
   }
 
   // ---------- v3.1 Task 2: Model liveness test ----------
@@ -3760,6 +3907,33 @@ roundData,
         logError(now
           ? "[P4] Fragility scoring ON \u2014 every round is scored and logged to rq_meta_consensus. Shadow only: nothing re-deliberates, no trust tag changes, zero tokens spent."
           : "[P4] Fragility scoring OFF.");
+      });
+
+      const p4d = document.createElement("button");
+      p4d.id = "p4Drift"; p4d.type = "button";
+      p4d.className = saveSettingsBtn.className || "";
+      p4d.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const paintDrift = () => { p4d.textContent = "P4 DRIFT MONITOR: " + (driftEnabled() ? "ON" : "OFF"); };
+      paintDrift();
+      p4m.parentNode.insertBefore(p4d, p4m.nextSibling);
+      p4d.addEventListener("click", () => {
+        const now = !driftEnabled();
+        localStorage.setItem("rq_p4_drift", now ? "on" : "off");
+        paintDrift();
+        logError(now
+          ? "[P4] Drift monitor ON \u2014 a CANDIDATE case opens when a round lands within " + P4_DRIFT_FLOOR + " of an ANCHORED VERIFIED round. Reuses retrieval already run: zero extra calls, zero tokens. Candidates are NOT contradictions; nothing classifies them."
+          : "[P4] Drift monitor OFF. Existing cases are untouched.");
+      });
+
+      const p4c = document.createElement("button");
+      p4c.id = "p4DriftConsole"; p4c.type = "button";
+      p4c.textContent = "P4: DRIFT CASES";
+      p4c.className = saveSettingsBtn.className || "";
+      p4c.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      p4d.parentNode.insertBefore(p4c, p4d.nextSibling);
+      p4c.addEventListener("click", async () => {
+        const l = p4c.textContent; p4c.disabled = true; p4c.textContent = "READING\u2026 see Error Logs";
+        try { await p4DriftConsole(); } finally { p4c.disabled = false; p4c.textContent = l; }
       });
 
       const p4e = document.createElement("button");
@@ -5505,10 +5679,11 @@ roundData,
         // v3.8.0 F2 — fragility scoring, shadow only, detached. Needs the round's
         // Supabase id, which logInstitutionalMemory obtains asynchronously, so it
         // listens for the id rather than racing it.
-        if (PILLAR4.meta()) {
+        if (PILLAR4.meta() || driftEnabled()) {
           document.addEventListener("rq:round-stored", function _once(ev) {
             document.removeEventListener("rq:round-stored", _once);
             try { p4ScoreRound(ev.detail && ev.detail.id, result, result._eligible, result._agreed); } catch (_) {}
+            try { p4DriftHook(ev.detail && ev.detail.id, result); } catch (_) {}
           }, { once: true });
         }
         // Pillar 3 trigger. Detached and flag-gated: with rq_p3_narrator off this
@@ -5666,6 +5841,7 @@ roundData,
         logError("[FLOOR] \u26A0 Similarity floor is OVERRIDDEN to " + simFloor() + " (ratified default is " +
           RQ_SIM_FLOOR_DEFAULT + "). Rounds this session are not comparable to default-floor rounds.");
       }
+      if (driftEnabled()) logError("[P4] Drift monitor ON \u2014 CANDIDATE cases open at similarity \u2265 " + P4_DRIFT_FLOOR + " against ANCHORED VERIFIED rounds.");
       logError(PILLAR4.meta()
         ? "[P4] Fragility scoring ON (shadow) \u2014 rounds scored to rq_meta_consensus, nothing acted on."
         : "[P4] Pillar 4 DORMANT \u2014 scoring off, export on demand. Dream/drift cron features are NOT built.");
@@ -5682,6 +5858,7 @@ roundData,
       // first dispatch, fire-and-forget — which meant Edit 12's floor repair could
       // not land until AFTER that round had already walked a dead list. Still
       // fire-and-forget: advisory work must never delay a round or a page load.
+      auditSeatChains();
       if (settings.keyOpenRouter && !catalogChecked) {
         catalogChecked = true;
         validateOrSeatModels().catch(() => {});
