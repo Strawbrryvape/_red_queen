@@ -1,4 +1,4 @@
- /* Red Queen v2.1 — Command Center logic
+  /* Red Queen v2.1 — Command Center logic
    Demo mode: if no API keys are saved (or Demo Mode is toggled on, or all live
    calls fail), the Council is simulated locally. The UI never shows an error
    box on the main canvas — failures are logged quietly to the drawer. */
@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.7.0-pillar3-narrator";
+  const RQ_BUILD = "v3.8.0-p4-meta-export";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -2109,6 +2109,215 @@ roundData,
     } finally { _p3running = false; }
   }
 
+  // ==================== v3.8.0: PILLAR 4 — F2 SHADOW + F5 EXPORT ====================
+  // Two features only, both browser-side, both zero-spend, both flag-OFF at merge.
+  //
+  // WHAT IS DELIBERATELY NOT HERE: F1 Dream State and F3's cron scan. They
+  // require Supabase Edge Functions, pg_cron, and a service-role key — which is
+  // an architecture change (this project has been browser-only since v1) and an
+  // operator decision, not an engineering detail. The spec's own §11 claims the
+  // edge function can be restricted with "no UPDATE/DELETE grants on rq_events" —
+  // that is false: the service_role key BYPASSES RLS and grants by design, so as
+  // specced the dream writer can rewrite the entire ledger including the audit
+  // trail Pillar 2 depends on. Restricting it needs a dedicated Postgres role.
+  // Until that is designed and the operator has ruled on running server-side
+  // compute at all, F1/F3-cron stay unbuilt.
+  const PILLAR4 = {
+    export:  () => localStorage.getItem("rq_p4_export") === "on",
+    meta:    () => localStorage.getItem("rq_p4_meta") === "on",
+  };
+
+  // ---------- F2: fragility scoring (shadow) ----------
+  // Deterministic arithmetic over values that already exist at round end. No
+  // inference, no new API surface, nothing estimated. Coefficients mirror the
+  // spec default and are overridable from rq_p4_config — the TIER_DECAY lesson
+  // was that a ratified schedule must move by config, not by deploy.
+  const P4_META_W = { margin: 0.40, weight_integrity: 0.25, seat_diversity: 0.20, walk_depth: 0.15 };
+
+  function p4Fragility(result, eligible, agreed) {
+    try {
+      // margin: mean pairwise similarity among AGREEING seats. One agreeing seat
+      // means no margin was ever measured — that is maximum thinness, not
+      // perfect agreement, so it scores 0 rather than 1.
+      let margin = 0;
+      if (agreed.length >= 2) {
+        let sum = 0, n = 0;
+        for (let i = 0; i < agreed.length; i++)
+          for (let j = i + 1; j < agreed.length; j++) { sum += pairSimilarity(agreed[i].text, agreed[j].text); n++; }
+        margin = n ? sum / n : 0;
+      }
+      const base = eligible.reduce((a, s) => a + seatBaseWeight(s.name), 0);
+      const live = eligible.reduce((a, s) => a + seatWeight(s.name), 0);
+      const weightIntegrity = base > 0 ? Math.min(1, live / base) : 0;
+
+      // Reuses the v3.4.6 identity rule rather than a second implementation, so
+      // this and warnSeatDiversity can never disagree about what "degraded" means.
+      const seen = {};
+      let dupe = 0;
+      eligible.forEach((a) => { const m = a.model || seatModelLabel(a.name) || "?"; seen[m] = (seen[m] || 0) + 1; if (seen[m] > 1) dupe = 1; });
+
+      const walk = eligible.length ? eligible.reduce((a, s) => a + Math.min(1, seatTier(s.name) / 3), 0) / eligible.length : 1;
+
+      const f = P4_META_W.margin * (1 - margin)
+              + P4_META_W.weight_integrity * (1 - weightIntegrity)
+              + P4_META_W.seat_diversity * dupe
+              + P4_META_W.walk_depth * walk;
+      const score = Math.max(0, Math.min(1, Math.round(f * 1000) / 1000));
+      return {
+        fragility_score: score,
+        components: { margin: Math.round(margin * 1000) / 1000, weight_integrity: Math.round(weightIntegrity * 1000) / 1000, seat_diversity: dupe, walk_depth: Math.round(walk * 1000) / 1000 },
+        weights_used: P4_META_W,
+        verdict: score > 0.60 ? "FRAGILE" : score > 0.35 ? "WATCH" : "STABLE",
+      };
+    } catch (_) { return null; }
+  }
+
+  // Detached and fail-soft, same doctrine as embedAndStore. A scoring row must
+  // never be able to cost the round it describes.
+  async function p4ScoreRound(roundId, result, eligible, agreed) {
+    if (!PILLAR4.meta() || !sbConfigured() || !roundId) return;
+    try {
+      let row;
+      if (result.divided) {
+        row = { fragility_score: 1.0, components: {}, weights_used: P4_META_W, verdict: "DIVIDED" };
+      } else if (result.trust === "sole") {
+        row = { fragility_score: 1.0, components: {}, weights_used: P4_META_W, verdict: "SOLE" };
+      } else {
+        row = p4Fragility(result, eligible || [], agreed || []);
+        if (!row) return;
+      }
+      // Shadow only. The trigger condition is LOGGED, never acted on — a fragile
+      // VERIFIED is the dangerous case (full-weight agreement on a thin margin),
+      // and knowing how often that happens has to precede spending tokens on it.
+      const wouldTrigger = row.verdict === "FRAGILE" && result.trust === "verified";
+      const res = await fetch(p2Base() + "/rest/v1/rq_meta_consensus", {
+        method: "POST", headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+        body: JSON.stringify({
+          round_event_id: roundId,
+          consensus_status: result.divided ? "divided" : (result.trust || "unknown"),
+          fragility_score: row.fragility_score, components: row.components,
+          weights_used: row.weights_used, verdict: row.verdict,
+          redeliberation_triggered: false, shadow_would_trigger: wouldTrigger,
+          settlement_state: "NOT_APPLICABLE",
+          shadow_settlement_state: (result.trust === "verified")
+            ? (row.verdict === "STABLE" ? "SETTLED" : "SETTLING") : "NOT_APPLICABLE",
+        }),
+      });
+      if (!res.ok) {
+        const b = await res.text().catch(() => "");
+        logError("[P4] meta-consensus insert HTTP " + res.status + " " + b.slice(0, 200) +
+          (res.status === 404 ? " \u2014 rq-pillar4-schema.sql has not been run." : ""));
+        return;
+      }
+      logError("[P4] fragility " + row.fragility_score.toFixed(3) + " \u2014 " + row.verdict +
+        " (margin " + (row.components.margin != null ? row.components.margin : "n/a") +
+        ", weight integrity " + (row.components.weight_integrity != null ? row.components.weight_integrity : "n/a") +
+        ", dupe-seat " + (row.components.seat_diversity || 0) + ", walk " + (row.components.walk_depth != null ? row.components.walk_depth : "n/a") + ")" +
+        (wouldTrigger ? " \u2014 WOULD trigger re-deliberation if live. Shadow only; nothing was re-run." : ""));
+    } catch (e) { logError("[P4] scoring threw: " + ((e && e.message) || e) + " \u2014 round unaffected."); }
+  }
+
+  // ---------- F5: narrative export ----------
+  // Zero inference, pure assembly. Ships first deliberately: it is the only P4
+  // feature with no model calls, and reading every P4 table is the natural smoke
+  // test for the schema. Arcs are QUOTED VERBATIM from rq_narratives — P3 stays
+  // the sole author of the autobiography; this is its publisher.
+  async function p4Export(kind) {
+    if (!sbConfigured()) { logError("[P4] Supabase not configured."); return; }
+    const B = p2Base(), H = p2Headers();
+    const get = async (path) => {
+      try { const r = await fetch(B + "/rest/v1/" + path, { headers: H }); if (!r.ok) return { err: r.status }; return { rows: await r.json() }; }
+      catch (e) { return { err: String(e && e.message || e) }; }
+    };
+    try {
+      logError("[P4] export \u2014 assembling\u2026");
+      const [verified, deltas, divided, arcs, meta, dreams, audit] = await Promise.all([
+        get("rq_events?select=id,prompt,response,consensus_status,pillar2_state,trust_tag,created_at&consensus_status=eq.verified&order=created_at.desc&limit=50"),
+        get("rq_consensus_deltas?select=prior_event_id,new_event_id,delta_kind,status,similarity,created_at&status=eq.OPEN&order=created_at.desc&limit=50"),
+        get("rq_events?select=id,prompt,response,created_at&consensus_status=eq.divided&order=created_at.desc&limit=50"),
+        get("rq_narratives?select=narrative_id,title,summary,start_round,end_round,status,trust_tag,quality_score&order=created_at.asc&limit=100"),
+        get("rq_meta_consensus?select=fragility_score,verdict,created_at&order=created_at.desc&limit=100"),
+        get("rq_dreams?select=dream_id,dream_question,hypothesized_answer,status,created_at&status=eq.APPROVED&order=created_at.desc&limit=50"),
+        get("rq_audit_trail?select=action,key_epoch&limit=1000"),
+      ]);
+
+      // A missing P4 table is stated, never silently rendered as an empty
+      // section — "no open contradictions" and "the contradictions table does
+      // not exist" are very different claims for a reader to be handed.
+      const sec = (label, r, render) => {
+        if (r.err) return "_" + label + " unavailable (HTTP " + r.err + " \u2014 the table may not exist yet; run rq-pillar4-schema.sql)._\n\n";
+        if (!Array.isArray(r.rows) || !r.rows.length) return "_None on record._\n\n";
+        return render(r.rows) + "\n";
+      };
+      const esc = (s) => String(s == null ? "" : s).replace(/\n{3,}/g, "\n\n");
+
+      let md = "# RED QUEEN — STATE OF BELIEF EXPORT\n\n";
+      md += "Generated: " + new Date().toISOString() + "  \nBuild: " + RQ_BUILD +
+            "  \nProvenance layer: " + (p2Enabled() ? "ARMED, epoch " + p2Epoch() : "DORMANT") + "\n\n";
+      md += "> This document is assembled from stored records only. Nothing in it was\n" +
+            "> generated for the export. Autobiography sections are quoted verbatim from\n" +
+            "> the narrator's own output and are not paraphrased here.\n\n";
+
+      md += "## 1. Verified Beliefs\n\n" + sec("Verified beliefs", verified, (rows) =>
+        rows.map((r) => "- **" + (r.pillar2_state || "UNAUDITED") + "** \u00b7 " + String(r.created_at).slice(0, 10) +
+          "\n  - Q: " + esc(clip(r.prompt, 200)) + "\n  - A: " + esc(clip(r.response, 400))).join("\n"));
+
+      md += "## 2. Open Contradictions\n\n" + sec("Contradiction cases", deltas, (rows) =>
+        rows.map((r) => "- " + r.delta_kind + " (" + r.status + ", sim " + r.similarity + ") \u2014 " +
+          String(r.prior_event_id).slice(0, 8) + "\u2026 vs " + String(r.new_event_id).slice(0, 8) + "\u2026").join("\n"));
+
+      md += "## 3. Unresolved Divisions\n\n" + sec("Divided rounds", divided, (rows) =>
+        rows.map((r) => "- " + String(r.created_at).slice(0, 10) + " \u2014 " + esc(clip(r.prompt, 160)) +
+          "\n  - positions: " + esc(clip(r.response, 500))).join("\n"));
+
+      md += "## 4. Autobiography\n\n" + sec("Narrative arcs", arcs, (rows) =>
+        rows.map((r) => "### " + r.title + "\n\n_" + r.narrative_id + " \u00b7 rounds " + r.start_round + "\u2013" + r.end_round +
+          " \u00b7 " + r.status + " \u00b7 quality " + (r.quality_score == null ? "UNSCORED (not injectable)" : r.quality_score) +
+          "_\n\n" + esc(r.summary || "")).join("\n\n"));
+
+      md += "## 5. Consensus Quality\n\n" + sec("Fragility history", meta, (rows) => {
+        const scored = rows.filter((r) => typeof r.fragility_score === "number");
+        const mean = scored.length ? scored.reduce((a, r) => a + r.fragility_score, 0) / scored.length : null;
+        const tally = {};
+        rows.forEach((r) => { tally[r.verdict] = (tally[r.verdict] || 0) + 1; });
+        return "- Rounds scored: " + rows.length +
+          "\n- Mean fragility: " + (mean === null ? "n/a" : mean.toFixed(3)) +
+          "\n- Verdicts: " + Object.keys(tally).sort().map((k) => k + " " + tally[k]).join(", ");
+      });
+
+      md += "## 6. Dream Journal\n\n" + sec("Approved dreams", dreams, (rows) =>
+        rows.map((r) => "- **" + r.dream_id + "** \u00b7 " + String(r.created_at).slice(0, 10) +
+          "\n  - Q: " + esc(r.dream_question) + "\n  - A: " + esc(clip(r.hypothesized_answer, 400))).join("\n"));
+
+      md += "## 7. Provenance Appendix\n\n" + sec("Audit trail", audit, (rows) => {
+        const byAction = {}, byEpoch = {};
+        rows.forEach((r) => { byAction[r.action] = (byAction[r.action] || 0) + 1; byEpoch[r.key_epoch] = (byEpoch[r.key_epoch] || 0) + 1; });
+        return "- Audit rows: " + rows.length +
+          "\n- By action: " + Object.keys(byAction).sort().map((k) => k + " " + byAction[k]).join(", ") +
+          "\n- By key epoch: " + Object.keys(byEpoch).sort().map((k) => "epoch " + k + ": " + byEpoch[k]).join(", ");
+      });
+
+      const hash = await p2Sha256(md);
+      md += "\n---\n\nSHA-256 of this document (excluding this line): `" + (hash || "unavailable") + "`\n";
+
+      const blob = new Blob([md], { type: "text/markdown" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "red-queen-state-of-belief-" + new Date().toISOString().slice(0, 10) + ".md";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+      // Receipt. Best-effort: a missing log table must not cost the export.
+      try {
+        await fetch(B + "/rest/v1/rq_export_log", {
+          method: "POST", headers: Object.assign({}, H, { Prefer: "return=minimal" }),
+          body: JSON.stringify({ export_kind: kind || "markdown", file_hash: hash, build_stamp: RQ_BUILD }),
+        });
+      } catch (_) {}
+      logError("[P4] export complete \u2014 " + md.length + " chars, SHA-256 " + String(hash).slice(0, 16) + "\u2026");
+    } catch (e) { logError("[P4] export threw: " + ((e && e.message) || e)); }
+  }
+
   // ---------- Stage 2/3: retrieval (shadow log + injection) ----------
   // ONE retrieval path, TWO consumers. Stage 2 records what retrieval WOULD have
   // surfaced; Stage 3 injects it. They must not be two implementations — a
@@ -3534,6 +3743,36 @@ roundData,
           : "[P3] Narrator OFF. No arcs are generated. Stored arcs are untouched \u2014 nothing is ever deleted.");
       });
 
+      // v3.8.0 — Pillar 4: shadow scoring + export. Both browser-side and
+      // zero-spend; the dream/drift cron features are NOT built (see the P4
+      // module header for why).
+      const p4m = document.createElement("button");
+      p4m.id = "p4Meta"; p4m.type = "button";
+      p4m.className = saveSettingsBtn.className || "";
+      p4m.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const paintP4 = () => { p4m.textContent = "P4 FRAGILITY SCORING: " + (PILLAR4.meta() ? "ON (shadow)" : "OFF"); };
+      paintP4();
+      p2r.parentNode.insertBefore(p4m, p2r.nextSibling);
+      p4m.addEventListener("click", () => {
+        const now = !PILLAR4.meta();
+        localStorage.setItem("rq_p4_meta", now ? "on" : "off");
+        paintP4();
+        logError(now
+          ? "[P4] Fragility scoring ON \u2014 every round is scored and logged to rq_meta_consensus. Shadow only: nothing re-deliberates, no trust tag changes, zero tokens spent."
+          : "[P4] Fragility scoring OFF.");
+      });
+
+      const p4e = document.createElement("button");
+      p4e.id = "p4Export"; p4e.type = "button";
+      p4e.textContent = "P4: EXPORT STATE OF BELIEF";
+      p4e.className = saveSettingsBtn.className || "";
+      p4e.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      p4m.parentNode.insertBefore(p4e, p4m.nextSibling);
+      p4e.addEventListener("click", async () => {
+        const l = p4e.textContent; p4e.disabled = true; p4e.textContent = "ASSEMBLING\u2026 see Error Logs";
+        try { await p4Export("markdown"); } finally { p4e.disabled = false; p4e.textContent = l; }
+      });
+
       const p3g = document.createElement("button");
       p3g.id = "p3Generate"; p3g.type = "button";
       p3g.textContent = "PILLAR 3: WRITE AN ARC NOW";
@@ -4106,6 +4345,8 @@ roundData,
       agreedCount: agreed.length,
       eligibleCount: eligible.length,
       speakerSeat: seatLabel(speaker.name),
+      _eligible: eligible,   // v3.8.0: F2 scores over the real seat objects
+      _agreed: agreed,       // (pairSimilarity needs .text, not the labels)
       agreedNames: _agreedNames,
       eligibleNames: _eligibleNames,
     };
@@ -4601,6 +4842,7 @@ roundData,
       // but returned nothing to attach an embedding to. Name it explicitly
       // rather than letting the chain end quietly.
       if (row && row.id) {
+        try { document.dispatchEvent(new CustomEvent("rq:round-stored", { detail: { id: row.id } })); } catch (_) {}
         embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse);
         // v3.6.0 — stamp the receipt. Detached like the embed: a crypto or
         // network failure here must never delay or fail a round. Same text that
@@ -5260,6 +5502,15 @@ roundData,
         if (window.__rqIntro) { window.__rqIntro.remove(); window.__rqIntro = null; }
         warnSeatDiversity(result);
         logInstitutionalMemory(dispatchId, query, result);
+        // v3.8.0 F2 — fragility scoring, shadow only, detached. Needs the round's
+        // Supabase id, which logInstitutionalMemory obtains asynchronously, so it
+        // listens for the id rather than racing it.
+        if (PILLAR4.meta()) {
+          document.addEventListener("rq:round-stored", function _once(ev) {
+            document.removeEventListener("rq:round-stored", _once);
+            try { p4ScoreRound(ev.detail && ev.detail.id, result, result._eligible, result._agreed); } catch (_) {}
+          }, { once: true });
+        }
         // Pillar 3 trigger. Detached and flag-gated: with rq_p3_narrator off this
         // is a no-op, and even on it can only run AFTER the round is fully
         // recorded, so a narrator failure can never touch the round that caused it.
@@ -5415,6 +5666,9 @@ roundData,
         logError("[FLOOR] \u26A0 Similarity floor is OVERRIDDEN to " + simFloor() + " (ratified default is " +
           RQ_SIM_FLOOR_DEFAULT + "). Rounds this session are not comparable to default-floor rounds.");
       }
+      logError(PILLAR4.meta()
+        ? "[P4] Fragility scoring ON (shadow) \u2014 rounds scored to rq_meta_consensus, nothing acted on."
+        : "[P4] Pillar 4 DORMANT \u2014 scoring off, export on demand. Dream/drift cron features are NOT built.");
       logError(PILLAR3.enabled() && PILLAR3.narratorPass()
         ? "[P3] Narrator ARMED \u2014 arcs every " + P3_N + " rounds. Retrieval/scoring/UI layers are NOT built; arcs are written and stored only."
         : "[P3] Pillar 3 DORMANT \u2014 no arcs generated, nothing read. Settings \u2192 PILLAR 3 NARRATOR to arm it.");
