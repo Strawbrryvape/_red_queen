@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.8.1-disjoint-drift";
+  const RQ_BUILD = "v3.8.3-shadow-partition";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -3529,37 +3529,103 @@ roundData,
     return 1;
   }
 
+  // v3.8.2 — TOP UP TO DEPTH, not merely rescue from zero.
+  //
+  // THE REGRESSION THIS FIXES, stated plainly because it was mine. v3.8.1 made
+  // the seat chains disjoint, which was right: two seats walking to the same
+  // model had been forming false majorities (2026-07-28 20:51, margin 0.238,
+  // the only distinct model excluded as the outlier). But BOTH of the new slugs
+  // I chose were dead on arrival, and this function only fired when a seat's
+  // ENTIRE list was dead. A seat with one live model and one 404 was left at
+  // WALK DEPTH 1 and never repaired — so when its single live model rate-limited,
+  // the seat VANISHED. The operator saw 2-of-3 seats for seven straight rounds.
+  //
+  // Trading a visible collision for a silently missing seat is a bad trade, and
+  // it is worse than what it replaced. A collision is now detected three ways
+  // (auditSeatChains at boot, warnSeatDiversity per round, the dupe-seat term in
+  // fragility). A vanished seat is detected by nobody and costs a whole voice.
+  //
+  // So: every seat is topped up to MIN_FLOOR_DEPTH live models, disjoint if the
+  // catalog allows it, and BORROWED as an explicit last resort if it does not.
+  // A degraded seat that answers and is flagged beats an empty chair.
+  const MIN_FLOOR_DEPTH = 2;
+
   function repairDeadFloors(cat) {
     if (!cat || !cat.free) return;
     Object.keys(OR_SEAT_MODELS).forEach((seat) => {
       const list = OR_SEAT_MODELS[seat] || [];
       if (!list.length) return;
-      if (list.some((m) => cat.free.has(m))) return;   // seat still has a floor
-      // v3.8.1: ban the exact SLUGS other seats hold, not only their families.
-      // A family check alone would happily seat the same model twice if its
-      // family were free elsewhere — which is how a repair could re-create the
-      // very collision this build exists to remove.
+      const live = list.filter((m) => cat.free.has(m));
+      const dead = list.filter((m) => !cat.free.has(m));
+      if (live.length >= MIN_FLOOR_DEPTH) return;      // already has real depth
+
       const banned = familiesUsedExcept(seat);
       const takenSlugs = new Set();
       Object.keys(OR_SEAT_MODELS).forEach((s2) => {
         if (s2 === seat) return;
         (OR_SEAT_MODELS[s2] || []).forEach((m) => takenSlugs.add(m));
       });
-      // v3.5.4: was .sort().slice(0,2) — alphabetical. That is how a CODE model
-      // (cohere/north-mini-code) ended up seated on a deliberation council on
-      // 2026-07-26. Rank by fitness first, alphabetically only to break ties.
-      const picks = Array.from(cat.free)
-        .filter((m) => !banned.has(orFamily(m)) && !takenSlugs.has(m))
-        .sort((a, b) => (orPickScore(a) - orPickScore(b)) || (a < b ? -1 : a > b ? 1 : 0))
-        .slice(0, 2);
+      const own = new Set(live);
+
+      // v3.5.4: ranked by fitness, not alphabetically — that is how a CODE model
+      // (cohere/north-mini-code) ended up seated on a deliberation council.
+      const rank = (arr) => arr.sort((a, b) =>
+        (orPickScore(a) - orPickScore(b)) || (a < b ? -1 : a > b ? 1 : 0));
+
+      const clean = rank(Array.from(cat.free).filter((m) =>
+        !own.has(m) && !takenSlugs.has(m) && !banned.has(orFamily(m))));
+
+      // Second tier: a live model whose FAMILY is already seated elsewhere but
+      // whose slug is not. Kimi's rule is family diversity; a distinct model from
+      // a seated family is a soft collision, not a hard one, and it was already
+      // ruled acceptable for gemma on 2026-07-13.
+      const softFamily = rank(Array.from(cat.free).filter((m) =>
+        !own.has(m) && !takenSlugs.has(m) && banned.has(orFamily(m))));
+
+      let picks = live.slice();
+      const takeFrom = (pool, why) => {
+        while (picks.length < MIN_FLOOR_DEPTH && pool.length) {
+          const m = pool.shift();
+          picks.push(m);
+          logError("\u2714 FLOOR TOP-UP — " + seat + " seat gained " + m + " (" + why + "). Walk depth now " + picks.length + ".");
+        }
+      };
+      takeFrom(clean, "family-safe and held by no other seat");
+      takeFrom(softFamily, "slug unique, family already seated elsewhere \u2014 soft collision, permitted");
+
+      if (picks.length < MIN_FLOOR_DEPTH) {
+        // LAST RESORT: borrow a slug another seat holds, at the DEEPEST slot only.
+        // This can produce the collision v3.8.1 removed, so it is announced in
+        // full and the existing instruments will flag any round it affects. The
+        // alternative is a seat that disappears, which nothing flags at all.
+        const borrow = rank(Array.from(cat.free).filter((m) => !own.has(m) && takenSlugs.has(m)));
+        while (picks.length < MIN_FLOOR_DEPTH && borrow.length) {
+          const m = borrow.shift();
+          picks.push(m);
+          logError("\u26A0 FLOOR TOP-UP (LAST RESORT) — " + seat + " seat gained " + m +
+            ", which ANOTHER SEAT also holds. Placed at the deepest slot, so it is only reached if " +
+            picks.slice(0, -1).join(" and ") + " fail. If two seats do land on it, the round is a false " +
+            "majority: warnSeatDiversity will say so, the audit trail will name both seats, and fragility " +
+            "will score dupe-seat 1. A flagged collision beats a vanished seat \u2014 but swap this when the catalog allows.");
+        }
+      }
+
       if (!picks.length) {
-        logError("\u26A0 FLOOR REPAIR — " + seat + " seat has no live models AND no family-safe replacement exists in the live free catalog. Escalate to Kimi; this seat will vanish if its primary fails.");
+        logError("\u26A0 FLOOR REPAIR — " + seat + " seat has NO live models and the catalog offers no replacement at all. This seat will vanish if its primary fails. Run LIST FREE MODELS.");
         return;
       }
+      if (picks.length === live.length && !dead.length) return;   // nothing changed
+
       OR_SEAT_MODELS[seat] = picks;
-      logError("\u2714 FLOOR REPAIR — " + seat + " seat had ZERO live fallback models (" + list.join(", ") +
-        " \u2014 all 404). Repaired IN MEMORY from the live free catalog: " + picks.join(", ") +
-        ". Family-safe. NOT persisted \u2014 paste these into OR_SEAT_MODELS to make it permanent.");
+      if (dead.length) {
+        logError("\u2714 FLOOR REPAIR — " + seat + " seat: dropped " + dead.join(", ") +
+          " (not in the live free catalog). Chain is now " + picks.join(", ") +
+          ". IN MEMORY only \u2014 paste into OR_SEAT_MODELS to persist.");
+      }
+      if (picks.length < MIN_FLOOR_DEPTH) {
+        logError("\u26A0 " + seat + " seat is at walk depth " + picks.length + " (target " + MIN_FLOOR_DEPTH +
+          "). One rate limit away from vanishing.");
+      }
     });
   }
 
@@ -3611,8 +3677,10 @@ roundData,
       if (collisions.length) {
         collisions.forEach((m) => logError(
           "\u26A0 SEAT CHAIN COLLISION \u2014 " + m + " appears in more than one seat's chain (" +
-          where[m].join(", ") + "). If both seats walk to it they agree with themselves, and the " +
-          "consensus engine cannot tell that from independent verification."));
+          where[m].join(", ") + "). If both seats walk to it they agree with themselves, and the consensus " +
+          "engine cannot tell that from independent verification. Deliberate if it came from a LAST RESORT " +
+          "top-up (a flagged collision beats a vanished seat); a bug if it is hardcoded. warnSeatDiversity " +
+          "and the fragility dupe-seat term will flag any round it actually affects."));
       } else {
         logError("\u2713 SEAT CHAINS \u2014 disjoint at every depth; no walk can put one model in two seats.");
       }
@@ -4079,6 +4147,86 @@ roundData,
     );
   }
 
+  // ---------- v3.8.3: SHADOW_PARTITION detector (K3 ruling, 2026-07-29) ----------
+  // A DIVIDED round is at least three different things wearing one label:
+  //   CONTRADICTION — seats assert incompatible claims. Divergence is the answer.
+  //   PARTITION     — seats each cover a different FACET. Divergence is COVERAGE.
+  //   INDEXICAL     — three correct answers about three different subjects
+  //                   (round 88), already routed separately since v3.5.4.
+  // All three currently score fragility 1.0 and get the same DIVIDED panel.
+  //
+  // WHY NEITHER COMPARATOR CAN DO THIS: lexical Jaccard measures shared
+  // vocabulary; concept mode measures verdict polarity and TF-IDF cosine. Both
+  // ask about SAMENESS. Neither has a notion of complementarity, and no
+  // threshold tuning creates one. The signal lives in the ADJUDICATION output,
+  // which already runs on every divided round and costs nothing more to read.
+  //
+  // Round 83 logged a partition describing itself: "remains DIVIDED after
+  // cross-examination. No seat located a decisive error." Nobody found a flaw
+  // because there was none to find — the seats answered different questions.
+  //
+  // SHADOW ONLY, per K3's ruling: logged beside DIVIDED, changes no label, no
+  // fragility score, no F4 dispatch. Promotion needs 20 shadow rounds plus a
+  // 20-round hand-labelled confusion matrix at >80% precision.
+  const P4_PARTITION_MIN_CHARS = 120;   // Guard A floor
+  function p4DetectPartition(positions, verdicts) {
+    try {
+      if (!positions || positions.length < 2 || !verdicts || !verdicts.length) return null;
+      const reasons = [];
+
+      // Base 1 — every seat must have returned a PARSEABLE verdict. An
+      // unparseable or unavailable seat is recorded as hold, and a round of
+      // failed dispatches would otherwise look like perfect complementary
+      // coverage. This is the guard that stops a rate limit masquerading as
+      // insight.
+      if (verdicts.length !== positions.length) return { partition: false, reason: "not every position returned a verdict" };
+      const unparsed = verdicts.filter((v) => v.parsed !== true);
+      if (unparsed.length) return { partition: false, reason: unparsed.length + " verdict(s) unparseable or seat unavailable" };
+
+      // Base 2 — all HOLD. A counted REFUTE or CONCEDE means a seat located a
+      // real flaw in another position, which is engagement over one shared
+      // proposition: contradiction, not partition.
+      const engaged = verdicts.filter((v) => v.counted && (v.verdict === "refute" || v.verdict === "concede"));
+      if (engaged.length) return { partition: false, reason: engaged.length + " counted " + engaged[0].verdict + "(s) — seats located flaws in each other" };
+      if (!verdicts.every((v) => v.verdict === "hold")) return { partition: false, reason: "not all verdicts are HOLD" };
+
+      // Base 3 — no opposing polarity. Seats answering different questions
+      // should not land on opposite conclusions about the same one.
+      const pols = positions.map((p) => verdictPolarity(p.text));
+      const stated = pols.filter((x) => x !== 0);
+      if (stated.length >= 2 && stated.some((x) => x !== stated[0])) {
+        return { partition: false, reason: "opposing verdict polarity across positions" };
+      }
+
+      // GUARD A (K3) — substantive assertion. A HOLD after a null or stub
+      // position is confusion or unavailability, not complementary coverage.
+      const thin = positions.filter((p) => String(p.text || "").trim().length < P4_PARTITION_MIN_CHARS);
+      if (thin.length) return { partition: false, reason: thin.length + " position(s) under " + P4_PARTITION_MIN_CHARS + " chars — too thin to be a facet" };
+
+      // GUARD B (K3) — cross-seat engagement. In a contradiction seats cite each
+      // other's specifics ("Position B incorrectly characterizes..."). In a
+      // partition they do not, because there is nothing of each other's to
+      // dispute. A HOLD that names another position and explains why is
+      // engagement even when it does not rise to a counted REFUTE.
+      const letters = positions.map((p) => p.letter);
+      const engagedHolds = verdicts.filter((v) => {
+        const namesTarget = v.target && letters.indexOf(String(v.target).toUpperCase().replace(/[^A-Z]/g, "").charAt(0)) !== -1;
+        const citesInProse = /\bposition\s+[A-Z]\b/i.test(String(v.error || ""));
+        return (namesTarget && String(v.error || "").trim().length >= 25) || citesInProse;
+      });
+      if (engagedHolds.length) {
+        return { partition: false, reason: engagedHolds.length + " HOLD(s) cite another position directly — engagement, not partition" };
+      }
+
+      reasons.push("all " + verdicts.length + " seats returned parseable HOLD");
+      reasons.push("zero counted refutes or concessions");
+      reasons.push("no opposing polarity");
+      reasons.push("all positions substantive (\u2265" + P4_PARTITION_MIN_CHARS + " chars)");
+      reasons.push("no cross-position citation");
+      return { partition: true, reason: reasons.join("; ") };
+    } catch (e) { return { partition: false, reason: "detector threw: " + ((e && e.message) || e) }; }
+  }
+
   // Run the adjudication round. Returns a resolution object or null.
   async function runAdjudication(originalQuery, rawAnswers, wrappedCalls) {
     if (!adjudicationEnabled()) return null;
@@ -4106,17 +4254,21 @@ roundData,
         const v = parseAdjVerdict(raw);
         if (!v) {
           logError(`ADJUDICATION — ${seatLabel(p.seat)} (Position ${p.letter}) returned no parseable verdict. Treated as HOLD.`);
-          verdicts.push({ letter: p.letter, seat: p.seat, verdict: "hold", target: null, error: "", counted: false });
+          // parsed:false is load-bearing for the PARTITION rule below. An
+          // unparseable verdict looks identical to a HOLD once it is stored, and
+          // a round full of unparseable output would otherwise present as
+          // beautiful complementary coverage.
+          verdicts.push({ letter: p.letter, seat: p.seat, verdict: "hold", target: null, error: "", counted: false, parsed: false });
           continue;
         }
         // The sycophancy guard.
         const substantive = (v.verdict === "concede" || v.verdict === "refute") ? isSubstantiveError(v.error) : true;
         if ((v.verdict === "concede" || v.verdict === "refute") && !substantive) {
           logError(`\u26A0 ADJUDICATION — ${seatLabel(p.seat)} (Position ${p.letter}) ${v.verdict.toUpperCase()}D to ${v.target || "?"} WITHOUT a locatable error ("${clip(v.error, 60)}"). SYCOPHANCY GUARD: does not count. Logged as an unearned concession — trust signal for the Nemotron scoring docket.`);
-          verdicts.push({ letter: p.letter, seat: p.seat, verdict: "hold", target: v.target, error: v.error, counted: false, collapsed: true });
+          verdicts.push({ letter: p.letter, seat: p.seat, verdict: "hold", target: v.target, error: v.error, counted: false, collapsed: true, parsed: true });
         } else {
           logError(`ADJUDICATION — ${seatLabel(p.seat)} (Position ${p.letter}): ${v.verdict.toUpperCase()}${v.target ? " -> " + v.target : ""}${v.error ? " — " + clip(v.error, 80) : ""}`);
-          verdicts.push({ letter: p.letter, seat: p.seat, verdict: v.verdict, target: v.target, error: v.error, counted: true });
+          verdicts.push({ letter: p.letter, seat: p.seat, verdict: v.verdict, target: v.target, error: v.error, counted: true, parsed: true });
         }
       } catch (e) {
         // v3.5.4: was "Treated as HOLD", which reads as a deliberate abstention
@@ -4125,7 +4277,7 @@ roundData,
         // resolution math; now the label says so and the seat is dropped from
         // the denominator below rather than silently blocking a RESOLVED.
         logError(`\u26A0 ADJUDICATION — ${seatLabel(p.seat)} UNAVAILABLE (${e.message || e}). Infrastructure failure, NOT an abstention. Excluded from the resolution denominator.`);
-        verdicts.push({ letter: p.letter, seat: p.seat, verdict: "unavailable", target: null, error: "", counted: false, unavailable: true });
+        verdicts.push({ letter: p.letter, seat: p.seat, verdict: "unavailable", target: null, error: "", counted: false, unavailable: true, parsed: false });
       }
     }
 
@@ -4164,7 +4316,20 @@ roundData,
       : null;
     const collapses = verdicts.filter((v) => v.collapsed).length;
     logError(`ADJUDICATION — remains DIVIDED after cross-examination${collapses ? ` (${collapses} unearned concession(s) rejected by the guard)` : ""}. ${contestedNote ? "Specific contested claims surfaced." : "No seat located a decisive error."}`);
-    return { resolved: false, verdicts, contestedNote };
+
+    // v3.8.3 — shadow partition read. Logged only; the round is still DIVIDED
+    // everywhere it matters, and stays that way until the confusion matrix says
+    // otherwise.
+    const _part = p4DetectPartition(positions, verdicts);
+    if (_part && _part.partition) {
+      logError("\u25C7 SHADOW_PARTITION \u2014 this round looks like COVERAGE, not conflict: " + _part.reason +
+        ". Reading: the seats answered different facets of one question and the whole picture is the three of them together. " +
+        "SHADOW ONLY \u2014 the round is still tagged DIVIDED, fragility is unchanged, and F4 is untouched. " +
+        "Hand-label this round so it can enter the confusion matrix.");
+    } else if (_part) {
+      logError("[SHADOW_PARTITION] not a partition \u2014 " + _part.reason + ". Reading: genuine contradiction or an unresolved dispatch.");
+    }
+    return { resolved: false, verdicts, contestedNote, shadowPartition: !!(_part && _part.partition), shadowPartitionReason: _part ? _part.reason : null };
   }
 
   async function runLiveCouncil(query) {
