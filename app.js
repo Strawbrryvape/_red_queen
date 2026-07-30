@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.8.3-shadow-partition";
+  const RQ_BUILD = "v3.8.4-partition-degraded";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -677,7 +677,19 @@
         messages: [{ role: "user", content: query }],
       }),
     }, "Claude");
-    if (!res.ok) throw new Error(`Claude HTTP ${res.status}${res.status === 429 ? " — rate limit persisted after retries" : ""}`);
+    if (!res.ok) {
+      // v3.8.4: surface the RESPONSE BODY. A bare "Claude HTTP 400" has been
+      // logged repeatedly and diagnoses nothing — the Anthropic API puts the
+      // reason in the body, and a 400 there is one of: invalid model string,
+      // malformed parameter, or CREDIT BALANCE TOO LOW (Anthropic returns that
+      // as 400, not 402). Those need completely different fixes.
+      const body = await res.text().catch(() => "");
+      let detail = body.slice(0, 300);
+      try { const j = JSON.parse(body); if (j && j.error && j.error.message) detail = j.error.type + ": " + j.error.message; } catch (_) {}
+      throw new Error(`Claude HTTP ${res.status}` +
+        (res.status === 429 ? " — rate limit persisted after retries" : "") +
+        (detail ? " — " + detail : " — no error body returned"));
+    }
     const data = await res.json();
     return data.content?.map((b) => b.text || "").join("") || "";
   }
@@ -4174,25 +4186,51 @@ roundData,
       if (!positions || positions.length < 2 || !verdicts || !verdicts.length) return null;
       const reasons = [];
 
-      // Base 1 — every seat must have returned a PARSEABLE verdict. An
-      // unparseable or unavailable seat is recorded as hold, and a round of
-      // failed dispatches would otherwise look like perfect complementary
-      // coverage. This is the guard that stops a rate limit masquerading as
-      // insight.
-      if (verdicts.length !== positions.length) return { partition: false, reason: "not every position returned a verdict" };
-      const unparsed = verdicts.filter((v) => v.parsed !== true);
-      if (unparsed.length) return { partition: false, reason: unparsed.length + " verdict(s) unparseable or seat unavailable" };
+      // v3.8.4 — EVALUATE OVER THE SEATS THAT ACTUALLY ANSWERED.
+      //
+      // v3.8.3 disqualified any round with a single unparseable-or-unavailable
+      // verdict. Correct in principle, useless in practice: the Claude seat has
+      // been 400ing on its primary and then 429ing on OpenRouter, so it returns
+      // no verdict, and the detector rejected two consecutive rounds on
+      // INFRASTRUCTURE rather than on epistemics. A textbook partition would
+      // never have been read as one. The operator called this correctly.
+      //
+      // The distinction that makes it safe to relax:
+      //   UNAVAILABLE  — the seat never rendered. Infrastructure. It holds no
+      //                  position, so it is EXCLUDED from the population rather
+      //                  than counted as a hold. Excluding a silent seat cannot
+      //                  manufacture agreement between the ones that spoke.
+      //   UNPARSEABLE  — the seat DID respond and we cannot read its verdict.
+      //                  It may have refuted. That is genuine unknown and still
+      //                  DISQUALIFIES, because reading it as a hold is exactly
+      //                  the guess this detector exists to avoid.
+      //
+      // A degraded read is still a read, but it is labelled: at n<m the result
+      // carries DEGRADED and the count, so the confusion matrix can weight it
+      // rather than treating a 2-seat partition as equal evidence to a 3-seat one.
+      const unavailable = verdicts.filter((v) => v.unavailable);
+      const unparsed = verdicts.filter((v) => v.parsed !== true && !v.unavailable);
+      if (unparsed.length) {
+        return { partition: false, reason: unparsed.length + " verdict(s) unparseable \u2014 the seat spoke and its verdict cannot be read, so a HOLD cannot be assumed" };
+      }
+      const live = verdicts.filter((v) => v.parsed === true);
+      if (live.length < 2) {
+        return { partition: false, reason: "only " + live.length + " seat(s) returned a readable verdict \u2014 fewer than two positions cannot partition anything" };
+      }
+      const liveSeats = new Set(live.map((v) => v.seat));
+      const livePositions = positions.filter((p) => liveSeats.has(p.seat));
+      const degraded = live.length < positions.length;
 
-      // Base 2 — all HOLD. A counted REFUTE or CONCEDE means a seat located a
-      // real flaw in another position, which is engagement over one shared
-      // proposition: contradiction, not partition.
-      const engaged = verdicts.filter((v) => v.counted && (v.verdict === "refute" || v.verdict === "concede"));
+      // Base 2 — all HOLD among the seats that answered. A counted REFUTE or
+      // CONCEDE means a seat located a real flaw in another position, which is
+      // engagement over one shared proposition: contradiction, not partition.
+      const engaged = live.filter((v) => v.counted && (v.verdict === "refute" || v.verdict === "concede"));
       if (engaged.length) return { partition: false, reason: engaged.length + " counted " + engaged[0].verdict + "(s) — seats located flaws in each other" };
-      if (!verdicts.every((v) => v.verdict === "hold")) return { partition: false, reason: "not all verdicts are HOLD" };
+      if (!live.every((v) => v.verdict === "hold")) return { partition: false, reason: "not all readable verdicts are HOLD" };
 
       // Base 3 — no opposing polarity. Seats answering different questions
       // should not land on opposite conclusions about the same one.
-      const pols = positions.map((p) => verdictPolarity(p.text));
+      const pols = livePositions.map((p) => verdictPolarity(p.text));
       const stated = pols.filter((x) => x !== 0);
       if (stated.length >= 2 && stated.some((x) => x !== stated[0])) {
         return { partition: false, reason: "opposing verdict polarity across positions" };
@@ -4200,7 +4238,7 @@ roundData,
 
       // GUARD A (K3) — substantive assertion. A HOLD after a null or stub
       // position is confusion or unavailability, not complementary coverage.
-      const thin = positions.filter((p) => String(p.text || "").trim().length < P4_PARTITION_MIN_CHARS);
+      const thin = livePositions.filter((p) => String(p.text || "").trim().length < P4_PARTITION_MIN_CHARS);
       if (thin.length) return { partition: false, reason: thin.length + " position(s) under " + P4_PARTITION_MIN_CHARS + " chars — too thin to be a facet" };
 
       // GUARD B (K3) — cross-seat engagement. In a contradiction seats cite each
@@ -4208,8 +4246,8 @@ roundData,
       // partition they do not, because there is nothing of each other's to
       // dispute. A HOLD that names another position and explains why is
       // engagement even when it does not rise to a counted REFUTE.
-      const letters = positions.map((p) => p.letter);
-      const engagedHolds = verdicts.filter((v) => {
+      const letters = livePositions.map((p) => p.letter);
+      const engagedHolds = live.filter((v) => {
         const namesTarget = v.target && letters.indexOf(String(v.target).toUpperCase().replace(/[^A-Z]/g, "").charAt(0)) !== -1;
         const citesInProse = /\bposition\s+[A-Z]\b/i.test(String(v.error || ""));
         return (namesTarget && String(v.error || "").trim().length >= 25) || citesInProse;
@@ -4218,12 +4256,14 @@ roundData,
         return { partition: false, reason: engagedHolds.length + " HOLD(s) cite another position directly — engagement, not partition" };
       }
 
-      reasons.push("all " + verdicts.length + " seats returned parseable HOLD");
+      reasons.push("all " + live.length + " readable verdict(s) are HOLD" +
+        (degraded ? " (DEGRADED: " + live.length + " of " + positions.length + " seats \u2014 " +
+          unavailable.length + " unavailable, excluded as infrastructure)" : ""));
       reasons.push("zero counted refutes or concessions");
       reasons.push("no opposing polarity");
       reasons.push("all positions substantive (\u2265" + P4_PARTITION_MIN_CHARS + " chars)");
       reasons.push("no cross-position citation");
-      return { partition: true, reason: reasons.join("; ") };
+      return { partition: true, degraded: degraded, seats: live.length, of: positions.length, reason: reasons.join("; ") };
     } catch (e) { return { partition: false, reason: "detector threw: " + ((e && e.message) || e) }; }
   }
 
@@ -4322,14 +4362,19 @@ roundData,
     // otherwise.
     const _part = p4DetectPartition(positions, verdicts);
     if (_part && _part.partition) {
-      logError("\u25C7 SHADOW_PARTITION \u2014 this round looks like COVERAGE, not conflict: " + _part.reason +
+      logError("\u25C7 SHADOW_PARTITION" + (_part.degraded ? " (DEGRADED " + _part.seats + "/" + _part.of + ")" : "") +
+        " \u2014 this round looks like COVERAGE, not conflict: " + _part.reason +
         ". Reading: the seats answered different facets of one question and the whole picture is the three of them together. " +
         "SHADOW ONLY \u2014 the round is still tagged DIVIDED, fragility is unchanged, and F4 is untouched. " +
         "Hand-label this round so it can enter the confusion matrix.");
     } else if (_part) {
       logError("[SHADOW_PARTITION] not a partition \u2014 " + _part.reason + ". Reading: genuine contradiction or an unresolved dispatch.");
     }
-    return { resolved: false, verdicts, contestedNote, shadowPartition: !!(_part && _part.partition), shadowPartitionReason: _part ? _part.reason : null };
+    return { resolved: false, verdicts, contestedNote,
+             shadowPartition: !!(_part && _part.partition),
+             shadowPartitionDegraded: !!(_part && _part.degraded),
+             shadowPartitionSeats: _part && _part.seats ? _part.seats + "/" + _part.of : null,
+             shadowPartitionReason: _part ? _part.reason : null };
   }
 
   async function runLiveCouncil(query) {
