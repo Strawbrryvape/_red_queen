@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.8.4-partition-degraded";
+  const RQ_BUILD = "v3.9.1-snapshot-restore";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -2252,6 +2252,12 @@ roundData,
         get("rq_dreams?select=dream_id,dream_question,hypothesized_answer,status,created_at&status=eq.APPROVED&order=created_at.desc&limit=50"),
         get("rq_audit_trail?select=action,key_epoch&limit=1000"),
       ]);
+      // v3.9.0 F1 — eighth query, declared separately so the existing seven
+      // stay untouched. Only issued when the flag is on, so a flag-off export
+      // assembles exactly the same seven sections as v3.8.4.
+      const fullpos = fullTextEnabled()
+        ? await get("rq_events?select=id,prompt,created_at,positions_full&positions_full=not.is.null&order=created_at.desc&limit=50")
+        : { err: "f1-off" };
 
       // A missing P4 table is stated, never silently rendered as an empty
       // section — "no open contradictions" and "the contradictions table does
@@ -2308,6 +2314,25 @@ roundData,
           "\n- By action: " + Object.keys(byAction).sort().map((k) => k + " " + byAction[k]).join(", ") +
           "\n- By key epoch: " + Object.keys(byEpoch).sort().map((k) => "epoch " + k + ": " + byEpoch[k]).join(", ");
       });
+
+      // v3.9.0 F1 — section 8. Same three-way honesty as sec(): missing column
+      // != empty record != data. Lands BEFORE the SHA-256 so the export's own
+      // receipt covers it.
+      if (fullTextEnabled()) {
+        md += "## 8. Full Seat Positions\n\n" + (fullpos.err
+          ? "_Full seat positions unavailable (HTTP " + fullpos.err + " \u2014 the positions_full column may not exist yet; run rq-fulltext-migration.sql)._\n\n"
+          : (!Array.isArray(fullpos.rows) || !fullpos.rows.length
+              ? "_None on record (no rounds recorded with the full-text ledger on, on this project's Supabase)._\n\n"
+              : fullpos.rows.map((r) =>
+                  "- " + String(r.created_at).slice(0, 10) + " \u2014 Q: " + esc(clip(r.prompt, 160)) + "\n" +
+                  Object.keys(r.positions_full || {}).map((sname) => {
+                    const pp = r.positions_full[sname] || {};
+                    return "  - **" + sname + "** (" + (pp.model || "?") + ", w " +
+                      (typeof pp.weight === "number" ? pp.weight : "?") + ", " + (pp.bytes || 0) + " B):\n" +
+                      esc(pp.text || "");
+                  }).join("\n")
+                ).join("\n\n") + "\n\n"));
+      }
 
       const hash = await p2Sha256(md);
       md += "\n---\n\nSHA-256 of this document (excluding this line): `" + (hash || "unavailable") + "`\n";
@@ -3822,6 +3847,32 @@ roundData,
       f2.className = saveSettingsBtn.className || "";
       f2.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
       e2.parentNode.insertBefore(f2, e2.nextSibling);
+      // v3.9.0 — F1 full-text ledger toggle. Same doctrine as the vector memory
+      // toggle: the flag lives in localStorage and a hard cache clear wipes it,
+      // so its state must be restorable without a console and stated out loud.
+      const ft = document.createElement("button");
+      ft.id = "fullTextToggle";
+      ft.type = "button";
+      ft.className = saveSettingsBtn.className || "";
+      ft.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const paintFT = () => {
+        ft.textContent = "FULL-TEXT LEDGER: " + (fullTextEnabled() ? "ON" : "OFF");
+      };
+      paintFT();
+      e2.parentNode.insertBefore(ft, e2.nextSibling);
+      ft.addEventListener("click", () => {
+        try {
+          const now = !fullTextEnabled();
+          localStorage.setItem("rq_fulltext", now ? "on" : "off");
+          paintFT();
+          logError(now
+            ? "[F1] Full-text ledger ON — seat responses stored verbatim (IndexedDB rq_fulltext_v1), clipped only at render."
+            : "[F1] Full-text ledger OFF — new rounds store 300-char clips as v3.8.4. Previously stored full text remains until FORGET / New Session / Clear-all.");
+          if (window.__rqRenderSessions) window.__rqRenderSessions();   // repaint affordances immediately
+        } catch (_) {
+          logError("[F1] Could not write the flag — localStorage is unavailable (private browsing?).");
+        }
+      });
       f2.addEventListener("click", async () => {
         // Kimi's v3.5.0 amendment: backfill walks the whole ledger and should be
         // a decision, not a fat-fingered Settings tap.
@@ -4842,14 +4893,44 @@ roundData,
   const MEMORY_CONTEXT_CHAR_CAP = 6000; // ≈1500 tokens — injection budget (raised from 2400)
   const MEMORY_CONTEXT_HARD_MAX = 8000; // ≈2000 tokens — absolute ceiling; CHAR_CAP must never exceed this
 
+  // v3.9.0 F1 §6.5 — shape guard. A JSON.parse throw already yielded [], but a
+  // parsed NON-ARRAY or junk elements survived into ledger.map(...) and crashed
+  // renderSessions. Flag-INDEPENDENT and inert on well-formed data, so the
+  // flag-off byte-identity contract still holds.
   function loadLedger() {
-    try { return JSON.parse(localStorage.getItem(LEDGER_KEY)) || []; }
-    catch { return []; }
+    try {
+      const raw = JSON.parse(localStorage.getItem(LEDGER_KEY)) || [];
+      if (!Array.isArray(raw)) {
+        logError("[LEDGER] stored ledger was not an array — starting fresh (corrupt data not loaded).");
+        return [];
+      }
+      const good = raw.filter((e) => e && typeof e === "object" && typeof e.t === "number");
+      if (good.length !== raw.length) logError("[LEDGER] dropped " + (raw.length - good.length) + " malformed ledger entr(ies) on load.");
+      return good;
+    } catch { return []; }
   }
   let ledger = loadLedger();
 
   function persistLedger() {
-    try { localStorage.setItem(LEDGER_KEY, JSON.stringify(ledger)); }
+    try {
+      // v3.9.0 F1 — localStorage persists the LEAN PROJECTION. fullText lives in
+      // IndexedDB + session memory only. Entries without fullText (flag off,
+      // legacy) pass through BY REFERENCE, so with the flag off `lean` is
+      // elementwise-identical to `ledger` and the serialized string is
+      // byte-identical to v3.8.4.
+      const lean = ledger.map((e) => {
+        if (!e || !e.positions || !e.positions.some((p) => p && p.fullText !== undefined)) return e;
+        return Object.assign({}, e, {
+          positions: e.positions.map((p) => {
+            if (!p || p.fullText === undefined) return p;
+            const lp = Object.assign({}, p);
+            delete lp.fullText;
+            return lp;
+          }),
+        });
+      });
+      localStorage.setItem(LEDGER_KEY, JSON.stringify(lean));
+    }
     catch (e) { logError("Ledger persist failed (localStorage full?) — memory continues in-page only. " + (e.message || e)); }
   }
 
@@ -4868,15 +4949,637 @@ roundData,
   // be mistaken for verdicts by extractDirective. Neutralize on write.
   const sanitizeMemory = (s) => (s ? s.replace(/FINAL DIRECTIVE:/gi, "FINAL VERDICT —") : s);
 
+
+  // ==================== v3.9.1: F2 — Ledger Snapshot / Restore ====================
+  // One-click export of the browser ledger to a self-contained JSON file, and a
+  // VALIDATED restore in Replace or Merge mode.
+  //
+  // PRIVACY, hard rule: the file NEVER contains anything from rq_settings_v21.
+  // No API keys, no Supabase URL or anon key, no feature flags. The roster block
+  // carries provider/model/weight LABELS only — the same strings the seat health
+  // badges already render.
+  //
+  // RESTORE CHANGES WHAT THE SEATS READ. F1 and F3 do not; this does. A restore
+  // mutates `ledger`, and the very next dispatch prepends that ledger to every
+  // seat's prompt via buildMemoryContext. It is an operator act of the same class
+  // as FORGET or New Session, the chooser modal says so in plain English before
+  // confirming, and the drawer receipt is the audit line. CHIM makes restored
+  // memory INDISTINGUISHABLE from native memory — that log line is the only
+  // record that a substitution happened.
+  //
+  // ROUND NUMBERS ARE POSITIONAL AND PER-DEVICE. There is no round_number
+  // anywhere in this system; UI numbers are index+1 into this device's ledger.
+  // The file carries an ordered SEQUENCE, never numbers. `t` (Date.now()) travels
+  // verbatim because it is the IndexedDB fullText key and the merge dedupe key —
+  // an identity, never a display number.
+  //
+  // GATED: default OFF. With the flag off there is no UI and no code path.
+  const SNAPSHOT_SCHEMA_VERSION = 1;
+
+  function snapshotEnabled() { return localStorage.getItem("rq_snapshot") === "on"; }
+
+  function snapshotStamp(d) {
+    const p = (n) => String(n).padStart(2, "0");
+    return String(d.getFullYear()) + p(d.getMonth() + 1) + p(d.getDate()) + "-" +
+           p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+  }
+
+  // THE canonical position -> raw-seat mapping, textually identical to F1's
+  // recordLedger write path and hydratePosition read path. If one changes, all
+  // three change. Required because the IDB store keys fullText by RAW seat name
+  // while positions[].seat is a dynamic seatLabel() string.
+  function rawSeatForPosition(entry, posIdx) {
+    const pos = (entry && entry.positions && entry.positions[posIdx]) || {};
+    return (entry.seats && entry.seats[posIdx] && entry.seats[posIdx].n)
+        || String(pos.seat || "").split(" ")[0].toLowerCase();
+  }
+
+  // Labels only — never key material. Built from the live seat functions so the
+  // same code produces the export roster and the restore-time comparison.
+  function currentRosterForComparison() {
+    const out = {};
+    ["gemini", "kimi", "claude"].forEach((n) => {
+      try {
+        out[n] = { provider: configuredProvider(n), model: seatModelLabel(n), weight: seatBaseWeight(n) };
+      } catch (_) { out[n] = { provider: "unknown", model: "unknown", weight: null }; }
+    });
+    return out;
+  }
+
+  function downloadJson(filename, text) {
+    const blob = new Blob([text], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  let _snapExporting = false;
+  async function exportLedgerSnapshot() {
+    if (!snapshotEnabled()) return;
+    if (_snapExporting) return;
+    _snapExporting = true;
+    const btn = document.getElementById("rqSnapshotExport");
+    const label = btn ? btn.textContent : null;
+    if (btn) { btn.disabled = true; btn.textContent = "EXPORTING\u2026"; }
+    try {
+      logError("[SNAPSHOT] export \u2014 assembling\u2026");
+      // Captured BY SLICE at click time: a concurrent recordLedger push during
+      // hydration cannot mutate the snapshot mid-flight. Entries are never
+      // mutated after being written, so a shallow slice is sufficient.
+      const entries = ledger.slice();
+      let hydrated = 0, idbWarned = false;
+      const rounds = [];
+      for (let ei = 0; ei < entries.length; ei++) {
+        const e = entries[ei];
+        const out = {
+          t: e.t, prompt: e.prompt, outcome: e.outcome,
+          counts: e.counts, verdict: e.verdict === undefined ? null : e.verdict,
+        };
+        if (e.seats) out.seats = e.seats;
+        if (e.positions) {
+          const posOut = [];
+          for (let pi = 0; pi < e.positions.length; pi++) {
+            const p = e.positions[pi] || {};
+            const q = { seat: p.seat, text: p.text };
+            ["hasFull", "bytes", "provider", "model", "weight"].forEach((k) => {
+              if (p[k] !== undefined) q[k] = p[k];
+            });
+            let ft = null;
+            if (typeof p.fullText === "string") {
+              ft = p.fullText;                                  // fast path: in-memory (F1 same-session)
+            } else if (p.hasFull === true && typeof readFullText === "function") {
+              try {
+                const map = await readFullText(e.t);            // IDB path
+                const raw = rawSeatForPosition(e, pi);
+                if (map && typeof map[raw] === "string") ft = map[raw];
+                else if (!map && !idbWarned) {
+                  idbWarned = true;
+                  logError("[SNAPSHOT] fullText store unavailable — exporting clips only.");
+                }
+              } catch (_) {}
+            }
+            // fullText and clipped are MUTUALLY EXCLUSIVE — exactly one is set.
+            if (typeof ft === "string") { q.fullText = ft; hydrated++; }
+            else { q.clipped = true; }
+            posOut.push(q);
+          }
+          out.positions = posOut;
+        }
+        rounds.push(out);
+      }
+      const envelope = {
+        app: "redqueen",
+        kind: "ledger-snapshot",
+        schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+        exportedAt: new Date().toISOString(),
+        buildStamp: RQ_BUILD,
+        roundCount: rounds.length,
+        roster: currentRosterForComparison(),
+        rounds: rounds,   // ledger order IS oldest-first; renderSessions reverses only for display
+      };
+      const text = JSON.stringify(envelope, null, 2);
+      const filename = "redqueen-snapshot-" + snapshotStamp(new Date()) + "-" + rounds.length + ".json";
+      downloadJson(filename, text);
+      try { sessionStorage.setItem("rq_snapshot_done_session", "1"); } catch (_) {}
+      logError("[SNAPSHOT] export complete — " + rounds.length + " rounds (" + hydrated +
+        " with full text), " + text.length + " chars → " + filename);
+      maybeShowSnapshotBanner();
+    } catch (e) {
+      logError("[SNAPSHOT] export threw: " + ((e && e.message) || e));
+    } finally {
+      _snapExporting = false;
+      if (btn) { btn.disabled = false; if (label) btn.textContent = label; }
+    }
+  }
+
+  // PURE and synchronous. Touches no live state — a failed validation leaves the
+  // ledger byte-identical because nothing is mutated before the operator picks a
+  // mode. Collects ALL errors rather than stopping at the first.
+  function validateSnapshot(obj) {
+    const errors = [], warnings = [];
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+      return { ok: false, errors: ["Not a JSON object — this is not a Red Queen ledger snapshot."], warnings: warnings, rounds: null };
+    }
+    if (obj.app !== "redqueen" || obj.kind !== "ledger-snapshot") {
+      errors.push("Not a Red Queen ledger snapshot (app=" + JSON.stringify(obj.app) +
+        ", kind=" + JSON.stringify(obj.kind) + "; expected \"redqueen\" / \"ledger-snapshot\").");
+    }
+    // Strict version gate. A migrator that guesses at a future shape would fail
+    // in the worst direction — silent data misinterpretation. Recognize, reject,
+    // explain; a v2 build ships its own v1->v2 migrator.
+    if (typeof obj.schemaVersion !== "number" || !isFinite(obj.schemaVersion) || obj.schemaVersion < 1) {
+      errors.push("This file does not declare a recognized snapshot schema version.");
+    } else if (obj.schemaVersion > SNAPSHOT_SCHEMA_VERSION) {
+      errors.push("This snapshot was written by a newer build (schema v" + obj.schemaVersion +
+        "). This build reads schema v" + SNAPSHOT_SCHEMA_VERSION + " only — update Red Queen, then retry.");
+    }
+    if (!Array.isArray(obj.rounds)) {
+      errors.push("Missing \"rounds\" array — this is not a Red Queen ledger snapshot.");
+      return { ok: false, errors: errors, warnings: warnings, rounds: null };
+    }
+    const rounds = obj.rounds;
+    if (!Number.isInteger(obj.roundCount) || obj.roundCount !== rounds.length) {
+      warnings.push("Declared roundCount (" + obj.roundCount + ") disagrees with rounds.length (" +
+        rounds.length + ") — using " + rounds.length + ".");
+    }
+    const KNOWN = ["verified", "provisional", "sole", "divided", "resolved", "unknown"];
+    const seenT = new Map();
+    rounds.forEach((r, i) => {
+      if (!r || typeof r !== "object") { errors.push("rounds[" + i + "] is not an object."); return; }
+      if (typeof r.t !== "number" || !isFinite(r.t)) errors.push("rounds[" + i + "].t is missing or not a number.");
+      else {
+        if (seenT.has(r.t)) errors.push("Duplicate timestamp t=" + r.t + " in rounds[" + seenT.get(r.t) +
+          "] and rounds[" + i + "] — the file is ambiguous; not restored.");
+        else seenT.set(r.t, i);
+      }
+      if (typeof r.prompt !== "string") errors.push("rounds[" + i + "].prompt is missing or not a string.");
+      if (typeof r.outcome !== "string") errors.push("rounds[" + i + "].outcome is missing or not a string.");
+      else if (KNOWN.indexOf(r.outcome) === -1) warnings.push("rounds[" + i + "] has an unrecognized outcome \"" +
+        r.outcome + "\" — kept verbatim (render paths tolerate it).");
+      if (!(r.verdict === null || r.verdict === undefined || typeof r.verdict === "string")) {
+        warnings.push("rounds[" + i + "].verdict was not a string or null — coerced to null.");
+        r.verdict = null;
+      }
+      if (r.positions !== undefined) {
+        if (!Array.isArray(r.positions)) errors.push("rounds[" + i + "].positions is present but not an array.");
+        else r.positions.forEach((p, pi) => {
+          if (!p || typeof p !== "object") { errors.push("rounds[" + i + "].positions[" + pi + "] is not an object."); return; }
+          if (typeof p.seat !== "string" || typeof p.text !== "string") {
+            errors.push("rounds[" + i + "].positions[" + pi + "] needs string seat and text.");
+            return;
+          }
+          if (p.fullText !== undefined && typeof p.fullText !== "string") {
+            warnings.push("rounds[" + i + "].positions[" + pi + "] had a non-string fullText — dropped; the position restores as a legacy clip.");
+            delete p.fullText; p.clipped = true;
+          }
+          if (typeof p.fullText === "string" && p.fullText.length > 51200) {
+            warnings.push("rounds[" + i + "].positions[" + pi + "] carries " + p.fullText.length +
+              " chars of full text (>50KB) — imported whole, flagged in the timeline, never truncated.");
+          }
+        });
+      }
+      if (r.seats !== undefined && !Array.isArray(r.seats)) {
+        warnings.push("rounds[" + i + "].seats was not an array — dropped.");
+        delete r.seats;
+      }
+    });
+    // Ordering is a presentation defect with a deterministic repair, and the
+    // rounds' identity is unambiguous — sort, warn, never reject.
+    let outOfOrder = 0;
+    for (let i = 1; i < rounds.length; i++) {
+      const a = rounds[i - 1], b = rounds[i];
+      if (a && b && typeof a.t === "number" && typeof b.t === "number" && b.t < a.t) outOfOrder++;
+    }
+    let ordered = rounds;
+    if (outOfOrder > 0) {
+      ordered = rounds.slice().sort((x, y) => ((x && x.t) || 0) - ((y && y.t) || 0));   // stable in modern JS
+      warnings.push(outOfOrder + " round(s) were re-ordered by timestamp.");
+    }
+    // Roster comparison — labels only, never parsed out of position text.
+    if (!obj.roster || typeof obj.roster !== "object") {
+      warnings.push("Snapshot carries no roster — seat configuration cannot be compared.");
+    } else {
+      const live = currentRosterForComparison();
+      ["gemini", "kimi", "claude"].forEach((n) => {
+        const s = obj.roster[n], c = live[n];
+        if (!s || !c) return;
+        if (s.provider !== c.provider || s.model !== c.model || s.weight !== c.weight) {
+          warnings.push("Seat " + n + ": snapshot \"" + s.model + "\" (provider " + s.provider +
+            ", weight " + s.weight + ") vs current \"" + c.model + "\" (provider " + c.provider +
+            ", weight " + c.weight + ")");
+        }
+      });
+    }
+    const ok = errors.length === 0;
+    return { ok: ok, errors: errors, warnings: warnings, rounds: ok ? ordered : null };
+  }
+
+  // Rebuilds a well-formed ledger entry from a validated snapshot round. Re-runs
+  // sanitizeMemory on every text field — the same anchor-poisoning guard
+  // recordLedger applies on write, so an edited file cannot smuggle live
+  // FINAL DIRECTIVE anchors into seat context.
+  function sanitizeImportedEntry(raw) {
+    let rewritten = 0;
+    const count = (before, after) => { if (before !== after) rewritten++; return after; };
+    const entry = {
+      t: raw.t,
+      prompt: count(raw.prompt, sanitizeMemory(raw.prompt)),
+      outcome: raw.outcome,
+      counts: typeof raw.counts === "string" ? raw.counts : "",
+      verdict: raw.verdict ? count(raw.verdict, sanitizeMemory(raw.verdict)) : (raw.verdict === undefined ? null : raw.verdict),
+    };
+    if (Array.isArray(raw.seats)) entry.seats = raw.seats;
+    if (Array.isArray(raw.positions)) {
+      entry.positions = raw.positions.map((p) => {
+        const q = { seat: p.seat, text: count(p.text, sanitizeMemory(p.text)) };
+        ["provider", "model", "weight"].forEach((k) => { if (p[k] !== undefined) q[k] = p[k]; });
+        if (typeof p.fullText === "string") {
+          q.fullText = count(p.fullText, sanitizeMemory(p.fullText));
+          q.hasFull = true;                        // recomputed, never trusted from the file
+          q.bytes = q.fullText.length;
+        } else if (p.bytes !== undefined && p.hasFull) {
+          // hasFull claimed with no fullText in the file: it is a legacy clip here.
+          q.clipped = true;
+        } else {
+          q.clipped = true;
+        }
+        return q;
+      });
+    }
+    return { entry: entry, rewritten: rewritten };
+  }
+
+  // Detached, fire-and-forget. Prefers F1's writeFullText when present; otherwise
+  // performs the same put directly so F2 is useful in an F1-absent build.
+  function writeImportedFullText(t, positionsBySeat) {
+    try {
+      if (typeof writeFullText === "function") { writeFullText(t, positionsBySeat); return; }
+      if (typeof indexedDB === "undefined") return;
+      const req = indexedDB.open("rq_fulltext_v1", 1);
+      req.onupgradeneeded = () => { try { req.result.createObjectStore("positions"); } catch (_) {} };
+      req.onsuccess = () => {
+        try {
+          const db = req.result;
+          db.transaction("positions", "readwrite").objectStore("positions").put(positionsBySeat, String(t));
+        } catch (_) {}
+      };
+      req.onerror = () => {};
+    } catch (_) {
+      logError("[SNAPSHOT] fullText import failed for one round — clips kept. Round unaffected.");
+    }
+  }
+
+  async function restoreLedgerSnapshot(rounds, meta, mode) {
+    try {
+      // Shared prelude: sanitize + recompute. No mutation of live state yet.
+      let rewritten = 0;
+      const imported = rounds.map((r) => {
+        const s = sanitizeImportedEntry(r);
+        rewritten += s.rewritten;
+        return s.entry;
+      });
+      if (rewritten > 0) logError("[SNAPSHOT] sanitized FINAL DIRECTIVE anchors in " + rewritten + " imported text(s).");
+
+      let fresh = imported, skipped = 0, evicted = 0;
+
+      if (mode === "replace") {
+        // Erasure parity FIRST, so the just-imported fullText (written in the
+        // postlude) is never wiped by it. Guarded for F1-absent builds.
+        if (typeof clearFullTextStore === "function") {
+          try { await clearFullTextStore(); } catch (_) {}
+        }
+        ledger = imported;
+      } else {
+        const seen = new Set(ledger.map((e) => e.t));
+        fresh = imported.filter((e) => !seen.has(e.t));
+        skipped = imported.length - fresh.length;
+        // Original `t` values are kept verbatim — rewriting them would orphan the
+        // IDB keys and break future dedupe. Nothing sorts by `t` (rendering is
+        // array-positional), so a snapshot whose `t`s predate the live ledger is
+        // harmless. Renumbering is natural array continuation.
+        ledger = ledger.concat(fresh);
+        if (ledger.length > LEDGER_MAX_ENTRIES) {
+          evicted = ledger.length - LEDGER_MAX_ENTRIES;
+          ledger = ledger.slice(-LEDGER_MAX_ENTRIES);
+          logError("[SNAPSHOT] merge exceeded the " + LEDGER_MAX_ENTRIES + "-round cap — evicted the oldest " + evicted + " round(s).");
+          if (typeof sweepFullTextOrphans === "function") { try { sweepFullTextOrphans(); } catch (_) {} }
+        }
+      }
+
+      // Shared postlude — detached fullText writes, then persist.
+      (mode === "replace" ? imported : fresh).forEach((e) => {
+        if (!e.positions) return;
+        const bySeat = {};
+        let any = false;
+        e.positions.forEach((p, i) => {
+          if (typeof p.fullText !== "string") return;
+          bySeat[rawSeatForPosition(e, i)] = p.fullText;
+          any = true;
+        });
+        if (any) writeImportedFullText(e.t, bySeat);
+      });
+
+      persistLedger();   // BOTH modes — merges are never memory-only, and this is F3's invalidation choke point
+
+      if (mode === "replace") { try { sessionStorage.setItem("rq_snapshot_done_session", "1"); } catch (_) {} }
+
+      if (memoryPill && memoryPill.refresh) memoryPill.refresh();
+      if (window.__rqRenderSessions) window.__rqRenderSessions();
+      maybeShowSnapshotBanner();
+
+      logError("[SNAPSHOT] restore complete — " + mode.toUpperCase() + ": ledger now " + ledger.length + " round(s)" +
+        (mode === "merge" ? " (" + fresh.length + " appended, " + skipped + " duplicate(s) skipped)" : "") +
+        ". Imported from build " + (meta.buildStamp || "unknown") + ", exported " + (meta.exportedAt || "unknown") +
+        ". The council reads this ledger from the next round onward.");
+    } catch (e) {
+      logError("[SNAPSHOT] restore threw: " + ((e && e.message) || e) + " — ledger may be partially updated; check the timeline.");
+    }
+  }
+
   // Record one completed round. Demo rounds are never recorded — canned
   // answers must not pollute real memory.
   function recordLedger(entry) {
     entry.prompt = sanitizeMemory(entry.prompt);
     if (entry.verdict) entry.verdict = sanitizeMemory(entry.verdict);
-    if (entry.positions) entry.positions.forEach((p) => { p.text = sanitizeMemory(p.text); });
+    if (entry.positions) entry.positions.forEach((p) => {
+      p.text = sanitizeMemory(p.text);
+      if (p.fullText) p.fullText = sanitizeMemory(p.fullText);   // F1 — one function, one anchor-poisoning rule; no-op when absent
+    });
     ledger.push(entry);
-    if (ledger.length > LEDGER_MAX_ENTRIES) ledger = ledger.slice(-LEDGER_MAX_ENTRIES);
+    if (ledger.length > LEDGER_MAX_ENTRIES) {
+      ledger = ledger.slice(-LEDGER_MAX_ENTRIES);
+      if (fullTextEnabled()) sweepFullTextOrphans();             // F1 — detached; trimmed entries orphan their IDB records
+    }
     persistLedger();
+    // F1 — detached verbatim write. Fire-and-forget: the round is already
+    // recorded, and an IDB failure must never reach this caller.
+    if (fullTextEnabled() && entry.positions && entry.positions.some((p) => p && p.hasFull)) {
+      try {
+        const bySeat = {};
+        entry.positions.forEach((p, i) => {
+          if (!p || !p.hasFull) return;
+          // THE canonical position -> raw-seat mapping. seatLabel is DYNAMIC
+          // ("Claude [Groq understudy: Llama 3.3]") and cannot be reproduced at
+          // read time; entry.seats[i].n is stable and in the same order.
+          // F1 write, F1 read (hydratePosition) and F2 export/import all use
+          // this exact expression — if one changes, all three change.
+          const rawSeat = (entry.seats && entry.seats[i] && entry.seats[i].n)
+                       || String(p.seat || "").split(" ")[0].toLowerCase();
+          bySeat[rawSeat] = p.fullText;
+        });
+        writeFullText(entry.t, bySeat);
+        const big = entry.positions.filter((p) => p && p.hasFull && p.bytes > FULLTEXT_OVERSIZE_BYTES);
+        if (big.length) logError("[F1] \u26A0 oversize seat response(s) stored verbatim (" +
+          big.map((p) => p.seat + ": " + p.bytes + " chars").join(", ") +
+          ") — flagged in the timeline, never truncated.");
+      } catch (_) { /* fail-soft: memory still holds fullText for this session */ }
+    }
+  }
+
+  // ==================== v3.9.0: F1 — UNTRUNCATED LEDGER ====================
+  // Store complete verbatim seat responses; truncate at RENDER time only.
+  // Clips remain the only thing CHIM reads; full text lives in IndexedDB,
+  // keyed by entry timestamp; localStorage keeps the lean projection.
+  //
+  // GATED: default OFF. Flip on: localStorage.setItem("rq_fulltext","on").
+  // With the flag off nothing here creates, opens, writes or sweeps a
+  // database — the only exceptions are the erasure hooks (privacy parity
+  // after a flag ON->OFF sequence) and deleteFullText, which PROBES for an
+  // existing DB rather than opening one into existence.
+  //
+  // FAIL-SOFT IS ABSOLUTE: every path is detached and try/caught. Nothing in
+  // this block may delay, block or fail a round. The IDB open promise is
+  // never on the dispatch path.
+  const FULLTEXT_DB = "rq_fulltext_v1";            // frozen foundation §E.3
+  const FULLTEXT_STORE = "positions";              // frozen foundation §E.3
+  const FULLTEXT_OVERSIZE_BYTES = 50 * 1024;       // >50KB warn guard (chars, conservative)
+  let _ftDbPromise = null;                         // memoized IDB open
+  let _ftIdbUnavailable = false;                   // sticky private-mode flag
+  const _ftMem = new Map();                        // session fallback: String(t) -> {seatName: fullText}
+  let _p4FullTextColumn = null;                    // null=unknown, true=ok, false=migration missing
+
+  function fullTextEnabled() { return localStorage.getItem("rq_fulltext") === "on"; }
+
+  function ensureFullTextStore() {
+    if (_ftIdbUnavailable) return Promise.resolve(null);
+    if (_ftDbPromise) return _ftDbPromise;
+    try {
+      _ftDbPromise = new Promise((resolve) => {
+        let req;
+        try { req = indexedDB.open(FULLTEXT_DB, 1); }
+        catch (e) {
+          _ftIdbUnavailable = true;
+          logError("[F1] IndexedDB unavailable (" + (e.message || e) + ") — full text held in memory this session only.");
+          return resolve(null);
+        }
+        req.onupgradeneeded = () => { try { req.result.createObjectStore(FULLTEXT_STORE); } catch (_) {} };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => {
+          _ftIdbUnavailable = true;
+          logError("[F1] IndexedDB open failed — full text held in memory this session only (private browsing?).");
+          resolve(null);
+        };
+        req.onblocked = () => { /* another tab holds the DB — reads fall back to _ftMem; never throw */ };
+      });
+    } catch (e) { _ftIdbUnavailable = true; return Promise.resolve(null); }
+    return _ftDbPromise;
+  }
+
+  function writeFullText(t, positionsBySeat) {
+    const key = String(t);
+    // _ftMem is set SYNCHRONOUSLY before the IDB attempt, so a quota failure
+    // below still leaves this session fully functional.
+    try { _ftMem.set(key, positionsBySeat); } catch (_) {}
+    ensureFullTextStore().then((db) => {
+      if (!db) return;                                             // private mode: _ftMem already holds it
+      try {
+        const tx = db.transaction(FULLTEXT_STORE, "readwrite");
+        tx.objectStore(FULLTEXT_STORE).put(positionsBySeat, key);
+        tx.onerror = () => logError("[F1] full-text IDB write failed for round key " + key +
+          " (quota?) — retained in memory this session. Round unaffected.");
+      } catch (e) { logError("[F1] full-text IDB write threw: " + (e.message || e) + " — round unaffected."); }
+    });
+  }
+
+  function readFullText(t) {
+    const key = String(t);
+    try { if (_ftMem.has(key)) return Promise.resolve(_ftMem.get(key)); } catch (_) {}
+    return ensureFullTextStore().then((db) => {
+      if (!db) return null;
+      return new Promise((resolve) => {
+        try {
+          const rq = db.transaction(FULLTEXT_STORE, "readonly").objectStore(FULLTEXT_STORE).get(key);
+          rq.onsuccess = () => {
+            const v = rq.result || null;
+            if (v) { try { _ftMem.set(key, v); } catch (_) {} }   // back-fill: second expand is instant
+            resolve(v);
+          };
+          rq.onerror = () => resolve(null);
+        } catch (_) { resolve(null); }
+      });
+    });
+  }
+
+  // Three tiers: session memory -> IndexedDB -> null (which the UI renders as
+  // the honest "unavailable on this device" state rather than an empty box).
+  function hydratePosition(entry, seatIdx) {
+    try {
+      const pos = entry && entry.positions && entry.positions[seatIdx];
+      if (!pos) return Promise.resolve(null);
+      if (typeof pos.fullText === "string") return Promise.resolve(pos.fullText);
+      if (!pos.hasFull) return Promise.resolve(null);              // legacy — nothing exists to hydrate
+      const rawSeat = (entry.seats && entry.seats[seatIdx] && entry.seats[seatIdx].n)
+                   || String(pos.seat || "").split(" ")[0].toLowerCase();
+      return readFullText(entry.t).then((m) =>
+        (m && typeof m[rawSeat] === "string") ? m[rawSeat] : null);
+    } catch (_) { return Promise.resolve(null); }
+  }
+
+  function sweepFullTextOrphans() {
+    ensureFullTextStore().then((db) => {
+      if (!db) return;
+      try {
+        const valid = new Set(ledger.map((e) => String(e.t)));
+        const tx = db.transaction(FULLTEXT_STORE, "readwrite");
+        const rq = tx.objectStore(FULLTEXT_STORE).getAllKeys();
+        rq.onsuccess = () => {
+          const orphans = (rq.result || []).filter((k) => !valid.has(String(k)));
+          orphans.forEach((k) => { try { tx.objectStore(FULLTEXT_STORE).delete(k); } catch (_) {} });
+          if (orphans.length) logError("[F1] swept " + orphans.length + " orphaned full-text record(s) (ledger trimmed past " + LEDGER_MAX_ENTRIES + ").");
+        };
+      } catch (_) {}
+    });
+  }
+
+  // Per-round delete. Called UNCONDITIONALLY — deleting a round must delete its
+  // full text whether or not the flag is currently on. But it must never CREATE
+  // the database on a flag-off profile, so it probes indexedDB.databases()
+  // first and falls back to acting only on an already-open connection where
+  // that probe is unsupported.
+  function deleteFullText(t) {
+    const key = String(t);
+    try { _ftMem.delete(key); } catch (_) {}
+    const openIfExists =
+      (typeof indexedDB !== "undefined" && typeof indexedDB.databases === "function")
+        ? indexedDB.databases().then((ds) =>
+            (ds || []).some((d) => d && d.name === FULLTEXT_DB) ? ensureFullTextStore() : null
+          ).catch(() => null)
+        : (_ftDbPromise || Promise.resolve(null));
+    Promise.resolve(openIfExists).then((db) => {
+      if (!db) return;
+      try { db.transaction(FULLTEXT_STORE, "readwrite").objectStore(FULLTEXT_STORE).delete(key); } catch (_) {}
+    });
+  }
+
+  // Total erasure — privacy parity with a ledger wipe. Called unconditionally
+  // by FORGET / New Session / Clear-all, because the user may have recorded
+  // full text earlier and since turned the flag off; erasure must not depend
+  // on the flag. Returns a Promise so F2's Replace can await it.
+  //
+  // The memoized connection is CLOSED FIRST: nulling the promise does not close
+  // the IDBDatabase, and an open connection in this same tab blocks
+  // deleteDatabase — onblocked fires, onsuccess never does, and the erase
+  // silently fails while the log blames another tab.
+  function clearFullTextStore() {
+    try { _ftMem.clear(); } catch (_) {}
+    const p = _ftDbPromise;
+    _ftDbPromise = null; _ftIdbUnavailable = false;
+    return new Promise((resolve) => {
+      const doDelete = () => {
+        let rq;
+        try { rq = indexedDB.deleteDatabase(FULLTEXT_DB); } catch (_) { return resolve(); }
+        rq.onsuccess = () => { logError("[F1] full-text store erased (privacy parity with ledger wipe)."); resolve(); };
+        rq.onerror = () => resolve();
+        rq.onblocked = () => { logError("[F1] full-text erase blocked by another open tab — close other Red Queen tabs to complete it."); resolve(); };
+      };
+      if (p && typeof p.then === "function") p.then((db) => { try { db && db.close(); } catch (_) {} doDelete(); }, doDelete);
+      else doDelete();
+    });
+  }
+
+  // Injected styles, same lazy guard doctrine as ensureSeatHealthStyles.
+  let _ftStyled = false;
+  function ensureFullTextStyles() {
+    if (_ftStyled) return;
+    _ftStyled = true;
+    const style = document.createElement("style");
+    style.textContent = [
+      "#rqSessions .rq-pos { border-top: 1px solid #333; margin-top: 8px; padding-top: 6px; }",
+      "#rqSessions .rq-pos-head { font-size: 0.92em; opacity: 0.9; display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }",
+      "#rqSessions .rq-pos-head.rq-pos-exp { cursor: pointer; }",
+      "#rqSessions .rq-pos-head.rq-pos-exp:hover { opacity: 1; text-decoration: underline dotted; }",
+      "#rqSessions .rq-pos-head.rq-pos-exp::after { content: \" \\25B8\"; opacity: 0.6; }",
+      "#rqSessions .rq-pos.open .rq-pos-head.rq-pos-exp::after { content: \" \\25BE\"; }",
+      "#rqSessions .rq-pos-bytes { font-size: 0.85em; opacity: 0.55; }",
+      "#rqSessions .rq-pos-meta { font-size: 0.85em; opacity: 0.65; }",
+      "#rqSessions .rq-pos-clip { white-space: pre-wrap; margin-top: 4px; }",
+      "#rqSessions .rq-pos.open .rq-pos-clip { display: none; }",
+      "#rqSessions .rq-pos-full { margin-top: 6px; }",
+      "#rqSessions .rq-pos-full.rq-pos-loading { opacity: 0.6; font-style: italic; white-space: pre-wrap; }",
+      "#rqSessions .rq-pos-full.rq-pos-unavail { opacity: 0.7; font-style: italic; white-space: pre-wrap; }",
+      "#rqSessions .rq-badge-clip { font-size: 0.78em; padding: 0 6px; border-radius: 999px; border: 1px solid #d97706; color: #d97706; white-space: nowrap; }",
+      "#rqSessions .rq-badge-oversize { font-size: 0.78em; padding: 0 6px; border-radius: 999px; border: 1px solid #dc2626; color: #dc2626; white-space: nowrap; }",
+    ].join("\n");
+    document.head.appendChild(style);
+  }
+
+  // Expand/collapse ONE seat position in place. Full text is painted only via
+  // renderRich (the app's single DOMPurify-gated innerHTML path); loading and
+  // unavailable states use textContent. No other innerHTML is introduced.
+  function expandSeatPosition(cardEl, entry, posIdx) {
+    const pos = entry && entry.positions && entry.positions[posIdx];
+    if (!pos || !pos.hasFull) return;                       // legacy rows never get the handler
+    const full = cardEl.querySelector(".rq-pos-full");
+    if (!full) return;
+    if (cardEl.classList.contains("open")) {                // collapse
+      cardEl.classList.remove("open");
+      full.style.display = "none";
+      return;
+    }
+    cardEl.classList.add("open");
+    full.style.display = "";
+    if (full.dataset.hydrated === "1") return;              // already painted this render
+    if (typeof pos.fullText === "string") {                 // session fast path — no async, no flash
+      full.dataset.hydrated = "1";
+      renderRich(full, pos.fullText);
+      return;
+    }
+    full.classList.add("rq-pos-loading");
+    full.textContent = "loading full text\u2026";
+    hydratePosition(entry, posIdx).then((text) => {
+      if (!cardEl.isConnected) return;                      // re-rendered away mid-flight (§6.8)
+      full.classList.remove("rq-pos-loading");
+      if (typeof text === "string") {
+        full.dataset.hydrated = "1";
+        renderRich(full, text);
+      } else {
+        full.classList.add("rq-pos-unavail");
+        full.textContent = "full text unavailable on this device (recorded on another device, " +
+          "before this feature, or storage was cleared).";
+      }
+    });
   }
 
   // One ledger entry -> one text line. Trust state ALWAYS travels with
@@ -5061,6 +5764,7 @@ roundData,
       if (!confirm("Erase the council's memory of " + ledger.length + " round(s)? This is permanent.")) return;
       ledger = [];
       persistLedger();
+      clearFullTextStore();   // F1 — privacy parity; unconditional, unawaited
       refresh();
     });
     memoryPill.appendChild(toggle);
@@ -5233,6 +5937,46 @@ roundData,
         // was written to the row, so the hash covers what retrieval will read.
         p2StampRound(row.id, _evPrompt, _evResponse, _evStatus,
           (result && result.speakerSeat) || (result && result.divided ? "council (divided)" : "council"));
+        // v3.9.0 F1 — full positions ride ALONGSIDE the clipped corpus row.
+        // _evPrompt/_evResponse stay clipped at 900: embedding parity and P2
+        // receipts both depend on that text being unchanged, so this column is
+        // never embedded and never rendered into any prompt (prompt_class
+        // doctrine). Detached, flag-gated, and self-disabling if the migration
+        // has not been run — a PATCH cannot "retry without" a key, so a 400
+        // switches it off for the session with ONE drawer line, not one per round.
+        if (fullTextEnabled() && _p4FullTextColumn !== false) {
+          try {
+            const pf = {};
+            ((result && result.answers) || []).forEach((a) => {
+              const ft = sanitizeMemory(String(a.text == null ? "" : a.text));
+              pf[a.name] = {
+                text: ft,
+                provider: a.provider || seatProvider[a.name] || "primary",
+                model: a.model || seatModelLabel(a.name),
+                weight: typeof a.weightLive === "number" ? a.weightLive : seatWeight(a.name),
+                bytes: ft.length,
+              };
+            });
+            fetch(settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/rq_events?id=eq." + row.id, {
+              method: "PATCH",
+              headers: {
+                apikey: settings.supabaseAnonKey,
+                Authorization: "Bearer " + settings.supabaseAnonKey,
+                "Content-Type": "application/json",
+                Prefer: "return=minimal",
+              },
+              body: JSON.stringify({ positions_full: pf }),
+            }).then((r) => {
+              if (r.ok) { _p4FullTextColumn = true; return; }
+              if (r.status === 400) {
+                _p4FullTextColumn = false;
+                logError("[F1] positions_full PATCH 400 — column missing. Run rq-fulltext-migration.sql; full-text writes disabled for this session, rounds unaffected.");
+              } else {
+                logError("[F1] positions_full PATCH failed (HTTP " + r.status + ") — round unaffected.");
+              }
+            }).catch((e) => logError("[F1] positions_full PATCH unreachable: " + (e.message || e) + " — round unaffected."));
+          } catch (_) {}
+        }
         // Detached on purpose — shadow retrieval must not delay the round or
         // the embedding write, and its failures are diagnostic only.
         runRetrievalShadow(row.id, _evPrompt, _evClass, _seatDegraded, _injectedThisRound);
@@ -5511,7 +6255,7 @@ roundData,
     clearAll.style.cssText = statsBtn.style.cssText;
     clearAll.addEventListener("click", () => {
       if (!confirm("Clear the whole timeline? (This also erases the council's memory.)")) return;
-      ledger = []; persistLedger(); renderSessions();
+      ledger = []; persistLedger(); clearFullTextStore(); renderSessions();   // F1 — privacy parity
       if (memoryPill && memoryPill.refresh) memoryPill.refresh();
     });
     title.appendChild(statsBtn);
@@ -5624,15 +6368,80 @@ roundData,
         del.textContent = "delete";
         del.addEventListener("click", (ev) => {
           ev.stopPropagation();
+          deleteFullText(e.t);   // F1 — before the splice, while e is still in scope
           ledger.splice(i, 1); persistLedger(); renderSessions();
           if (memoryPill && memoryPill.refresh) memoryPill.refresh();
         });
         body.appendChild(del);
-        const bodyText = document.createElement("div");
-        bodyText.textContent = "Q: " + e.prompt + "\n\n" + (e.outcome === "divided"
-          ? (e.positions || []).map((p) => p.seat + ":\n" + p.text).join("\n\n")
-          : "Verdict: " + (e.verdict || "—"));
-        body.appendChild(bodyText);
+        // v3.9.0 F1 — full-text-aware body. Flag OFF or no positions: the
+        // v3.8.4 path runs verbatim in the else branch below.
+        if (fullTextEnabled() && (e.positions || []).length) {
+          ensureFullTextStyles();
+          const qDiv = document.createElement("div");
+          qDiv.textContent = "Q: " + e.prompt;
+          body.appendChild(qDiv);
+          if (e.outcome !== "divided") {
+            const vDiv = document.createElement("div");
+            vDiv.style.cssText = "margin-top:6px;";
+            vDiv.textContent = "Verdict: " + (e.verdict || "—");
+            body.appendChild(vDiv);
+          }
+          e.positions.forEach((p, pi) => {
+            const row = document.createElement("div");
+            row.className = "rq-pos";
+            const head = document.createElement("div");
+            head.className = "rq-pos-head";
+            head.textContent = p.seat;
+            if (p.model) {
+              const meta = document.createElement("span");
+              meta.className = "rq-pos-meta";
+              meta.textContent = "· " + p.model + (typeof p.weight === "number" ? " · w " + p.weight : "");
+              head.appendChild(meta);
+            }
+            if (p.hasFull) {
+              const sz = document.createElement("span");
+              sz.className = "rq-pos-bytes";
+              sz.textContent = (p.bytes || 0) + " B";
+              head.appendChild(sz);
+              if ((p.bytes || 0) > FULLTEXT_OVERSIZE_BYTES) {
+                const ob = document.createElement("span");
+                ob.className = "rq-badge-oversize";
+                ob.textContent = "\u26A0 >50KB stored";
+                ob.title = "This seat's response exceeded 50KB. It is stored verbatim — flagged, never truncated.";
+                head.appendChild(ob);
+              }
+            } else {
+              // isLegacy = !p.hasFull. That is the entire rule — never inferred,
+              // never backfilled. No expand control, because there is nothing to
+              // expand to and a dead control would lie.
+              const cb = document.createElement("span");
+              cb.className = "rq-badge-clip";
+              cb.textContent = "\u26A0 clipped";
+              cb.title = "Recorded before the full-text ledger (or with it off) — only this 300-character clip exists.";
+              head.appendChild(cb);
+            }
+            row.appendChild(head);
+            const clipDiv = document.createElement("div");
+            clipDiv.className = "rq-pos-clip";
+            clipDiv.textContent = p.text;                 // displayClip — textContent, untrusted model text
+            row.appendChild(clipDiv);
+            if (p.hasFull) {
+              const fullDiv = document.createElement("div");
+              fullDiv.className = "rq-pos-full";
+              fullDiv.style.display = "none";
+              row.appendChild(fullDiv);
+              head.classList.add("rq-pos-exp");
+              head.addEventListener("click", (ev) => { ev.stopPropagation(); expandSeatPosition(row, e, pi); });
+            }
+            body.appendChild(row);
+          });
+        } else {
+          const bodyText = document.createElement("div");
+          bodyText.textContent = "Q: " + e.prompt + "\n\n" + (e.outcome === "divided"
+            ? (e.positions || []).map((p) => p.seat + ":\n" + p.text).join("\n\n")
+            : "Verdict: " + (e.verdict || "—"));
+          body.appendChild(bodyText);
+        }
         const replay = document.createElement("button");
         replay.className = "rq-replay";
         replay.textContent = "↻ Replay this dispatch";
@@ -5651,6 +6460,210 @@ roundData,
     }
     renderSessions();
     window.__rqRenderSessions = renderSessions;
+  })();
+
+  // ---------- v3.9.1: F2 UI — buttons, drag-drop, modals, banner ----------
+  // Runs AFTER the ensureTimeline IIFE so #rqSessions exists. Imitates
+  // ensureTimeline's own injection rather than editing it, so the whole feature
+  // stays behind one gate. Flag off: this returns immediately, nothing is
+  // injected, and window.__rqMaybeSnapshotBanner stays undefined.
+
+  // Idempotent: shows the banner when every condition holds, REMOVES it when
+  // they stop holding (e.g. after an export, or after FORGET drops the count).
+  function maybeShowSnapshotBanner() {
+    try {
+      if (!snapshotEnabled()) return;
+      const existing = document.getElementById("rqSnapshotBanner");
+      let done = null, dismissed = null;
+      try { done = sessionStorage.getItem("rq_snapshot_done_session"); } catch (_) {}
+      try { dismissed = sessionStorage.getItem("rq_snapshot_dismissed_session"); } catch (_) {}
+      const want = ledger.length > 50 && !done && !dismissed && busy === false;
+      if (!want) { if (existing) existing.remove(); return; }
+      if (existing) return;
+      const banner = document.createElement("div");
+      banner.id = "rqSnapshotBanner";
+      const msg = document.createElement("div");
+      msg.textContent = "Ledger: " + ledger.length + " rounds — no snapshot this session. Save snapshot?";
+      const save = document.createElement("button"); save.textContent = "Save";
+      const dismiss = document.createElement("button"); dismiss.textContent = "Dismiss";
+      save.addEventListener("click", () => { banner.remove(); exportLedgerSnapshot(); });
+      dismiss.addEventListener("click", () => {
+        try { sessionStorage.setItem("rq_snapshot_dismissed_session", "1"); } catch (_) {}
+        banner.remove();
+      });
+      banner.appendChild(msg); banner.appendChild(save); banner.appendChild(dismiss);
+      document.body.appendChild(banner);
+    } catch (_) { /* a banner is a nicety, never a fault */ }
+  }
+
+  // rqModal's innerHTML takes STATIC app copy only (its own comment says so), so
+  // the skeleton is a literal and every dynamic string — file errors, seat
+  // labels, all untrusted — is appended afterwards via textContent.
+  function showSnapshotModal(kind, payload) {
+    if (kind === "errors") {
+      rqModal("<h3>Snapshot not restored</h3><p>This file failed validation. The ledger is unchanged.</p>");
+      const box = document.querySelector(".rq-modal");
+      if (!box) return;
+      const ul = document.createElement("ul");
+      ul.className = "rq-snap-errs";
+      (payload.errors || []).forEach((msg) => {
+        const li = document.createElement("li");
+        li.textContent = msg;
+        ul.appendChild(li);
+      });
+      box.appendChild(ul);
+      return;
+    }
+    // kind === "chooser"
+    const v = payload.v, meta = payload.meta;
+    const freshCount = v.rounds.filter((r) => !ledger.some((e) => e.t === r.t)).length;
+    const dupCount = v.rounds.length - freshCount;
+    const evictPreview = Math.max(0, ledger.length + freshCount - LEDGER_MAX_ENTRIES);
+    rqModal("<h3>Snapshot valid</h3>");
+    const box = document.querySelector(".rq-modal");
+    if (!box) return;
+    const h = box.querySelector("h3");
+    if (h) h.textContent = "Snapshot valid — " + v.rounds.length + " rounds";
+    const sub = document.createElement("p");
+    sub.textContent = "Exported " + (meta.exportedAt || "unknown") + " · build " + (meta.buildStamp || "unknown");
+    box.appendChild(sub);
+    if ((v.warnings || []).length) {
+      const wh = document.createElement("p");
+      wh.textContent = "\u26A0 Warnings:";
+      box.appendChild(wh);
+      const ul = document.createElement("ul");
+      ul.className = "rq-snap-errs";
+      v.warnings.forEach((w) => { const li = document.createElement("li"); li.textContent = w; ul.appendChild(li); });
+      box.appendChild(ul);
+    }
+    const disc = document.createElement("p");
+    // Mandatory copy — this is the seat-context disclosure.
+    disc.textContent = "Restoring rewrites the council's memory: from the next round onward, every seat reads this ledger as its past.";
+    box.appendChild(disc);
+
+    const close = () => { const sc = document.querySelector(".rq-modal-scrim"); if (sc) sc.remove(); };
+    const mk = (title, body, mode) => {
+      const b = document.createElement("button");
+      b.className = "rq-snap-mode";
+      const t = document.createElement("div"); t.textContent = title;
+      const d = document.createElement("div"); d.textContent = body; d.style.cssText = "opacity:0.8;margin-top:3px;";
+      b.appendChild(t); b.appendChild(d);
+      b.addEventListener("click", () => { close(); restoreLedgerSnapshot(v.rounds, meta, mode); });
+      box.appendChild(b);
+    };
+    mk("REPLACE — wipe current ledger",
+       "Erases the current " + ledger.length + " rounds and all stored full text, then loads these " +
+       v.rounds.length + ". The session resumes at round " + (v.rounds.length + 1) + ".", "replace");
+    mk("MERGE — append after current",
+       "Appends " + v.rounds.length + " rounds after the current " + ledger.length + ". " +
+       freshCount + " new, " + dupCount + " duplicates skipped. Cap " + LEDGER_MAX_ENTRIES +
+       ": the oldest " + evictPreview + " current rounds would be evicted. Rounds renumber sequentially.", "merge");
+    const cancel = document.createElement("button");
+    cancel.className = "rq-snap-mode";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => {
+      close();
+      logError("[SNAPSHOT] restore cancelled by operator — ledger unchanged.");
+    });
+    box.appendChild(cancel);
+  }
+
+  // Shared entry for both the click path and the drop path.
+  // Strict order: parse -> validate -> mode-select -> mutate. Nothing touches
+  // ledger, IDB or localStorage before the operator confirms a mode.
+  function handleSnapshotFile(file) {
+    if (!snapshotEnabled() || !file) return;
+    if (busy) {
+      logError("[SNAPSHOT] restore blocked — a council round is in flight. Try again when it finishes.");
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      logError("[SNAPSHOT] restore rejected — file is " + Math.round(file.size / 1048576) +
+        "MB; the limit is 20MB.");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => logError("[SNAPSHOT] restore rejected — the file could not be read. Ledger unchanged.");
+    reader.onload = () => {
+      let obj;
+      try { obj = JSON.parse(reader.result); }
+      catch (e) {
+        logError("[SNAPSHOT] restore rejected — the file is not valid JSON (" + (e.message || e) + "). Ledger unchanged.");
+        showSnapshotModal("errors", { errors: ["File is not valid JSON: " + (e.message || e)] });
+        return;
+      }
+      const v = validateSnapshot(obj);
+      if (!v.ok) {
+        logError("[SNAPSHOT] restore rejected — " + v.errors[0] + " Ledger unchanged.");
+        showSnapshotModal("errors", { errors: v.errors });
+        return;
+      }
+      showSnapshotModal("chooser", { v: v, meta: { roster: obj.roster, exportedAt: obj.exportedAt, buildStamp: obj.buildStamp } });
+    };
+    reader.readAsText(file);
+  }
+
+  (function ensureSnapshotUI() {
+    try {
+      if (!snapshotEnabled()) return;
+      const wrap = document.getElementById("rqSessions");
+      const tlTitle = wrap && wrap.querySelector("h3");
+      if (!wrap || !tlTitle) return;              // timeline absent: fail-soft, no UI
+
+      const style = document.createElement("style");
+      style.textContent = [
+        "#rqSessions .rq-snap-btn { font-size: 0.72em; margin-left: 8px; background: none; border: 1px solid #666; border-radius: 999px; color: inherit; padding: 1px 8px; cursor: pointer; }",
+        "#rqSessions .rq-snap-btn[disabled] { opacity: 0.5; cursor: default; }",
+        "#rqSessions.rq-snap-drag { outline: 2px dashed #d97706; outline-offset: 4px; border-radius: 6px; }",
+        "#rqSnapshotBanner { position: fixed; bottom: 52px; left: 14px; z-index: 60; max-width: 300px; font-size: 0.75em; line-height: 1.5; padding: 8px 10px; border: 1px solid #d97706; border-radius: 8px; background: rgba(20,20,20,0.92); color: inherit; }",
+        "#rqSnapshotBanner button { font-size: 0.95em; letter-spacing: 0.04em; padding: 2px 10px; border-radius: 999px; border: 1px solid #d97706; background: rgba(217,119,6,0.12); color: inherit; cursor: pointer; margin-right: 6px; }",
+        ".rq-modal ul.rq-snap-errs { margin: 6px 0; padding-left: 18px; font-size: 0.85em; }",
+        ".rq-modal ul.rq-snap-errs li { margin: 3px 0; }",
+        ".rq-modal .rq-snap-mode { display: block; width: 100%; margin-top: 8px; padding: 8px; border-radius: 8px; border: 1px solid #666; background: none; color: inherit; cursor: pointer; text-align: left; font-size: 0.9em; }",
+        ".rq-modal .rq-snap-mode:hover { border-color: #d97706; }",
+      ].join("\n");
+      document.head.appendChild(style);
+
+      const snapBtn = document.createElement("button");
+      snapBtn.className = "rq-snap-btn"; snapBtn.id = "rqSnapshotExport";
+      snapBtn.textContent = "Snapshot";
+      snapBtn.title = "Download the whole ledger as a JSON snapshot file";
+      const restBtn = document.createElement("button");
+      restBtn.className = "rq-snap-btn"; restBtn.id = "rqSnapshotRestore";
+      restBtn.textContent = "Restore";
+      restBtn.title = "Restore the ledger from a snapshot file (validates first)";
+      tlTitle.appendChild(snapBtn);
+      tlTitle.appendChild(restBtn);
+
+      const fileInput = document.createElement("input");
+      fileInput.type = "file";
+      fileInput.id = "rqSnapshotFile";
+      fileInput.accept = ".json,application/json";
+      fileInput.style.display = "none";
+      wrap.appendChild(fileInput);
+
+      snapBtn.addEventListener("click", () => { exportLedgerSnapshot(); });
+      restBtn.addEventListener("click", () => { fileInput.click(); });
+      fileInput.addEventListener("change", () => {
+        const f = fileInput.files && fileInput.files[0];
+        if (f) handleSnapshotFile(f);
+        fileInput.value = "";
+      });
+
+      ["dragover", "dragenter"].forEach((ev) => wrap.addEventListener(ev, (e) => {
+        e.preventDefault(); wrap.classList.add("rq-snap-drag");
+      }));
+      ["dragleave", "drop"].forEach((ev) => wrap.addEventListener(ev, (e) => {
+        e.preventDefault(); wrap.classList.remove("rq-snap-drag");
+      }));
+      wrap.addEventListener("drop", (e) => {
+        const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+        if (f) handleSnapshotFile(f);   // one file only; extras ignored
+      });
+
+      window.__rqMaybeSnapshotBanner = maybeShowSnapshotBanner;
+      maybeShowSnapshotBanner();
+    } catch (e) { /* cosmetic — never block boot */ }
   })();
 
   // ==================== v3.0.1: Progressive Onboarding + Voice Input (Charter §11.7-8) ====================
@@ -5875,7 +6888,20 @@ roundData,
           // text, so the ledger — and the embedded corpus built from it —
           // systematically under-represented divergence, which is the one thing
           // Stage 4 exists to measure.
-          positions: allAnswers.map((a) => ({ seat: seatLabel(a.name), text: clip(a.text, 300) })),
+          // v3.9.0 F1 — flag OFF produces the v3.8.4 object literally: same keys,
+          // same values, same order. Byte-identical.
+          positions: allAnswers.map((a) => {
+            const p = { seat: seatLabel(a.name), text: clip(a.text, 300) };
+            if (fullTextEnabled()) {
+              p.fullText = String(a.text == null ? "" : a.text);
+              p.hasFull = true;
+              p.bytes = p.fullText.length;
+              p.provider = a.provider || seatProvider[a.name] || "primary";
+              p.model = a.model || seatModelLabel(a.name);
+              p.weight = typeof a.weightLive === "number" ? a.weightLive : seatWeight(a.name);
+            }
+            return p;
+          }),
           // v3.0.2: per-seat roster for Seat Stats — who answered, who was
           // malformed; absent seats failed that round.
           seats: allAnswers.map((a) => ({ n: a.name, m: !!a.malformed })),
@@ -5883,6 +6909,7 @@ roundData,
         if (typeof playConsensusFlow === "function" && settings.flowAnim !== false) playConsensusFlow(divided, result.trust);
         if (memoryPill && memoryPill.refresh) memoryPill.refresh();
         if (window.__rqRenderSessions) window.__rqRenderSessions();
+        if (window.__rqMaybeSnapshotBanner) window.__rqMaybeSnapshotBanner();   // F2 — no-op when the flag is off
         if (window.__rqIntro) { window.__rqIntro.remove(); window.__rqIntro = null; }
         warnSeatDiversity(result);
         logInstitutionalMemory(dispatchId, query, result);
@@ -6016,6 +7043,7 @@ roundData,
     // erases memory, via New Session or the FORGET pill.)
     ledger = [];
     persistLedger();
+    clearFullTextStore();   // F1 — privacy parity
     if (memoryPill && memoryPill.refresh) memoryPill.refresh();
     consensusBar.classList.add("is-empty");
     consensusBar.classList.remove("loading");
@@ -6038,6 +7066,13 @@ roundData,
       logError(vectorMemoryEnabled()
         ? "[EMBED] Vector memory is ON — rounds will be embedded and stored."
         : "[EMBED] Vector memory is OFF — rounds will NOT be embedded. Settings → VECTOR MEMORY to enable. (A hard cache clear resets this.)");
+      logError(fullTextEnabled()
+        ? "[F1] Full-text ledger is ON — seat responses stored verbatim (IndexedDB rq_fulltext_v1), clipped only at render."
+        : "[F1] Full-text ledger is OFF — ledger stores 300-char clips exactly as v3.8.4. Settings → FULL-TEXT LEDGER to enable. (A hard cache clear resets this.)");
+      logError(snapshotEnabled()
+        ? "[SNAPSHOT] Ledger snapshot/restore is ON — Snapshot + Restore buttons in the timeline header."
+        : "[SNAPSHOT] Ledger snapshot/restore is OFF. Enable: localStorage.setItem('rq_snapshot','on') and reload.");
+      if (fullTextEnabled()) sweepFullTextOrphans();   // boot sweep — detached
       // Spend state gets the same treatment as the flag that cost three
       // sessions: stated at boot, never assumed.
       if (settings.keyKimi) {
