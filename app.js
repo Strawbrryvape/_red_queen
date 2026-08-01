@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.5-arc-retrieval";
+  const RQ_BUILD = "v3.9.6-stale-state";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -7495,10 +7495,20 @@ roundData,
     resetSeatVisuals();
     clearDividedPanel();
     consensusBar.classList.remove("is-empty");
+    // v3.9.6 — clear the PREVIOUS round's trust state before this one starts.
+    // These were only ever removed at RENDER time, so a round following a
+    // DIVIDED round ran as .consensus-bar.loading.divided: the divided styling
+    // painted underneath the loading shimmer, and the bar asserted a verdict
+    // that belonged to a round already gone. Visible as a two-tone pill with
+    // unreadable text; the deeper fault is that the UI stated a stale outcome
+    // while the council was mid-deliberation.
+    consensusBar.classList.remove("divided", "provisional", "sole");
     consensusBar.classList.add("loading");
     consensusText.textContent = "The Council is deliberating…";
     consensusText.style.fontStyle = "italic";
-    consensusText.style.color = "#888";
+    // #888 was chosen against the v2.2 near-black bar. It is unreadable on the
+    // v4.0 lit chamber; this reads on both.
+    consensusText.style.color = "#E8DADA";
 
     let answer = null;
     let divided = false;
