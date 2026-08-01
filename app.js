@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.1-snapshot-restore";
+  const RQ_BUILD = "v3.9.3-binary-guard";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4947,7 +4947,15 @@ roundData,
   // anchor phrase (the v2.7 election texts did). If injected verbatim,
   // remembered anchors would false-arm anchored-consensus mode and could
   // be mistaken for verdicts by extractDirective. Neutralize on write.
-  const sanitizeMemory = (s) => (s ? s.replace(/FINAL DIRECTIVE:/gi, "FINAL VERDICT —") : s);
+  // v3.9.3 — Postgres text cannot hold \u0000 (SQLSTATE 22P05) and rejects the
+  // ENTIRE insert, so one stray byte silently costs a round its ledger row, its
+  // embedding AND its provenance receipt while dispatch itself looks healthy.
+  // That is exactly what happened on 2026-08-01 03:52 when an image was attached
+  // and read as text. \t \n \r are preserved — they are load-bearing for prompt
+  // structure and for the FINAL DIRECTIVE anchor.
+  const rqStripControls = (s) =>
+    (typeof s === "string" ? s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "") : s);
+  const sanitizeMemory = (s) => (s ? rqStripControls(s).replace(/FINAL DIRECTIVE:/gi, "FINAL VERDICT —") : s);
 
 
   // ==================== v3.9.1: F2 — Ledger Snapshot / Restore ====================
@@ -5809,6 +5817,16 @@ roundData,
   }
 
   function sbInsert(table, rows) {
+    // v3.9.3 — strip control bytes from every string field at the WIRE, whatever
+    // the caller did. 22P05 kills the whole batch, not the offending field.
+    try {
+      rows = (Array.isArray(rows) ? rows : [rows]).map((r) => {
+        if (!r || typeof r !== "object") return r;
+        const out = {};
+        Object.keys(r).forEach((k) => { out[k] = typeof r[k] === "string" ? rqStripControls(r[k]) : r[k]; });
+        return out;
+      });
+    } catch (_) {}
     if (!sbConfigured()) return Promise.resolve();
     const payload = rqNormalizeRows(rows);
     return fetch(settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/" + table, {
@@ -5990,6 +6008,11 @@ roundData,
   // so callers can chain on the generated id. Resolves the first row or null;
   // never rejects. Single-object insert only.
   function sbInsertReturning(table, obj) {
+    try {
+      const _c = {};
+      Object.keys(obj || {}).forEach((k) => { _c[k] = typeof obj[k] === "string" ? rqStripControls(obj[k]) : obj[k]; });
+      obj = _c;
+    } catch (_) {}
     if (!sbConfigured()) return Promise.resolve(null);
     const payload = rqNormalizeRows([obj]);
     return fetch(settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/" + table, {
@@ -6239,6 +6262,390 @@ roundData,
     demoToggle.parentNode.parentNode.appendChild(lbl);
   })();
 
+
+  // ==================== v3.9.2: F3 — LEDGER SEARCH ====================
+  // A read-path filter over the in-memory browser ledger. Text search, trust
+  // and seat chips, round-number syntax, yellow highlighting, and shareable
+  // URL-hash state.
+  //
+  // SEARCH CHANGES NOTHING THE SEATS READ. F3 never touches
+  // buildMemoryContext, buildStateDigest, ledgerLine, recordLedger, CHIM,
+  // injection or retrieval. The bytes a seat receives next round are identical
+  // whether search is off, on, or actively filtering. Per the Addendum
+  // checklist this is NOT a seat-context feature and carries no baseline
+  // contamination.
+  //
+  // SUBSTRING, NEVER tokenize(). The consensus tokenizer drops every token of
+  // two characters or fewer, so "42" and "1st=1" vanish inside it. That
+  // tokenizer exists to COMPARE seat answers, not to FIND text. This pipeline
+  // uses String.indexOf only — no regex is ever constructed from user input, so
+  // a typed "[" cannot throw and there is no ReDoS surface on ledger text.
+  //
+  // HIGHLIGHTING USES TreeWalker + Range.surroundContents ON SINGLE TEXT NODES.
+  // Model output is untrusted; no string-innerHTML ever touches ledger content.
+  //
+  // ROUND NUMBERS ARE POSITIONAL AND PER-DEVICE (idx + 1). They do not match
+  // Supabase corpus position and differ across devices. A shared URL containing
+  // round=45 filters to whatever is positionally 45th on the viewing device.
+  //
+  // GATED: default OFF. Flag off, the timeline renders exactly as v3.9.1: the
+  // original five-chip row, no search bar, no hash parsing, no listeners.
+  function ledgerSearchEnabled() { return localStorage.getItem("rq_ledger_search") === "on"; }
+
+  // The entire case-folding strategy. No diacritic stripping, no stemming, no
+  // synonyms — deliberately. "Résumé" will not match "resume"; that is a stated
+  // v1 decision rather than an oversight, and it keeps offsets exact, because
+  // toLowerCase is length-preserving for the text we highlight.
+  function foldText(s) { return (s == null ? "" : String(s)).toLowerCase(); }
+
+  let searchState = { query: "", tags: new Set(), seats: new Set(), rounds: { exact: null, range: null } };
+  let searchIndex = null;      // null = dirty; rebuilt lazily on next search
+  let searchTimer = null;
+
+  // G.7 syntax. Pure-numeric tokens are ROUND predicates, not text — documented
+  // precedence, and the reason "42" finds round 42 rather than the text "42".
+  // "answer 42" searches the text, because the token set is then non-numeric.
+  function parseQueryTerms(raw) {
+    const out = { terms: [], exact: null, range: null };
+    String(raw == null ? "" : raw).toLowerCase().trim().split(/\s+/).forEach((tok) => {
+      if (!tok) return;
+      let m = /^#?(\d+)$/.exec(tok);
+      if (m) { out.exact = parseInt(m[1], 10); out.range = null; return; }   // last wins; clears any range
+      m = /^(\d+)-(\d+)$/.exec(tok);
+      if (m) {
+        let a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+        if (a > b) { const t = a; a = b; b = t; }
+        out.range = [a, b]; out.exact = null; return;                        // last wins; clears any exact
+      }
+      out.terms.push(tok);
+    });
+    return out;
+  }
+
+  function _f3Terms() { return parseQueryTerms(searchState.query).terms; }
+
+  // idx-keyed so ledgerMatches is O(1) per row. Prefers F1's in-memory fullText
+  // when hydrated; otherwise the 300-char clip. Search NEVER triggers an IDB
+  // read — lazy hydration stays lazy, and the honest consequence is marked
+  // "· clipped" on the snippet rather than hidden.
+  function buildSearchIndex() {
+    searchIndex = ledger.map((e, i) => ({
+      idx: i,
+      haystack: foldText(
+        (e.prompt || "") + " " + (e.outcome || "") + " " + (e.verdict || "") + " " +
+        (e.positions || []).map((p) => (p.seat || "") + " " + (p.fullText || p.text || "")).join(" ")
+      ),
+    }));
+  }
+  function invalidateSearchIndex() { searchIndex = null; }
+
+  // Pure predicate. Cheapest-first, short-circuiting; all predicates AND.
+  function ledgerMatches(entry, idx, state) {
+    const st = state || searchState;
+    const parsed = parseQueryTerms(st.query);
+    const n = idx + 1;                                   // positional round number
+    if (parsed.exact !== null && n !== parsed.exact) return false;
+    if (parsed.range !== null && (n < parsed.range[0] || n > parsed.range[1])) return false;
+    if (st.tags.size && !st.tags.has(entry.outcome)) return false;
+    if (st.seats.size) {
+      const hit = (entry.positions || []).some((p) =>
+        st.seats.has(foldText(p && p.seat).split(/[\s[]/)[0]));   // "Claude [Groq …]" -> "claude"
+      if (!hit) return false;
+    }
+    if (parsed.terms.length) {
+      if (!searchIndex) buildSearchIndex();
+      const row = searchIndex[idx];
+      if (!row) return true;                             // index/ledger raced: show rather than hide
+      for (let i = 0; i < parsed.terms.length; i++) {
+        if (row.haystack.indexOf(parsed.terms[i]) === -1) return false;
+      }
+    }
+    return true;
+  }
+
+  // Fail-soft catch-all: any throw shows the row. A search fault degrades to an
+  // unfiltered timeline, never a broken ledger.
+  function safeLedgerMatches(entry, idx) {
+    try { return ledgerMatches(entry, idx, searchState); } catch (_) { return true; }
+  }
+
+  // ~40 chars of context either side of the first hit. Sources scanned in a
+  // fixed order so the snippet is deterministic.
+  function findMatchSnippet(entry, terms) {
+    if (!terms || !terms.length) return null;
+    const sources = [];
+    if (entry.prompt) sources.push({ text: entry.prompt, clip: false });
+    if (entry.verdict) sources.push({ text: entry.verdict, clip: false });
+    (entry.positions || []).forEach((p) => {
+      if (!p) return;
+      // "clipped" means: this round HAS verbatim text that is not loaded here,
+      // so the snippet may be truncated. A legacy position (hasFull falsy) has no
+      // full text anywhere, so its clip IS the whole record and must NOT be
+      // flagged — flagging it would claim hidden text that does not exist.
+      const usingClip = typeof p.fullText !== "string";
+      sources.push({ text: (p.seat || "") + ": " + (p.fullText || p.text || ""),
+                     clip: usingClip && p.hasFull === true });
+    });
+    for (let s = 0; s < sources.length; s++) {
+      const hay = foldText(sources[s].text);
+      for (let t = 0; t < terms.length; t++) {
+        const at = hay.indexOf(terms[t]);
+        if (at === -1) continue;
+        const raw = sources[s].text;
+        const from = Math.max(0, at - 40), to = Math.min(raw.length, at + terms[t].length + 40);
+        return {
+          text: (from > 0 ? "\u2026" : "") + raw.slice(from, to).trim() + (to < raw.length ? "\u2026" : ""),
+          fromClip: !!sources[s].clip,
+        };
+      }
+    }
+    return null;
+  }
+
+  // SECURITY-CRITICAL. Collect first, mutate second — never mutate the DOM
+  // during a TreeWalker traversal. surroundContents on a single text node
+  // cannot cross an element boundary, and no HTML is ever parsed.
+  function highlightMatches(cardEl, terms) {
+    if (!cardEl || !terms || !terms.length) return;
+    const walker = document.createTreeWalker(cardEl, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.parentElement && n.parentElement.closest("mark, script, style"))
+        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+    });
+    const jobs = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const folded = foldText(node.nodeValue);
+      const hits = [];
+      // Longest term first, so a short term nested in a longer one cannot split
+      // the longer one's match in half.
+      terms.slice().sort((a, b) => b.length - a.length).forEach((t) => {
+        let from = 0, at;
+        while ((at = folded.indexOf(t, from)) !== -1) {
+          if (!hits.some((h) => at < h.end && at + t.length > h.start)) {
+            hits.push({ start: at, end: at + t.length });
+          }
+          from = at + t.length;
+        }
+      });
+      if (hits.length) jobs.push({ node: node, hits: hits.sort((a, b) => b.start - a.start) });
+    }
+    // Right-to-left within each node: splitting shifts only offsets AFTER the
+    // split point, so earlier offsets stay valid.
+    jobs.forEach((j) => {
+      j.hits.forEach((h) => {
+        try {
+          const r = document.createRange();
+          r.setStart(j.node, h.start);
+          r.setEnd(j.node, h.end);
+          const mark = document.createElement("mark");
+          r.surroundContents(mark);
+        } catch (_) { /* fail-soft: this one hit stays unhighlighted */ }
+      });
+    });
+  }
+
+  // Total — never throws. Unknown values are dropped rather than guessed, so an
+  // all-bad hash yields the empty state, which is an unfiltered timeline.
+  function parseSearchHash() {
+    const st = { query: "", tags: new Set(), seats: new Set(), rounds: { exact: null, range: null } };
+    try {
+      const h = String(location.hash || "").replace(/^#/, "");
+      if (!h) return st;
+      const dec = (v) => { try { return decodeURIComponent(v); } catch (_) { return null; } };
+      const TAGS = ["verified", "provisional", "sole", "divided", "resolved"];
+      const SEATS = ["gemini", "kimi", "claude"];
+      h.split("&").forEach((pair) => {
+        const i = pair.indexOf("=");
+        if (i === -1) return;
+        const k = pair.slice(0, i), raw = dec(pair.slice(i + 1));
+        if (raw === null) return;
+        if (k === "search") st.query = raw;
+        else if (k === "tag") raw.split(",").forEach((v) => { v = v.trim().toLowerCase(); if (TAGS.indexOf(v) !== -1) st.tags.add(v); });
+        else if (k === "seat") raw.split(",").forEach((v) => { v = v.trim().toLowerCase(); if (SEATS.indexOf(v) !== -1) st.seats.add(v); });
+        else if (k === "round") {
+          let m = /^(\d+)$/.exec(raw.trim());
+          if (m) { st.rounds.exact = parseInt(m[1], 10); return; }
+          m = /^(\d+)-(\d+)$/.exec(raw.trim());
+          if (m) {
+            let a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+            if (a > b) { const t = a; a = b; b = t; }
+            st.rounds.range = [a, b];
+          }
+        }
+      });
+    } catch (_) { /* total by contract */ }
+    return st;
+  }
+
+  // replaceState: no history spam per keystroke, no hashchange self-trigger, no
+  // scroll. Numeric tokens are stripped from search= and carried in round=, so
+  // the hash round-trips through the same parser that produced the state.
+  function writeSearchHash(state) {
+    try {
+      const st = state || searchState;
+      const parsed = parseQueryTerms(st.query);
+      const parts = [];
+      const textOnly = parsed.terms.join(" ");
+      if (textOnly) parts.push("search=" + encodeURIComponent(textOnly));
+      if (st.tags.size) parts.push("tag=" + Array.from(st.tags).map((t) => encodeURIComponent(t.toUpperCase())).join(","));
+      if (st.seats.size) parts.push("seat=" + Array.from(st.seats).map((s) => encodeURIComponent(s.charAt(0).toUpperCase() + s.slice(1))).join(","));
+      if (parsed.exact !== null) parts.push("round=" + parsed.exact);
+      else if (parsed.range) parts.push("round=" + parsed.range[0] + "-" + parsed.range[1]);
+      const h = parts.join("&");
+      history.replaceState(null, "", location.pathname + location.search + (h ? "#" + h : ""));
+    } catch (_) {}
+  }
+
+  function clearLedgerSearch() {
+    searchState = { query: "", tags: new Set(), seats: new Set(), rounds: { exact: null, range: null } };
+    const input = document.getElementById("rqSearchInput");
+    if (input) input.value = "";
+    _f3PaintChips();
+    writeSearchHash(searchState);
+    if (window.__rqRenderSessions) window.__rqRenderSessions();
+  }
+
+  // Repainted from state rather than toggled in the handler, so hash restore and
+  // click produce identical visuals. aria-pressed always mirrors .on.
+  function _f3PaintChips() {
+    try {
+      const row = document.getElementById("rqTlFilters");
+      if (!row) return;
+      row.querySelectorAll("button[data-f3]").forEach((b) => {
+        const kind = b.getAttribute("data-f3"), val = b.getAttribute("data-val");
+        const on = kind === "all" ? searchState.tags.size === 0
+                 : kind === "tag" ? searchState.tags.has(val)
+                 : searchState.seats.has(val);
+        b.classList.toggle("on", on);
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      const clr = document.getElementById("rqSearchClear");
+      if (clr) {
+        const empty = !searchState.query && !searchState.tags.size && !searchState.seats.size;
+        clr.style.display = empty ? "none" : "";
+      }
+    } catch (_) {}
+  }
+
+  function runSearch() {
+    try {
+      const input = document.getElementById("rqSearchInput");
+      if (input) searchState.query = input.value;
+      _f3PaintChips();
+      if (window.__rqRenderSessions) window.__rqRenderSessions();
+      writeSearchHash(searchState);
+    } catch (e) { logError("[SEARCH] runSearch threw: " + ((e && e.message) || e) + " — timeline unfiltered."); }
+  }
+
+  // ONE choke point. Every ledger mutation in the file funnels through
+  // persistLedger — recordLedger, timeline delete, Clear-all, New Session,
+  // FORGET, and both F2 restore modes — so wrapping it covers all of them and
+  // needs no cooperation from F2.
+  function installPersistLedgerHook() {
+    try {
+      const orig = persistLedger;
+      persistLedger = function () {
+        invalidateSearchIndex();
+        const r = orig.apply(this, arguments);
+        if (ledgerSearchEnabled() && window.__rqRenderSessions) {
+          try { window.__rqRenderSessions(); } catch (_) {}
+        }
+        return r;
+      };
+    } catch (_) {}
+  }
+
+  function ensureLedgerSearchUI(wrap, filters) {
+    try {
+      if (!ledgerSearchEnabled() || !wrap || !filters) return;
+
+      const style = document.createElement("style");
+      style.textContent = [
+        "#rqSearch { display:flex; gap:6px; margin:6px 0 2px; align-items:center; }",
+        "#rqSearchInput { flex:1; min-width:0; font-size:0.78em; padding:4px 10px; border-radius:999px; border:1px solid #555; background:rgba(255,255,255,0.05); color:inherit; outline:none; }",
+        "#rqSearchInput:focus { border-color:#d97706; }",
+        "#rqSearchClear { font-size:0.72em; padding:3px 10px; border-radius:999px; border:1px solid #666; background:none; color:inherit; cursor:pointer; opacity:0.8; }",
+        "#rqTlFilters button.rq-seat-chip { border-style:dashed; }",
+        "#rqSessions mark { background:#eab308; color:#111; padding:0 1px; border-radius:2px; }",
+        "#rqSessions .rq-snip { font-size:0.72em; opacity:0.85; margin-top:4px; border-left:2px solid #eab308; padding-left:6px; white-space:pre-wrap; }",
+        "#rqSessions .rq-snip .rq-snip-clip { opacity:0.6; font-style:italic; }",
+        "#rqSessions .rq-search-empty { font-size:0.78em; opacity:0.6; margin:8px 0; }",
+        "#rqSessions .rq-search-empty button { font-size:0.72em; margin-left:8px; padding:2px 9px; border-radius:999px; border:1px solid #d97706; background:none; color:inherit; cursor:pointer; }",
+      ].join("\n");
+      document.head.appendChild(style);
+
+      const row = document.createElement("div");
+      row.id = "rqSearch";
+      const input = document.createElement("input");
+      input.type = "search";
+      input.id = "rqSearchInput";
+      input.placeholder = "Search rounds\u2026 (#45, 12-18)";
+      input.setAttribute("aria-label", "Search the council ledger");
+      const clr = document.createElement("button");
+      clr.id = "rqSearchClear";
+      clr.type = "button";
+      clr.textContent = "\u2715 clear";
+      clr.style.display = "none";
+      clr.addEventListener("click", () => clearLedgerSearch());
+      row.appendChild(input); row.appendChild(clr);
+      wrap.insertBefore(row, filters);
+
+      // Extended chip row. ALL clears TAGS ONLY — text and seats persist, which
+      // is what makes the chips composable with an active query.
+      const mk = (label, kind, val, cls) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        b.setAttribute("data-f3", kind);
+        if (val) b.setAttribute("data-val", val);
+        if (cls) b.classList.add(cls);
+        b.addEventListener("click", () => {
+          if (kind === "all") searchState.tags.clear();
+          else if (kind === "tag") { searchState.tags.has(val) ? searchState.tags.delete(val) : searchState.tags.add(val); }
+          else { searchState.seats.has(val) ? searchState.seats.delete(val) : searchState.seats.add(val); }
+          runSearch();                                    // chips are discrete events — never debounced
+        });
+        filters.appendChild(b);
+      };
+      mk("ALL", "all", null, null);
+      // RESOLVED closes the v3.8.4 gap: adjudication wins are written as
+      // outcome "resolved" and no chip could surface them. The per-card dot is
+      // already #888 via the existing TRUST_COLORS[e.outcome] || "#888"
+      // fallback, so TRUST_COLORS needs no edit.
+      ["verified", "provisional", "sole", "divided", "resolved"].forEach((t) => mk(t.toUpperCase(), "tag", t, null));
+      ["gemini", "kimi", "claude"].forEach((s) => mk(s.toUpperCase(), "seat", s, "rq-seat-chip"));
+
+      // 200ms trailing edge, one timer.
+      input.addEventListener("input", () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(runSearch, 200);
+      });
+
+      // Boot restore, BEFORE the initial renderSessions call below, so the first
+      // paint is already filtered — no flash of unfiltered content.
+      const fromHash = parseSearchHash();
+      searchState = fromHash;
+      input.value = fromHash.query;
+      // round= in the hash is authoritative: fold it back into the query text so
+      // one parser owns the predicate.
+      if (!fromHash.query && fromHash.rounds.exact !== null) { searchState.query = "#" + fromHash.rounds.exact; input.value = searchState.query; }
+      else if (!fromHash.query && fromHash.rounds.range) { searchState.query = fromHash.rounds.range[0] + "-" + fromHash.rounds.range[1]; input.value = searchState.query; }
+      _f3PaintChips();
+
+      window.addEventListener("hashchange", () => {
+        try {
+          const st = parseSearchHash();
+          searchState = st;
+          const inp = document.getElementById("rqSearchInput");
+          if (inp) inp.value = st.query || (st.rounds.exact !== null ? "#" + st.rounds.exact
+                                          : st.rounds.range ? st.rounds.range[0] + "-" + st.rounds.range[1] : "");
+          if (inp) searchState.query = inp.value;
+          _f3PaintChips();
+          if (window.__rqRenderSessions) window.__rqRenderSessions();
+        } catch (_) {}
+      });
+    } catch (e) { /* cosmetic — never block boot */ }
+  }
+
   // Timeline (spec 4.1) + Seat Stats (spec 4.2), ledger-fed.
   (function ensureTimeline() {
     if (!historyList || !historyList.parentNode) return;
@@ -6264,18 +6671,20 @@ roundData,
     const filters = document.createElement("div");
     filters.id = "rqTlFilters";
     let activeFilter = "all";
-    ["all", "verified", "provisional", "sole", "divided"].forEach((f) => {
-      const b = document.createElement("button");
-      b.textContent = f.toUpperCase();
-      if (f === "all") b.classList.add("on");
-      b.addEventListener("click", () => {
-        activeFilter = f;
-        filters.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
-        b.classList.add("on");
-        renderSessions();
+    if (!ledgerSearchEnabled()) {
+      ["all", "verified", "provisional", "sole", "divided"].forEach((f) => {
+        const b = document.createElement("button");
+        b.textContent = f.toUpperCase();
+        if (f === "all") b.classList.add("on");
+        b.addEventListener("click", () => {
+          activeFilter = f;
+          filters.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
+          b.classList.add("on");
+          renderSessions();
+        });
+        filters.appendChild(b);
       });
-      filters.appendChild(b);
-    });
+    }
     wrap.appendChild(filters);
     const stats = document.createElement("div");
     stats.id = "rqSeatStats";
@@ -6284,6 +6693,9 @@ roundData,
     const list = document.createElement("div");
     wrap.appendChild(list);
     historyList.parentNode.insertBefore(wrap, historyList);
+    // v3.9.2 F3 — build the search row + extended chips, and restore hash state,
+    // BEFORE the initial renderSessions() at the end of this IIFE.
+    ensureLedgerSearchUI(wrap, filters);
 
     function renderStats() {
       // Reduce over ledger: per seat — verified/provisional contributions,
@@ -6335,12 +6747,30 @@ roundData,
 
     function renderSessions() {
       list.innerHTML = "";
-      const rows = ledger.map((e, i) => ({ e, i })).filter((r) => activeFilter === "all" || r.e.outcome === activeFilter);
+      const rows = ledger.map((e, i) => ({ e, i })).filter((r) =>
+        ledgerSearchEnabled() ? safeLedgerMatches(r.e, r.i)
+                              : (activeFilter === "all" || r.e.outcome === activeFilter));
       if (!rows.length) {
+        // v3.9.2 F3 — two DISTINCT empty states. "The ledger is empty" and "your
+        // filter matched nothing" are different facts and must not share a
+        // string; §6 row 1 and row 7 both turn on this.
         const empty = document.createElement("p");
         empty.style.cssText = "font-size:0.78em;opacity:0.5;";
-        empty.textContent = activeFilter === "all" ? "No rounds yet. The council's past appears here and survives reloads." : "No " + activeFilter.toUpperCase() + " rounds yet.";
-        list.appendChild(empty);
+        if (ledgerSearchEnabled() && ledger.length === 0) {
+          empty.textContent = "No rounds yet. The council's past appears here and survives reloads.";
+          list.appendChild(empty);
+        } else if (ledgerSearchEnabled()) {
+          empty.className = "rq-search-empty";
+          empty.textContent = "No rounds match your search. ";
+          const cb = document.createElement("button");
+          cb.textContent = "Clear search";
+          cb.addEventListener("click", () => clearLedgerSearch());
+          empty.appendChild(cb);
+          list.appendChild(empty);
+        } else {
+          empty.textContent = activeFilter === "all" ? "No rounds yet. The council's past appears here and survives reloads." : "No " + activeFilter.toUpperCase() + " rounds yet.";
+          list.appendChild(empty);
+        }
         return;
       }
       rows.reverse().forEach(({ e, i }) => {
@@ -6454,12 +6884,39 @@ roundData,
         body.appendChild(replay);
         head.addEventListener("click", () => card.classList.toggle("open"));
         card.appendChild(head);
+        // v3.9.2 F3 — .rq-snip sits BETWEEN head and body, so it never lands
+        // inside an F1 .rq-pos row.
+        if (ledgerSearchEnabled()) {
+          try {
+            const snip = findMatchSnippet(e, _f3Terms());
+            if (snip) {
+              const sd = document.createElement("div");
+              sd.className = "rq-snip";
+              sd.textContent = "\u2026matched: " + snip.text;   // textContent — untrusted model text
+              if (snip.fromClip) {
+                const c = document.createElement("span");
+                c.className = "rq-snip-clip";
+                c.textContent = " \u00B7 clipped";
+                sd.appendChild(c);
+              }
+              card.appendChild(sd);
+            }
+          } catch (_) {}
+        }
         card.appendChild(body);
         list.appendChild(card);
       });
+      // Highlight AFTER every card exists. Re-render wipes stale marks for free
+      // (list.innerHTML = "" above), so there is no un-highlight path.
+      if (ledgerSearchEnabled()) {
+        try { highlightMatches(list, _f3Terms()); } catch (_) {}
+      }
     }
     renderSessions();
     window.__rqRenderSessions = renderSessions;
+    // Installed AFTER __rqRenderSessions exists, so the wrapper's re-render call
+    // can never fire against an undefined function.
+    installPersistLedgerHook();
   })();
 
   // ---------- v3.9.1: F2 UI — buttons, drag-drop, modals, banner ----------
@@ -6815,6 +7272,7 @@ roundData,
     let divided = false;
     let allAnswers = [];
     let trustPrefix = "";
+    let trustClass = null;   // v4.0 — the stylesheet needs the trust state as a CLASS, not only as prose
 
     if (!inDemoMode()) {
       let result = null;
@@ -6939,6 +7397,11 @@ roundData,
         // variants so persona warmth never contradicts the trust doctrine.
         // Trust prefix stays FIRST: the bar carries the verification level
         // up front ("always check the error logs" — founder, 2026-07-12).
+        // v4.0 JS Integration §2 — the stylesheet reads .provisional / .sole on
+        // #consensusBar. app.js has always COMPUTED these states and rendered them
+        // only as prose, so that CSS was dead. Names are the frozen contract
+        // (§4: do not rename). Nothing else about the round changes.
+        trustClass = (result.trust === "provisional" || result.trust === "sole") ? result.trust : null;
         if (result.trust === "sole") {
           trustPrefix = "⚠ SOLE VOICE (unverified) — Only one voice answered, so this is a single model's opinion, not a council verdict: ";
         } else if (result.trust === "provisional") {
@@ -6973,6 +7436,8 @@ roundData,
     consensusText.style.fontStyle = "normal";
     consensusText.style.color = "";
     consensusBar.classList.remove("divided");
+    consensusBar.classList.remove("provisional", "sole");   // v4.0 — cleared every round, exactly as .divided is
+    if (trustClass) consensusBar.classList.add(trustClass);
 
     if (divided) {
       // No white flash — the Council did not converge. Amber state instead.
@@ -7047,6 +7512,7 @@ roundData,
     if (memoryPill && memoryPill.refresh) memoryPill.refresh();
     consensusBar.classList.add("is-empty");
     consensusBar.classList.remove("loading");
+    consensusBar.classList.remove("divided", "provisional", "sole");   // v4.0 — a reset bar carries no trust state
     historyList.innerHTML = '<li class="empty-note">No queries yet this session.</li>';
     errorList.innerHTML = '<li class="empty-note">No errors logged.</li>';
     Object.values(agents).forEach((a) => a.classList.remove("thinking", "consensus"));
@@ -7072,6 +7538,9 @@ roundData,
       logError(snapshotEnabled()
         ? "[SNAPSHOT] Ledger snapshot/restore is ON — Snapshot + Restore buttons in the timeline header."
         : "[SNAPSHOT] Ledger snapshot/restore is OFF. Enable: localStorage.setItem('rq_snapshot','on') and reload.");
+      logError(ledgerSearchEnabled()
+        ? "[SEARCH] Ledger search ON — timeline filter/highlight active. Search state lives in the URL hash."
+        : "[SEARCH] Ledger search OFF — timeline renders as v3.9.1. localStorage rq_ledger_search=on to enable.");
       if (fullTextEnabled()) sweepFullTextOrphans();   // boot sweep — detached
       // Spend state gets the same treatment as the flag that cost three
       // sessions: stated at boot, never assumed.
