@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.3-binary-guard";
+  const RQ_BUILD = "v3.9.5-arc-retrieval";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -1708,7 +1708,35 @@
   };
   const P3_N = 10;                 // arc window, locked by lead decision
   const P3_MIN_ROUNDS = 5;         // see the truncation note in p3BuildWindow
-  const P3_CTX_BUDGET = 6800;      // chars for ROUND_DATA; ~0.85 of the smallest seat budget after the ~1.5k template reserve
+  const P3_CTX_BUDGET = 11000;     // chars for ROUND_DATA; raised from 6800 (see the share note below)
+  // v3.9.4 — THE STARVATION FIX.
+  //
+  // The budget was never the real problem. p3SerializeRound embedded each
+  // round's FULL prompt and response (each up to the 900-char rq_events clip),
+  // so one round could serialize to ~1,950 chars. Ten of those is ~19,500
+  // against a 6,800 budget, and p3BuildWindow drops WHOLE rounds until it fits
+  // — which is why the log read "admitted only 4 of 10 rounds; floor is 5" and
+  // tombstoned DEGRADED_WINDOW_SKIP for days. Every round Derek ran made the
+  // prompts longer, so the window kept shrinking as the corpus grew.
+  //
+  // Raising the number alone would only postpone it, and would push the narrator
+  // prompt toward the seat context limit that produced MALFORMED_RESPONSE on two
+  // seats on 2026-08-01. So each round gets a guaranteed SHARE instead, DERIVED
+  // from the two constants rather than hardcoded — if either changes, the
+  // guarantee holds automatically and cannot drift out of sync.
+  //
+  // Consequence: P3_N rounds ALWAYS fit. The window can no longer starve, at any
+  // corpus size, for any prompt length.
+  let _p3LastTruncated = false;
+  const P3_ROUND_SHARE = Math.floor(P3_CTX_BUDGET / P3_N);   // 1100
+  // MEASURED, not estimated: 65 (rule) + ~56 (ROUND line) + 17 + 10 + 2 newlines
+  // = 150, PLUS the clip marker at 68 chars on each of the two fields = 286.
+  // 340 leaves margin for optional marks ([OPERATOR_TEST], [SEAT_GHOSTED]) and
+  // four-digit round numbers. A first pass used 150 and admitted 8 of 10 — the
+  // marker's own cost is easy to forget, which is why this is asserted in test.
+  const P3_ROUND_HEADER = 340;
+  const P3_PROMPT_SHARE = Math.floor((P3_ROUND_SHARE - P3_ROUND_HEADER) * 0.40);   // 304
+  const P3_RESPONSE_SHARE = (P3_ROUND_SHARE - P3_ROUND_HEADER) - P3_PROMPT_SHARE;  // 456
 
   // ---------- §1.3 secret scan (caller-side, non-delegable) ----------
   // Runs on narrator INPUT and OUTPUT. The narrator is never asked to redact
@@ -1755,6 +1783,17 @@
     return new Set((rows || []).map((r) => r.round_event_id));
   }
 
+  // v3.9.4 — clip ONE field to its share. The marker is not decoration: R3
+  // (ABSENCE = ABSENCE) requires the narrator to say "the record is silent"
+  // rather than invent, so it must be able to tell a SHORT round from a CLIPPED
+  // one. Without the marker, truncated detail reads as absent detail and the
+  // rule inverts into exactly the confabulation it exists to prevent.
+  function p3ClipField(v, max) {
+    const t = String(v == null ? "" : v);
+    if (t.length <= max) return t;
+    return t.slice(0, max) + " […clipped for the narrator window; the full round is in the ledger]";
+  }
+
   // §1.2 serialization. Contractual — the ROUND <n> header is what R2's citation
   // rule and evidence_round both key off, so it must not be reformatted.
   function p3SerializeRound(r) {
@@ -1767,8 +1806,8 @@
       "ROUND " + r.round_number + " | consensus_status: " + tag +
       " | seat_origin: " + (r.seat_origin || "unrecorded") +
       (marks.filter(Boolean).length ? " " + marks.filter(Boolean).join(" ") : "") + "\n" +
-      "OPERATOR_PROMPT: " + (r.prompt || "") + "\n" +
-      "RESPONSE: " + (r.response || "") + "\n";
+      "OPERATOR_PROMPT: " + p3ClipField(r.prompt, P3_PROMPT_SHARE) + "\n" +
+      "RESPONSE: " + p3ClipField(r.response, P3_RESPONSE_SHARE) + "\n";
   }
 
   // §1.1a token-budget rule. Drops WHOLE rounds oldest-first and shrinks the
@@ -1899,6 +1938,71 @@ roundData,
              character_arc: arc, tensions_resolved: bullets(tr), tensions_unresolved: bullets(tu) };
   }
 
+  // ==================== v3.9.5: ARC RETRIEVAL + INJECTION ====================
+  // The council reads its own autobiography. Semantically retrieved from
+  // rq_narratives via match_narratives, gated on quality_score, budgeted, and
+  // labelled so no seat can mistake a self-authored summary for the record.
+  //
+  // ⚠ THIS IS THE ONE THING IN R134 THAT CHANGES WHAT THE SEATS READ. F1, F2 and
+  // F3 provably do not. It therefore ships flag-OFF and must carry a
+  // before-measurement: any Stage 4 confabulation figure collected with
+  // rq_p3_retrieval ON is not comparable to one collected with it off.
+  const P3_ARC_FRAC = 0.15;        // share of the memory budget when arcs are injected
+  const P3_ARC_COUNT = 2;          // at most two arcs; more crowds out verbatim recency
+
+  function p3ScoringEnabled()  { return localStorage.getItem("rq_p3_scoring") === "on"; }
+  function p3RetrievalEnabled() { return localStorage.getItem("rq_p3_retrieval") === "on"; }
+
+  async function p3RetrieveArcs(query) {
+    try {
+      if (!p3RetrievalEnabled()) return null;
+      const vec = await embedText(String(query || "").slice(0, 2000));
+      if (!vec) { logError("[P3-ARC] no embedding for this query — arc retrieval skipped."); return null; }
+      const res = await fetch(p2Base() + "/rest/v1/rpc/match_narratives", {
+        method: "POST", headers: p2Headers(),
+        body: JSON.stringify({
+          query_embedding: "[" + vec.join(",") + "]",
+          match_count: P3_ARC_COUNT,
+          min_similarity: simFloor(),
+          min_quality: P3_QUALITY_FLOOR,
+        }),
+      });
+      if (!res.ok) {
+        const b = await res.text().catch(() => "");
+        logError("[P3-ARC] match_narratives failed HTTP " + res.status + " " + b.slice(0, 160) +
+          (res.status === 404 ? " — run rq-v4-schema.sql (the RPC does not exist)." : ""));
+        return null;
+      }
+      const rows = await res.json().catch(() => []);
+      return Array.isArray(rows) ? rows : [];
+    } catch (e) { logError("[P3-ARC] retrieval threw: " + ((e && e.message) || e) + " — round unaffected."); return null; }
+  }
+
+  // The label is load-bearing, not decoration. An arc is the council's own
+  // narrative summary of its past — PROVISIONAL, self-authored, and not a
+  // verbatim record. A seat that reads it as established fact and cites it back
+  // is the exact failure mode observed in the round-100 paper, so the block says
+  // what it is in its own first line.
+  function p3BuildArcBlock(arcs, budget) {
+    if (!arcs || !arcs.length) return "";
+    let out = "=== COUNCIL NARRATIVE (self-authored summary of past rounds) ===\n" +
+      "The council wrote these about itself. They are PROVISIONAL summaries, not\n" +
+      "the verbatim record, and they may be wrong. Treat them as recollection to\n" +
+      "be checked, never as established fact, and do not quote them as citations.\n";
+    let used = out.length;
+    for (let i = 0; i < arcs.length; i++) {
+      const a = arcs[i];
+      const line = "\n[" + (a.narrative_id || "arc") + " · rounds " + a.start_round + "-" + a.end_round +
+        " · integrity " + (typeof a.quality_score === "number" ? a.quality_score.toFixed(2) : "?") +
+        " · similarity " + (typeof a.similarity === "number" ? a.similarity.toFixed(2) : "?") + "]\n" +
+        String(a.title || "").trim() + "\n" + String(a.summary || "").trim() + "\n";
+      if (used + line.length > budget) break;
+      used += line.length;
+      out += line;
+    }
+    return out + "=== END COUNCIL NARRATIVE ===\n\n";
+  }
+
   // ---------- A4 caller-side verification ----------
   // Mechanical, not trusted to the narrator. A citation to a round that was never
   // injected is fabrication by definition, and this is the only check in the
@@ -1926,6 +2030,113 @@ roundData,
       phantomRounds: Array.from(new Set(uncited)),
       noCitations: noCitations,
     };
+  }
+
+  // ==================== v3.9.5: P3 NARRATIVE QUALITY SCORE ====================
+  //
+  // ⚠ WHAT THIS SCORE IS NOT: it is NOT a truthfulness measure. Every dimension
+  // below is STRUCTURAL — does the arc cite rounds that exist, cover the seats
+  // present, disclose its own truncation, carry substance. A well-formed
+  // fabrication scores high. Reading quality_score as "this arc is true" is
+  // exactly the confabulation trap this project keeps finding elsewhere, so the
+  // label rendered everywhere is INTEGRITY, never accuracy.
+  //
+  // DETERMINISTIC BY DESIGN. No model call: a seat scoring the council's own
+  // autobiography is a model grading its own homework, costs a dispatch, and
+  // introduces a new confabulation surface at the exact point the pillar exists
+  // to constrain. Everything here is computable from the arc and its window, so
+  // it is reproducible and auditable by hand.
+  const P3_QUALITY_FLOOR = 0.6;      // matches match_narratives' min_quality default
+  const P3_SCORE_VERSION = 1;
+
+  function p3ScoreArc(parsed, injectedNums, truncated) {
+    const comp = {};
+
+    // (1) CITATION INTEGRITY — 0.30. Reuses the same verifier that runs at
+    // generation, so the score cannot disagree with the gate that admitted it.
+    const v = p3VerifyCitations(parsed, injectedNums);
+    comp.citation_integrity = v.ok ? 1
+      : (v.noCitations ? 0
+         : Math.max(0, 1 - (v.badEvidence.length + v.phantomRounds.length) * 0.34));
+
+    // (2) COVERAGE — 0.20. What fraction of the injected window does the arc
+    // actually reference? An arc citing one round out of ten is a paragraph with
+    // a title, not an autobiography.
+    const set = new Set(injectedNums);
+    const refs = new Set();
+    const body = [parsed.summary].concat(parsed.tensions_resolved || [], parsed.tensions_unresolved || []).join("\n");
+    (body.match(/\bRounds?\s+(\d{1,4})/gi) || []).forEach((m) => {
+      const k = parseInt(String(m).replace(/\D+/g, ""), 10);
+      if (isFinite(k) && set.has(k)) refs.add(k);
+    });
+    Object.keys(parsed.character_arc || {}).forEach((seat) => {
+      const e = parsed.character_arc[seat] || {};
+      const k = parseInt(e.evidence_round, 10);
+      if (isFinite(k) && set.has(k)) refs.add(k);
+    });
+    comp.coverage = injectedNums.length ? Math.min(1, refs.size / Math.max(3, injectedNums.length * 0.5)) : 0;
+
+    // (3) SEAT COMPLETENESS — 0.20. Each seat needs a from/to. R3 legality is
+    // preserved: an entry that declares no observable baseline is COMPLETE, not
+    // missing — declining to invent growth is the behaviour the rule wants, and
+    // penalising it would train the narrator to fabricate.
+    const seats = Object.keys(parsed.character_arc || {});
+    let good = 0;
+    seats.forEach((k) => {
+      const e = parsed.character_arc[k] || {};
+      const from = String(e.from == null ? "" : e.from).trim();
+      const to = String(e.to == null ? "" : e.to).trim();
+      if (from.length >= 3 && to.length >= 3) good++;
+    });
+    comp.seat_completeness = seats.length ? good / seats.length : 0;
+
+    // (4) SPAN HONESTY — 0.15. A truncated window MUST say so. This is the
+    // WINDOW_TRUNCATED disclosure that held on both existing arcs; scoring it
+    // keeps it holding.
+    const discloses = /surviving record|window|truncat|omitted|rounds before/i.test(body + " " + String(parsed.title || ""));
+    comp.span_honesty = truncated ? (discloses ? 1 : 0) : 1;
+
+    // (5) SUBSTANCE — 0.15. A band, not a maximum: a stub is not an arc, and a
+    // wall of text will not survive the injection budget anyway.
+    const len = String(parsed.summary || "").length;
+    comp.substance = len < 200 ? len / 200 : (len > 4000 ? Math.max(0.4, 1 - (len - 4000) / 8000) : 1);
+
+    const score =
+      comp.citation_integrity * 0.30 +
+      comp.coverage           * 0.20 +
+      comp.seat_completeness  * 0.20 +
+      comp.span_honesty       * 0.15 +
+      comp.substance          * 0.15;
+
+    return {
+      score: Math.round(score * 1000) / 1000,
+      components: Object.assign({ _version: P3_SCORE_VERSION, _measures: "structural integrity, NOT truthfulness" }, comp),
+      injectable: score >= P3_QUALITY_FLOOR,
+    };
+  }
+
+  // PATCHes an existing arc row. Detached and best-effort: a scoring failure
+  // leaves quality_score NULL, which the gate reads as non-injectable — the safe
+  // direction, and identical to today's behaviour.
+  async function p3PatchScore(rowId, scored) {
+    try {
+      const res = await fetch(p2Base() + "/rest/v1/rq_narratives?id=eq." + encodeURIComponent(rowId), {
+        method: "PATCH", headers: Object.assign({}, p2Headers(), { Prefer: "return=minimal" }),
+        body: JSON.stringify({
+          quality_score: scored.score,
+          quality_components: scored.components,
+          scored_at: new Date().toISOString(),
+          scored_by: "deterministic-v" + P3_SCORE_VERSION,
+        }),
+      });
+      if (!res.ok) {
+        const b = await res.text().catch(() => "");
+        logError("[P3] score PATCH failed HTTP " + res.status + " " + b.slice(0, 160) +
+          (res.status === 400 ? " — run rq-v4-schema.sql (quality_score/quality_components columns)." : ""));
+        return false;
+      }
+      return true;
+    } catch (e) { logError("[P3] score PATCH threw: " + ((e && e.message) || e)); return false; }
   }
 
   // ---------- storage ----------
@@ -1995,8 +2206,26 @@ roundData,
       logError("[P3] arc stored but embedding is null \u2014 it will not be retrievable until re-embedded.");
     }
 
+    // v3.9.5 — score immediately. Until this existed, every arc stored with
+    // quality_score NULL and the gate read unscored as non-injectable, so no arc
+    // could ever be retrieved no matter how good it was.
+    let _scored = null;
+    if (p3ScoringEnabled()) {
+      try {
+        _scored = p3ScoreArc(arc, injectedRounds.map((r) => r.round_number), _p3LastTruncated);
+        const okp = await p3PatchScore(stored.id, _scored);
+        logError("[P3] arc " + label + " integrity " + _scored.score.toFixed(3) +
+          (_scored.injectable ? " — ABOVE the " + P3_QUALITY_FLOOR + " floor, retrievable"
+                              : " — below the " + P3_QUALITY_FLOOR + " floor, stored but NOT retrievable") +
+          (okp ? "" : " (score not persisted)") +
+          ". Integrity is structural: citations, coverage, seat completeness, span honesty. It is NOT a truth claim.");
+      } catch (e) { logError("[P3] scoring threw: " + ((e && e.message) || e) + " — arc stays unscored and non-injectable."); }
+    } else {
+      logError("[P3] arc " + label + " stored UNSCORED — scoring is OFF, so it is not retrievable. Settings → P3 SCORING.");
+    }
+
     if (p2Enabled()) await p2AppendAudit("CREATE", null, null, { narrative_id: label, start_round: x, end_round: y }, "council_narrator");
-    return { id: stored.id, label: label, x: x, y: y };
+    return { id: stored.id, label: label, x: x, y: y, score: _scored };
   }
 
   async function p3StoreTombstone(status, note) {
@@ -2042,6 +2271,9 @@ roundData,
       if (inHits) logError("[P3] secret-scan redacted " + inHits + " match(es) from the narrator's input. Seats never see raw secrets.");
 
       const win = p3BuildWindow(redacted);
+      // Carried so the scorer can require the WINDOW_TRUNCATED disclosure only
+      // when the window was actually truncated.
+      _p3LastTruncated = !!win.truncated;
       if (win.picked.length < P3_MIN_ROUNDS) {
         await p3StoreTombstone("DEGRADED_WINDOW_SKIP",
           "Context budget admitted only " + win.picked.length + " of " + nominal.length + " rounds; floor is " + P3_MIN_ROUNDS + ".");
@@ -7301,6 +7533,25 @@ roundData,
         }
         _injectedThisRound = !!_vectorBlock;
       }
+      // v3.9.5 — arc injection. Its budget comes OUT of the memory share, never
+      // from the vector share: retrieved real rounds outrank the council's own
+      // summary of them, and if the two ever compete the verbatim record wins.
+      let _arcBlock = "";
+      if (p3RetrievalEnabled() && PILLAR3.enabled()) {
+        const arcs = await p3RetrieveArcs(query);
+        if (arcs && arcs.length) {
+          const arcBudget = Math.floor(MEMORY_CONTEXT_CHAR_CAP * P3_ARC_FRAC);
+          _memBudget = Math.max(600, _memBudget - arcBudget);
+          _arcBlock = p3BuildArcBlock(arcs, arcBudget);
+          logError("[P3-ARC] injected " + arcs.length + " arc(s): " +
+            arcs.map((a) => a.narrative_id + " (integrity " +
+              (typeof a.quality_score === "number" ? a.quality_score.toFixed(2) : "?") + ", sim " +
+              (typeof a.similarity === "number" ? a.similarity.toFixed(2) : "?") + ")").join(", ") +
+            " — " + _arcBlock.length + " chars, labelled PROVISIONAL. THIS ROUND'S CONTEXT DIFFERS from a no-arc round; it is not baseline-comparable.");
+        } else if (arcs) {
+          logError("[P3-ARC] no arc above quality " + P3_QUALITY_FLOOR + " and similarity " + simFloor() + " — nothing injected.");
+        }
+      }
       const memoryContext = buildMemoryContext(_memBudget);
       // The vector block goes INSIDE the memory envelope, immediately before the
       // CURRENT QUESTION marker, so the marker stays adjacent to the question.
@@ -7311,10 +7562,10 @@ roundData,
         const _mark = "=== CURRENT QUESTION ===\n";
         const _at = memoryContext.lastIndexOf(_mark);
         _composedBody = (_at === -1)
-          ? _vectorBlock + memoryContext + query
-          : memoryContext.slice(0, _at) + _vectorBlock + memoryContext.slice(_at) + query;
+          ? _arcBlock + _vectorBlock + memoryContext + query
+          : memoryContext.slice(0, _at) + _arcBlock + _vectorBlock + memoryContext.slice(_at) + query;
       } else {
-        _composedBody = _vectorBlock + query;
+        _composedBody = _arcBlock + _vectorBlock + query;
       }
       const composedQuery = _composedBody + (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "");
       try {
@@ -7560,7 +7811,9 @@ roundData,
         ? "[P4] Fragility scoring ON (shadow) \u2014 rounds scored to rq_meta_consensus, nothing acted on."
         : "[P4] Pillar 4 DORMANT \u2014 scoring off, export on demand. Dream/drift cron features are NOT built.");
       logError(PILLAR3.enabled() && PILLAR3.narratorPass()
-        ? "[P3] Narrator ARMED \u2014 arcs every " + P3_N + " rounds. Retrieval/scoring/UI layers are NOT built; arcs are written and stored only."
+        ? "[P3] Narrator ARMED \u2014 arcs every " + P3_N + " rounds. Scoring " +
+          (p3ScoringEnabled() ? "ON" : "OFF") + ", arc retrieval " +
+          (p3RetrievalEnabled() ? "ON \u2014 \u26A0 arcs enter seat context; rounds are NOT baseline-comparable to arc-free rounds" : "OFF") + "."
         : "[P3] Pillar 3 DORMANT \u2014 no arcs generated, nothing read. Settings \u2192 PILLAR 3 NARRATOR to arm it.");
       logError(p2Enabled()
         ? "[P2] Provenance layer ARMED \u2014 epoch " + p2Epoch() + ". New rounds are receipted; retrieved memories are verified before injection."
