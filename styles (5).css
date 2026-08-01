@@ -1,0 +1,1494 @@
+/* ==========================================================================
+   RED QUEEN v4.0 — COUNCIL CHAMBER EDITION
+   Full replacement for styles.css (v2.2 "Minimalist Command Center")
+   K3 Swarm for Syntropy LLC — 2026-07-31
+   Baseline: v2.2 tokens/geometry preserved; Syntropy transitional-gradient
+   dynamics ported to GPU-legal transform/opacity mechanics (Foundation R17).
+   Reactivity: zero new JS hooks required — CSS reads existing classes via
+   :has() and degrades to the idle chamber on unsupported browsers (R2).
+   ========================================================================== */
+
+/* ==========================================================================
+   V40-FRAG-chamber.css — Writer W1 (Gradient Chamber)
+   Red Queen UI v4.0 — gradient system, layer architecture, chamber keyframes,
+   :has() state map, reduced-motion + mobile media blocks.
+   Binding context: V40-FOUNDATION.md (FROZEN). Baseline: rq_styles_v22.css.
+   Assembly order: :root → @property/@supports → layers → keyframes →
+                   state map → media blocks (mirrors v2.2 document order).
+   ========================================================================== */
+
+/* ---------- CUSTOM PROPERTIES ---------- */
+/* v2.2 tokens (13) PRESERVED VERBATIM (Foundation §B.1), then §B.2 new tokens. */
+:root {
+  --red: #E63946;
+  --red-deep: #B91C1C;
+  --red-bright: #FF4D5A;
+  --maroon: #7F1D1D;
+  --oxblood: #450A0A;
+  --gemini: #4285F4;
+  --kimi: #00D4AA;
+  --claude: #D4A574;
+  --text: #F0F0F0;
+  --muted: #888;
+  --drawer-bg: #121212;
+  --gold: #FFD700;
+  --ease: 300ms ease;
+
+  /* council telemetry — the five mandated tokens (Foundation §B.2);
+     :root defaults = IDLE state (Foundation §C row 1) */
+  --gradient-drift-speed: 26s;   /* idle baseline; 12s generating; 40s verified */
+  --gradient-intensity: 1;       /* hot-underlayer opacity multiplier; 1.4 generating */
+  --gradient-harmony: 0;         /* 1 = verified crimson-gold equilibrium */
+  --gradient-fracture: 0;        /* 1 = divided dual-stream mode */
+  --gradient-pulse: 0s;          /* 4s provisional heartbeat; 0s = off */
+  /* supporting tokens (Foundation §B.2, frozen) */
+  --gradient-flow-angle: 135deg; /* @property-animated flow angle (enhancement path) */
+  --chamber-hot-opacity: 0;      /* computed per state from intensity/harmony */
+  --seal-rotate-speed: 24s;      /* summon seal gradient rotation (consumed by summon-btn writer) */
+  --scrim-center: rgba(10,10,10,0.85);
+  --scrim-edge: rgba(0,0,0,0.95);
+  --crest-size: 26px;            /* crest overlay box inside 48px ring (consumed by crest writer) */
+}
+
+/* ---------- @PROPERTY REGISTRATION (Foundation §B.3, R18) ---------- */
+/* Registered --gradient-flow-angle is progressive enhancement ONLY.
+   Guard: browsers without @property / var()-in-gradient support skip the whole
+   block; the static 135deg :root default then applies and the transform-drift
+   primary path (red-drift) is unaffected (Foundation H.2).
+   Firefox <128 / Safari <16.4 snap-degrade — accepted per R17. */
+@supports (background: linear-gradient(var(--gradient-flow-angle), #000, #fff)) {
+  @property --gradient-flow-angle {
+    syntax: "<angle>";
+    inherits: false;
+    initial-value: 135deg;
+  }
+
+  /* Enhancement path: angle flow rides alongside transform drift on the base
+     chamber stream only. Registered-var angle animation is GPU-composited;
+     NO background-position anywhere in v4.0 (R5/R17). */
+  body::after {
+    animation:
+      red-drift var(--gradient-drift-speed) ease-in-out infinite alternate,
+      gradient-flow var(--gradient-drift-speed) ease-in-out infinite alternate;
+  }
+}
+
+/* ---------- LIVING RED BACKGROUND — v4.0 GRADIENT CHAMBER ----------
+   Frozen layer architecture (Foundation §D). Paint order, all layers
+   position:fixed, pointer-events:none:
+     1. html::before  z:0  hot/harmony under-layer (opacity via --chamber-hot-opacity)
+     2. body::after   z:0  BASE chamber stream — 5 v2.2 radials PRESERVED + flow (R17)
+     3. html::after   z:0  fracture gold stream (opacity via --gradient-fracture)
+     4. body::before  z:1  feTurbulence noise — PRESERVED VERBATIM
+     5. .canvas       z:2  content stacking context (owned elsewhere, unchanged)
+   z:0 trio paints in tree order html::before → body::after → html::after. */
+
+/* v2.2 host context PRESERVED VERBATIM (layers depend on it) */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  overflow-x: hidden;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  color: var(--text);
+  background: #0A0A0A;
+  position: relative;
+}
+
+/* LAYER 1 (Foundation §D row 1) — hot/harmony under-layer.
+   Glows through the translucent base radials. Idle opacity 0; generating
+   pushes red-bright+gold (§C row 2); verified reads as crimson-gold
+   equilibrium against the crimson base (§C row 3). One layer serves both
+   moods — Foundation H.5 layer budget (only 1 extra visible beyond base). */
+html::before {
+  content: "";
+  position: fixed;
+  inset: -20%;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(ellipse 55% 45% at 50% 30%, rgba(255, 77, 90, 0.30) 0%, transparent 70%),
+    radial-gradient(ellipse 45% 40% at 78% 22%, rgba(255, 215, 0, 0.16) 0%, transparent 70%),
+    radial-gradient(ellipse 40% 35% at 20% 75%, rgba(255, 215, 0, 0.10) 0%, transparent 70%),
+    radial-gradient(ellipse 60% 50% at 50% 85%, rgba(230, 57, 70, 0.20) 0%, transparent 70%);
+  opacity: var(--chamber-hot-opacity);
+  transition: opacity 600ms ease; /* mood crossfade on state change; vars themselves snap per §C */
+  animation: red-drift var(--gradient-drift-speed) ease-in-out infinite alternate-reverse;
+}
+
+/* LAYER 2 (Foundation §D row 2) — BASE chamber stream.
+   v2.2's five drifting radials PRESERVED VERBATIM (first five layers below),
+   enhanced into the flowing system per R17: a diagonal linear stream stop is
+   layered underneath, its angle driven by --gradient-flow-angle under the
+   @supports enhancement path (gradient-flow). Transform drift (red-drift)
+   remains the primary, always-on motion path — GPU-only, no background-position.
+   Duration now var(--gradient-drift-speed) so the chamber breathes with council
+   state (§C); speed changes restart the drift — accepted per R18. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: -20%;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 60% 45% at 50% 18%, rgba(255, 77, 90, 0.16) 0%, transparent 70%),
+    radial-gradient(ellipse 55% 50% at 12% 78%, rgba(230, 57, 70, 0.14) 0%, transparent 70%),
+    radial-gradient(ellipse 50% 55% at 88% 70%, rgba(185, 28, 28, 0.16) 0%, transparent 70%),
+    radial-gradient(ellipse 70% 60% at 75% 10%, rgba(127, 29, 29, 0.20) 0%, transparent 70%),
+    radial-gradient(ellipse 80% 70% at 25% 30%, rgba(69, 10, 10, 0.55) 0%, transparent 75%),
+    linear-gradient(var(--gradient-flow-angle),
+      rgba(69, 10, 10, 0) 0%,
+      rgba(127, 29, 29, 0.22) 30%,
+      rgba(185, 28, 28, 0.18) 55%,
+      rgba(230, 57, 70, 0.12) 80%,
+      rgba(69, 10, 10, 0) 100%);
+  animation: red-drift var(--gradient-drift-speed) ease-in-out infinite alternate;
+  z-index: 0;
+}
+
+/* LAYER 3 (Foundation §D row 3) — fracture gold stream.
+   Idle: opacity 0, no animation (no GPU cost while hidden). DIVIDED (§C row 5)
+   fades it in via --gradient-fracture and starts gradient-orbit, counter-
+   drifting against the crimson body::after — two competing streams. */
+html::after {
+  content: "";
+  position: fixed;
+  inset: -20%;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(ellipse 50% 45% at 82% 30%, rgba(255, 215, 0, 0.20) 0%, transparent 70%),
+    radial-gradient(ellipse 45% 50% at 70% 78%, rgba(255, 215, 0, 0.12) 0%, transparent 70%),
+    radial-gradient(ellipse 55% 45% at 15% 60%, rgba(230, 57, 70, 0.18) 0%, transparent 70%);
+  opacity: var(--gradient-fracture);
+  transition: opacity 600ms ease;
+}
+
+/* LAYER 4 (Foundation §D row 4) — subtle noise texture, v2.2 PRESERVED VERBATIM.
+   Grounds the gradient, prevents banding (master prompt §Syntropy). */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.05;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.6'/%3E%3C/svg%3E");
+  z-index: 1;
+}
+
+/* ---------- CHAMBER KEYFRAMES (Foundation §E) ---------- */
+
+/* red-drift — PRESERVED BY NAME, enhanced internally (§E: "stops may deepen").
+   v2.2's 0%/50%/100% anchors preserved verbatim; 25%/75% stops added to trace
+   the diamond-path drift ported from Syntropy dynamics (R17). Duration moved to
+   var(--gradient-drift-speed) at the call sites; timing/easing/iteration
+   (ease-in-out infinite alternate) unchanged. */
+@keyframes red-drift {
+  0%   { transform: translate3d(-2%, -1%, 0) scale(1); }
+  25%  { transform: translate3d(0, -2%, 0) scale(1.02); }
+  50%  { transform: translate3d(2%, 1.5%, 0) scale(1.04); }
+  75%  { transform: translate3d(0, 2.2%, 0) scale(1.03); }
+  100% { transform: translate3d(-1%, 2%, 0) scale(1.02); }
+}
+
+/* gradient-flow — NEW (§E). @property angle flow, enhancement path only
+   (consumed solely inside the @supports block above; R18). Quarter-turn
+   diamond sweep; 495deg ≡ 135deg so the loop wraps seamlessly (R17).
+   Duration var(--gradient-drift-speed), ease-in-out infinite alternate — frozen. */
+@keyframes gradient-flow {
+  0%   { --gradient-flow-angle: 135deg; }
+  25%  { --gradient-flow-angle: 225deg; }
+  50%  { --gradient-flow-angle: 315deg; }
+  75%  { --gradient-flow-angle: 405deg; }
+  100% { --gradient-flow-angle: 495deg; }
+}
+
+/* gradient-orbit — NEW (§E). Fracture counter-drift on html::after:
+   translate3d+rotate in opposite phase to red-drift (starts where red-drift
+   ends, rotates against it). 32s ease-in-out infinite alternate — frozen.
+   Applied only in the DIVIDED state rule below. */
+@keyframes gradient-orbit {
+  0%   { transform: translate3d(2%, 1%, 0) rotate(-2deg) scale(1.02); }
+  50%  { transform: translate3d(-2%, -1.5%, 0) rotate(2deg) scale(1); }
+  100% { transform: translate3d(1%, -2%, 0) rotate(-1deg) scale(1.04); }
+}
+
+/* gradient-pulse-wash — NEW (§E). PROVISIONAL gold heartbeat on the
+   under-layer: opacity 0→0.35→0, duration var(--gradient-pulse),
+   ease-in-out infinite. Applied only while .provisional is present
+   (0s default = off, §B.2). */
+@keyframes gradient-pulse-wash {
+  0%   { opacity: 0; }
+  50%  { opacity: 0.35; }
+  100% { opacity: 0; }
+}
+
+/* ---------- COUNCIL STATE → GRADIENT MAP (Foundation §C, FROZEN) ----------
+   Zero-new-JS reactivity (R2): CSS reads the SAME classes v2.2's JS already
+   toggles. No :has() support → static idle gradient, all component styling
+   still applies (H.1). Vars snap on class change; drift-speed change restarts
+   the drift — accepted, R18.
+
+   INHERITANCE NOTE (no Foundation conflict — mechanical necessity):
+   custom properties inherit downward only. The frozen body:has() selectors
+   below carry the §C var contract and reach body::after; each is paired with
+   a :root:has() mirror (:root ≡ html) so html::before / html::after — which
+   sit ABOVE body in the tree — receive the same state. Cascade order =
+   precedence (later wins): idle < generating < verified < provisional < divided. */
+
+/* §C row 2 — GENERATING/THINKING: 12s, intensity 1.4 → hot under-layer
+   opacity up (red-bright+gold push), drift faster. */
+body:has(.agent.thinking) {
+  --gradient-drift-speed: 12s;
+  --gradient-intensity: 1.4;
+}
+:root:has(.agent.thinking) {
+  --gradient-drift-speed: 12s;
+  --gradient-intensity: 1.4;
+  --chamber-hot-opacity: calc(0.22 * var(--gradient-intensity)); /* 0.308 */
+}
+
+/* §C row 6 — LOADING (bar): treated as generating for chamber mood
+   (shimmer is the bar-level signal — owned by the altar writer). */
+body:has(.consensus-bar.loading) {
+  --gradient-drift-speed: 12s;
+  --gradient-intensity: 1.4;
+}
+:root:has(.consensus-bar.loading) {
+  --gradient-drift-speed: 12s;
+  --gradient-intensity: 1.4;
+  --chamber-hot-opacity: calc(0.22 * var(--gradient-intensity)); /* 0.308 */
+}
+
+/* §C row 3 — VERIFIED: 40s, harmony 1 → under-layer shifts to crimson-gold
+   equilibrium; drift slows to stately. */
+body:has(.agent.consensus) {
+  --gradient-drift-speed: 40s;
+  --gradient-harmony: 1;
+}
+:root:has(.agent.consensus) {
+  --gradient-drift-speed: 40s;
+  --gradient-harmony: 1;
+  --chamber-hot-opacity: calc(0.06 + 0.2 * var(--gradient-harmony)); /* 0.26 */
+}
+
+/* §C row 4 — PROVISIONAL (R3 contract; activates when JS adds the class):
+   pulse 4s → gradient-pulse-wash runs, gold heartbeat across the under-layer.
+   The pulse animation owns html::before's opacity while running (cascade:
+   provisional > generating/verified), so --chamber-hot-opacity is not set here. */
+body:has(.consensus-bar.provisional) {
+  --gradient-pulse: 4s;
+}
+:root:has(.consensus-bar.provisional) {
+  --gradient-pulse: 4s;
+}
+:root:has(.consensus-bar.provisional)::before {
+  animation:
+    red-drift var(--gradient-drift-speed) ease-in-out infinite alternate-reverse,
+    gradient-pulse-wash var(--gradient-pulse) ease-in-out infinite;
+}
+
+/* §C row 5 — DIVIDED: fracture 1 → html::after gold stream fades in,
+   counter-drifting (gradient-orbit) against crimson body::after. */
+body:has(.consensus-bar.divided) {
+  --gradient-fracture: 1;
+}
+:root:has(.consensus-bar.divided) {
+  --gradient-fracture: 1;
+}
+:root:has(.consensus-bar.divided)::after {
+  animation: gradient-orbit 32s ease-in-out infinite alternate;
+}
+
+/* §C row 7 — SEND GLYPH (R4, best-effort): implemented in the Command Dais
+   section (single canonical implementation per §G: .send-btn::after is the
+   dais writer's slot). See `body:has(.consensus-bar.loading) .send-btn` there. */
+
+
+/* ==========================================================================
+   Red Queen v4.0 — FRAGMENT W3: CHAMBERS & CURTAINS
+   Seat: W3 · Baseline of record: rq_styles_v22.css · Frozen context: V40-FOUNDATION.md
+   Scope: Header (preserved) · Canvas/misc (preserved) · Scrims = The Void Curtain
+          · Bottom Sheet = The Command Dais · Drawer = The Council Archive
+          · Toast = The Council Whisper
+   Owned keyframes: scrim-contract, drawer-gold-pulse, toast-in (carried verbatim).
+   CONSUMES, never defines: :root tokens + chamber layers + :has() state map +
+   BOTH media blocks (W1); constellation / consensus-bar / summon (W2).
+   Frozen tokens consumed here: --scrim-center, --scrim-edge (Foundation §B.2,
+   defined by W1); --maroon --oxblood --gold --red --red-bright --ease
+   --drawer-bg --muted --text (Foundation §B.1).
+   Section order follows v2.2. Blocks headed "preserved" are byte-verbatim
+   from rq_styles_v22.css; blocks headed "enhanced"/"new" flag every deviation
+   inline with its Foundation citation.
+   ========================================================================== */
+
+/* ---------- HEADER ---------- */
+/* preserved verbatim (v2.2 lines 68–150) */
+.topbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  z-index: 50;
+  background: linear-gradient(to bottom, rgba(10,10,10,0.75), transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.wordmark {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--red);
+  letter-spacing: 0.01em;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.icon-btn {
+  background: rgba(230,57,70,0.10);
+  border: 1px solid rgba(230,57,70,0.35);
+  color: var(--text);
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background var(--ease), border-color var(--ease), transform var(--ease);
+}
+.icon-btn:hover { background: rgba(230,57,70,0.22); border-color: var(--red); }
+.icon-btn:active { transform: scale(0.94); }
+
+.menu-btn {
+  background: none;
+  border: none;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-end;
+  gap: 5px;
+  cursor: pointer;
+  padding: 8px;
+}
+.menu-btn span {
+  display: block;
+  width: 22px;
+  height: 2px;
+  background: var(--text);
+  border-radius: 1px;
+  transition: opacity var(--ease);
+}
+.menu-btn:hover span { opacity: 0.7; }
+
+/* DEMO badge */
+.demo-badge {
+  position: fixed;
+  top: 60px;
+  left: 16px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  color: var(--gold);
+  border: 1px solid rgba(255, 215, 0, 0.4);
+  border-radius: 4px;
+  padding: 2px 6px;
+  z-index: 51;
+}
+.hidden { display: none !important; }
+
+/* ---------- MAIN CANVAS ---------- */
+/* preserved verbatim (v2.2 lines 152–161). Constellation / consensus-bar /
+   summon-btn blocks that follow it in v2.2 are owned by W2 — omitted here. */
+.canvas {
+  position: relative;
+  z-index: 2;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 96px 20px calc(48px + env(safe-area-inset-bottom));
+}
+
+
+/* ==========================================================================
+   V40-FRAG-seals.css — Red Queen UI v4.0
+   Writer W2: Seals & Altar seat
+   Sections: Seal Constellation · The Verdict Altar (Consensus Bar) · The Council Seal (Summon)
+   Baseline: rq_styles_v22.css (preserved rules quoted verbatim)
+   Binding: V40-FOUNDATION.md — rulings cited per rule (R#, §B/§E/§F/§G)
+   Consumes (W1-owned, never redefined here): :root tokens incl. --crest-size,
+   --seal-rotate-speed (Foundation §B.2); :has() state map (§C); both media blocks (§H).
+   ========================================================================== */
+
+/* ---------- SEAL CONSTELLATION ---------- */
+/* v2.2 geometry preserved exactly (48px rings, 40px gap, 12px/0.15em names) */
+
+.constellation {
+  display: flex;
+  justify-content: center;
+  gap: 40px;
+}
+
+.agent {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.ring {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 2px solid;
+  transition: box-shadow var(--ease), border-color var(--ease);
+  position: relative; /* v4.0: anchor for crest overlay (Foundation §F) */
+}
+.ring-gemini { border-color: var(--gemini); }
+.ring-kimi   { border-color: var(--kimi); }
+.ring-claude { border-color: var(--claude); }
+
+.agent-name {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--muted);
+}
+
+/* Crest insignias (Foundation §F, R12) — data-URI SVG per seat, CSP-clean (R7).
+   --crest-size: 26px (§B.2, W1 :root). Centered inside the 48px ring;
+   background-size: contain; no border interference. .ring::after RESERVED (§G).
+   Geometry frozen: Gemini four-point star #4285F4 · Kimi ascendant
+   triangle-in-triangle #00D4AA · Claude hexagonal signet #D4A574.
+   Legibility: ≤4-vertex silhouettes, ≥1.5px strokes, shape-distinct at 24px. */
+.ring::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: var(--crest-size);
+  height: var(--crest-size);
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: contain;
+  pointer-events: none;
+}
+.ring-gemini::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 2 L14.8 9.2 L22 12 L14.8 14.8 L12 22 L9.2 14.8 L2 12 L9.2 9.2 Z' fill='%234285F4'/%3E%3C/svg%3E");
+}
+.ring-kimi::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 3 L21 20 L3 20 Z' fill='none' stroke='%2300D4AA' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M12 10 L16.5 17.5 L7.5 17.5 Z' fill='%2300D4AA'/%3E%3C/svg%3E");
+}
+.ring-claude::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 2 L20.5 7 L20.5 17 L12 22 L3.5 17 L3.5 7 Z' fill='none' stroke='%23D4A574' stroke-width='2' stroke-linejoin='round'/%3E%3Ccircle cx='12' cy='12' r='2.6' fill='%23D4A574'/%3E%3C/svg%3E");
+}
+
+/* thinking pulse — heartbeat, not strobe.
+   v4.0 (R16): glow radius intensified (wider bloom + soft outer halo layer);
+   border 2px→3px is a STATIC snap on class change — no border-width animation. */
+@keyframes pulse-gemini {
+  0%, 100% { box-shadow: 0 0 4px 0 rgba(66,133,244,0.25); }
+  50%      { box-shadow: 0 0 22px 6px rgba(66,133,244,0.6), 0 0 38px 10px rgba(66,133,244,0.2); }
+}
+@keyframes pulse-kimi {
+  0%, 100% { box-shadow: 0 0 4px 0 rgba(0,212,170,0.25); }
+  50%      { box-shadow: 0 0 22px 6px rgba(0,212,170,0.6), 0 0 38px 10px rgba(0,212,170,0.2); }
+}
+@keyframes pulse-claude {
+  0%, 100% { box-shadow: 0 0 4px 0 rgba(212,165,116,0.25); }
+  50%      { box-shadow: 0 0 22px 6px rgba(212,165,116,0.6), 0 0 38px 10px rgba(212,165,116,0.2); }
+}
+.agent.thinking .ring { border-width: 3px; } /* R16: static snap, no animation */
+.agent.thinking .ring-gemini { animation: pulse-gemini 2s ease-in-out infinite; }
+.agent.thinking .ring-kimi   { animation: pulse-kimi 2s ease-in-out infinite; }
+.agent.thinking .ring-claude { animation: pulse-claude 2s ease-in-out infinite; }
+
+/* consensus flash then settle — v4.0 (R9): white → --gold family, INCLUDING the
+   settled 100% glow (rgba(255,215,0,0.18)); name + 1.2s ease-out forwards preserved. */
+@keyframes consensus-flash {
+  0%   { box-shadow: 0 0 0 0 rgba(255,215,0,0); }
+  30%  { box-shadow: 0 0 24px 6px rgba(255,215,0,0.9); border-color: var(--gold); }
+  100% { box-shadow: 0 0 10px 2px rgba(255,215,0,0.18); }
+}
+.agent.consensus .ring {
+  animation: consensus-flash 1.2s ease-out forwards;
+}
+
+/* ---------- SHADOWED SEAT (any non-primary occupant: understudy or fallback) ----------
+   v2.2 preserved (opacity 0.5, dashed border, occupant tag) +
+   v4.0 (§F): filter: saturate(0.4) ghosting on ring+crest (static per-state filter). */
+.agent.shadowed .ring {
+  opacity: 0.5;
+  border-style: dashed;
+  filter: saturate(0.4);
+}
+.agent.shadowed .agent-name::after {
+  content: " \2022 " attr(data-occupant);
+  color: #555;
+  text-transform: lowercase;
+  letter-spacing: 0.05em;
+}
+
+/* ---------- THE VERDICT ALTAR (CONSENSUS BAR) ---------- */
+
+.consensus-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 24px 0;
+  position: relative; /* v4.0: anchor for SOLE halo ::before (R10) */
+}
+
+/* v2.2 architecture preserved (28px radius, blur, overflow hidden, min-height,
+   padding, 16px/1.45); v4.0: max-width 320px → 420px; transition widened so
+   state recolors settle through the existing --ease hook. */
+.consensus-bar {
+  max-width: 420px;
+  width: 100%;
+  min-height: 56px;
+  border-radius: 28px;
+  background: rgba(20, 8, 8, 0.72);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--red);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px 22px;
+  text-align: center;
+  font-size: 16px;
+  color: var(--text);
+  line-height: 1.45;
+  position: relative;
+  overflow: hidden;
+  transition: min-height var(--ease), border-color var(--ease), box-shadow var(--ease), color var(--ease);
+}
+
+.consensus-bar.is-empty span {
+  font-style: italic;
+  color: var(--muted);
+}
+
+/* shimmer while loading — v4.0 (R5): REFACTORED. Oversized ::after swept with
+   translateX (composited); zero background-position. Highlight tint
+   rgba(240,240,240,0.12) → rgba(255,215,0,0.15). Name + 1.8s timing kept. */
+.consensus-bar.loading::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 150%;
+  background: linear-gradient(105deg, transparent 30%, rgba(255,215,0,0.15) 50%, transparent 70%);
+  animation: shimmer 1.8s ease-in-out infinite;
+  will-change: transform;
+  pointer-events: none;
+}
+@keyframes shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* VERIFIED (R3) — existing hook, zero JS: any agent at consensus seals the verdict.
+   Wax-seal stamp: inset box-shadow impression + 1px gold border + text → --gold. */
+body:has(.agent.consensus) .consensus-bar {
+  border-color: var(--gold);
+  box-shadow:
+    inset 0 2px 6px rgba(255,215,0,0.22),
+    inset 0 -1px 3px rgba(0,0,0,0.55),
+    0 0 18px rgba(255,215,0,0.12);
+  color: var(--gold);
+}
+body:has(.agent.consensus) .consensus-bar span {
+  color: var(--gold);
+}
+
+/* DIVIDED (R11) — no consensus, by design. Fractured 28px border via
+   padding-box fill + border-box fracture gradient (border-image rejected:
+   ignores radius). Crimson left, gold right, 1px void gap at center.
+   v2.2's gold-tint fill rgba(255,215,0,0.07) absorbed into the padding-box layer. */
+.consensus-bar.divided {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(rgba(255,215,0,0.07), rgba(255,215,0,0.07)) padding-box,
+    linear-gradient(90deg, var(--red) 0 calc(50% - 0.5px), transparent calc(50% - 0.5px) calc(50% + 0.5px), var(--gold) calc(50% + 0.5px)) border-box;
+}
+.consensus-bar.divided span {
+  color: var(--gold);
+  font-style: italic;
+}
+/* altar-unrest (§E, §G): two data-URI noise layers on ::before, opacity
+   keyframes only — never background-position. 3s ease-in-out infinite alternate. */
+.consensus-bar.divided::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E"),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='m'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.55' numOctaves='3'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23m)' opacity='0.35'/%3E%3C/svg%3E");
+  animation: altar-unrest 3s ease-in-out infinite alternate;
+}
+@keyframes altar-unrest {
+  0%   { opacity: 0.14; }
+  100% { opacity: 0.4; }
+}
+
+/* PROVISIONAL (R3 contract) — NEW class; CSS ships ready, activates when JS adds it.
+   Hollow 1px dashed --gold outline + slow 4s opacity heartbeat. */
+.consensus-bar.provisional {
+  border: 1px dashed var(--gold);
+  background: transparent;
+  color: var(--gold);
+  animation: provisional-pulse 4s ease-in-out infinite;
+}
+@keyframes provisional-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+/* SOLE (R3 contract + R10) — NEW class; one voice carries the verdict.
+   Bar keeps a quiet gold-rimmed presence; the halo lives on the WRAP because
+   the bar's overflow:hidden would clip it (R10). */
+.consensus-bar.sole {
+  border-color: rgba(255,215,0,0.45);
+  box-shadow: 0 0 22px rgba(255,215,0,0.1);
+}
+.consensus-wrap:has(.consensus-bar.sole)::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 560px;
+  height: 260px;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(ellipse 50% 50% at 50% 50%, rgba(255,215,0,0.14) 0%, rgba(255,215,0,0.05) 45%, transparent 70%);
+  pointer-events: none;
+}
+.consensus-wrap:has(.consensus-bar.sole) .consensus-bar {
+  z-index: 1;
+}
+
+/* ---------- THE COUNCIL SEAL (SUMMON BUTTON) ---------- */
+
+.summon-wrap {
+  display: flex;
+  justify-content: center;
+}
+
+/* v2.2 preserved (64px circle, base 135deg gradient, glow, transition hooks);
+   v4.0 (§E, §G): position:relative + overflow:hidden anchor the rotating
+   gradient ::before and contain the ripple ::after. */
+.summon-btn {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--red-bright) 0%, var(--red) 45%, var(--red-deep) 100%);
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 0 24px rgba(230,57,70,0.4), 0 4px 14px rgba(69,10,10,0.6);
+  transition: transform var(--ease), box-shadow var(--ease);
+  position: relative;
+  overflow: hidden;
+}
+
+/* seal-rotate (§E): the ::before layer carries the 135deg gradient and rotates
+   at var(--seal-rotate-speed) linear infinite; the button keeps its base
+   gradient underneath as the static fallback (identical, so degradation is
+   invisible). Oversized inset so rotation never reveals a corner. */
+.summon-btn::before {
+  content: "";
+  position: absolute;
+  inset: -30%;
+  background: linear-gradient(135deg, var(--red-bright) 0%, var(--red) 45%, var(--red-deep) 100%);
+  animation: seal-rotate var(--seal-rotate-speed) linear infinite;
+  pointer-events: none;
+}
+@keyframes seal-rotate {
+  to { transform: rotate(1turn); }
+}
+
+/* ripple-burst (§E): :active triggers scale 0.6→1.8 + opacity 0.5→0, 600ms ease-out */
+.summon-btn::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255,255,255,0.4) 0%, rgba(255,215,0,0.18) 55%, transparent 72%);
+  transform: scale(0.6);
+  opacity: 0;
+  pointer-events: none;
+}
+.summon-btn:active::after {
+  animation: ripple-burst 600ms ease-out;
+}
+@keyframes ripple-burst {
+  0%   { transform: scale(0.6); opacity: 0.5; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+
+.summon-btn svg {
+  position: relative;
+  z-index: 1; /* glyph rides above the rotating gradient layer */
+}
+
+.summon-btn:active { transform: scale(0.94); }
+/* v4.0: hover is a deliberate 15deg rotation of the seal + glow expand — NOT generic scale */
+.summon-btn:hover {
+  transform: rotate(15deg);
+  box-shadow: 0 0 34px rgba(230,57,70,0.6), 0 6px 18px rgba(69,10,10,0.7);
+}
+
+/* The seal's glow breathes with the council (§C chamber mood, component level).
+   Static per-state box-shadow only; the existing transition hook settles it. */
+body:has(.agent.thinking) .summon-btn {
+  box-shadow: 0 0 34px rgba(255,77,90,0.55), 0 0 14px rgba(255,215,0,0.18), 0 4px 14px rgba(69,10,10,0.6);
+}
+body:has(.agent.consensus) .summon-btn {
+  box-shadow: 0 0 30px rgba(255,215,0,0.35), 0 4px 14px rgba(69,10,10,0.6);
+}
+
+
+/* ---------- SCRIMS — THE VOID CURTAIN ---------- */
+/* Component upgrade 6 (Master Prompt) / Foundation R6 + §G.
+   enhanced: v2.2 flat rgba(0,0,0,0.5) becomes a radial void gradient
+   var(--scrim-center) → var(--scrim-edge) (frozen tokens, §B.2).
+   Geometry, stacking (z-index 90, §D invariant), opacity transition, and the
+   .hidden interplay are preserved exactly: JS still toggles .hidden on
+   #sheetScrim / #drawerScrim; nothing about scrim behavior changes for JS. */
+.scrim {
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(ellipse 120% 120% at 50% 50%, var(--scrim-center) 0%, var(--scrim-edge) 100%); /* enhanced: was rgba(0,0,0,0.5) — R6 void curtain */
+  z-index: 90;
+  opacity: 1;
+  transition: opacity var(--ease);
+}
+
+/* new (R6): contracted-gradient layer. Opacity crossfade from the flat base
+   gradient to a gradient whose bright center is pulled toward the opening
+   element ("focus pull"). Driven by @keyframes because animations restart on
+   display:none → rendered while transitions do not (R6/R8 confirmed).
+   Opacity-only — GPU-compliant. ::after on both scrims stays RESERVED (§G). */
+.scrim::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  animation: scrim-contract 300ms ease-out forwards;
+}
+/* sheet scrim contracts toward the bottom edge (the Command Dais rises) */
+#sheetScrim::before {
+  background: radial-gradient(ellipse 90% 70% at 50% 100%, var(--scrim-center) 0%, var(--scrim-edge) 100%);
+}
+/* drawer scrim contracts toward the right edge (the Council Archive slides in) */
+#drawerScrim::before {
+  background: radial-gradient(ellipse 90% 110% at 100% 50%, var(--scrim-center) 0%, var(--scrim-edge) 100%);
+}
+
+/* owned keyframes — frozen name (Foundation §E): scrim-contract */
+@keyframes scrim-contract {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* ---------- BOTTOM SHEET — THE COMMAND DAIS ---------- */
+/* Component upgrade 5 (Master Prompt). Structure/geometry/motion preserved
+   verbatim; only the top border is enhanced (Foundation R11 technique):
+   border: 1px solid transparent + background layered <fill> padding-box over
+   <gradient> border-box. border-image was rejected frozen — it ignores
+   border-radius (R11). Only border-top has width, so the border-box gradient
+   is visible solely as the 1px top strip, clipped by the 20px top radius.
+   Idle = gold (Foundation §C :root defaults = idle state). */
+.bottom-sheet {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  background:
+    linear-gradient(var(--drawer-bg), var(--drawer-bg)) padding-box,
+    linear-gradient(90deg, rgba(255,215,0,0.25) 0%, var(--gold) 50%, rgba(255,215,0,0.25) 100%) border-box; /* enhanced: was background: var(--drawer-bg) — R11 gradient-border fill+frame */
+  border-top: 1px solid transparent; /* enhanced: was 1px solid #333 — gradient now supplies the edge */
+  border-radius: 20px 20px 0 0;
+  padding: 12px 20px calc(24px + env(safe-area-inset-bottom));
+  transform: translateY(105%);
+  transition: transform var(--ease);
+  z-index: 100;
+  max-height: 85dvh;
+  overflow-y: auto;
+}
+.bottom-sheet.open { transform: translateY(0); }
+
+/* new: GENERATING state — dais edge runs red while any seat is thinking.
+   Frozen selector body:has(.agent.thinking) (Foundation §C / R2 :has() path;
+   states snap on class change per §C). Browsers without :has() keep the idle
+   gold edge — acceptable degradation (Foundation §H.1). */
+body:has(.agent.thinking) .bottom-sheet {
+  background:
+    linear-gradient(var(--drawer-bg), var(--drawer-bg)) padding-box,
+    linear-gradient(90deg, rgba(230,57,70,0.30) 0%, var(--red) 50%, rgba(230,57,70,0.30) 100%) border-box;
+}
+
+/* preserved verbatim (v2.2 lines 318–324) */
+.sheet-handle {
+  width: 36px;
+  height: 4px;
+  background: #444;
+  border-radius: 2px;
+  margin: 0 auto 16px;
+}
+
+/* preserved verbatim (v2.2 lines 326–335) */
+.sheet-label {
+  display: block;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 10px;
+}
+
+/* enhanced: preserved + focus outer glow "council is listening"
+   (Master Prompt component 5). Transition gains box-shadow so the glow
+   eases in with the border. */
+#queryInput {
+  width: 100%;
+  background: #1C1C1C;
+  border: 1px solid #333;
+  border-radius: 12px;
+  color: var(--text);
+  font-family: 'Inter', sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  padding: 12px 14px;
+  resize: none;
+  outline: none;
+  min-height: 140px;
+  max-height: 40dvh;
+  overflow-y: auto;
+  transition: border-color var(--ease), box-shadow var(--ease); /* enhanced: was border-color var(--ease) */
+}
+#queryInput:focus {
+  border-color: var(--red);
+  box-shadow: 0 0 12px rgba(230,57,70,0.2); /* enhanced: new — static declaration, not animated */
+}
+
+/* preserved verbatim (v2.2 lines 356–372) */
+.input-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 6px;
+  padding: 0 2px;
+}
+.input-hint {
+  font-size: 11px;
+  color: #555;
+  letter-spacing: 0.03em;
+}
+.char-count {
+  font-size: 11px;
+  color: #555;
+  font-variant-numeric: tabular-nums;
+}
+
+/* enhanced: gradient/hover/active preserved verbatim; position: relative added
+   solely to anchor the R4 ✦ ::after overlay (§G assigns .send-btn::after to W3). */
+.send-btn {
+  width: 100%;
+  margin-top: 12px;
+  background: linear-gradient(135deg, var(--red-bright) 0%, var(--red) 50%, var(--red-deep) 100%);
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 16px;
+  font-weight: 500;
+  padding: 14px;
+  cursor: pointer;
+  position: relative; /* enhanced: new — anchors ::after glyph overlay (R4) */
+  transition: opacity var(--ease), filter var(--ease);
+}
+.send-btn:hover { filter: brightness(1.08); }
+.send-btn:active { opacity: 0.85; }
+
+/* new: R4 glyph flash — while the consensus bar is loading, the send label
+   swaps to the ✦ seal. BEST-EFFORT (Foundation R4/D4): the visible effect
+   depends on .loading outliving the sheet-close timing in JS, which the
+   swarm cannot verify (app.js/ui-plus.js unseen). If the sheet closes on
+   send, the flash is moot and this rule is harmless dead CSS. ✦ (U+2726) is
+   not in Space Grotesk — font-family: system-ui fallback per R4. */
+body:has(.consensus-bar.loading) .send-btn { color: transparent; }
+body:has(.consensus-bar.loading) .send-btn::after {
+  content: "✦"; /* U+2726 FOUR-POINTED STAR */
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-family: system-ui;
+  font-size: 16px;
+  pointer-events: none;
+}
+
+/* ---------- DOCUMENT UPLOAD ---------- */
+/* preserved verbatim (v2.2 lines 391–455) */
+.drop-zone {
+  margin-top: 14px;
+  border: 1px dashed #3A3A3A;
+  border-radius: 12px;
+  padding: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color var(--ease), color var(--ease), background var(--ease);
+  user-select: none;
+}
+.drop-zone:hover, .drop-zone:focus-visible {
+  border-color: var(--red);
+  color: var(--text);
+}
+.drop-zone.dragover {
+  border-color: var(--red);
+  background: rgba(230,57,70,0.08);
+  color: var(--text);
+}
+
+.attachment-list {
+  list-style: none;
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.attachment-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: #1A1A1A;
+  border: 1px solid #2A2A2A;
+  border-radius: 8px;
+  padding: 8px 11px;
+  font-size: 12px;
+  color: #CCC;
+}
+.attachment-list .att-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-list .att-size {
+  color: #555;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.attachment-list .att-remove {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+}
+.attachment-list .att-remove:hover { color: var(--red); }
+
+/* ---------- DRAWER — THE COUNCIL ARCHIVE ---------- */
+/* Component upgrade 7 (Master Prompt). Geometry/motion preserved verbatim;
+   border-left enhanced via the same R11 radius-safe technique as the dais:
+   1px transparent border + fill padding-box over a top-to-bottom
+   --maroon → --oxblood gradient border-box. Only border-left has width, so
+   the gradient is visible solely as the 1px left strip. */
+.drawer {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: 280px;
+  max-width: 85vw;
+  background:
+    linear-gradient(var(--drawer-bg), var(--drawer-bg)) padding-box,
+    linear-gradient(to bottom, var(--maroon) 0%, var(--oxblood) 100%) border-box; /* enhanced: was background: var(--drawer-bg) — R11 fill+frame */
+  border-left: 1px solid transparent; /* enhanced: was 1px solid #333 */
+  transform: translateX(105%);
+  transition: transform var(--ease);
+  z-index: 100;
+  overflow-y: auto;
+  padding: 16px 16px 32px;
+}
+.drawer.open { transform: translateX(0); }
+
+/* new: aged-parchment noise (Master Prompt component 7; §G assigns
+   .drawer::before to W3, ::after stays RESERVED). Same feTurbulence data-URI
+   SVG technique as v2.2 body::before (CSP: img-src data: — R7), opacity 0.03.
+   Static declaration — no animation. NOTE: absolute inset:0 is sized to the
+   drawer's padding box and scrolls with its content; content taller than one
+   viewport outruns the texture. Accepted (subtle 0.03 tint). */
+.drawer::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.03;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.6'/%3E%3C/svg%3E");
+}
+
+/* preserved verbatim (v2.2 lines 473–493) */
+.drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.drawer-title {
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700;
+  color: var(--red);
+  font-size: 17px;
+}
+.drawer-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 26px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+
+/* preserved verbatim (v2.2 lines 495–507) + enhanced hover below */
+.drawer-action {
+  width: 100%;
+  background: rgba(230,57,70,0.12);
+  border: 1px solid var(--red);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 11px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 14px;
+  cursor: pointer;
+  margin-bottom: 16px;
+  transition: background var(--ease);
+}
+.drawer-action:active { background: rgba(230,57,70,0.25); }
+
+/* new: hover gold pulse (Master Prompt component 7: bg rgba(230,57,70,0.12)
+   → slow pulse rgba(255,215,0,0.08); Foundation §E frozen keyframes
+   drawer-gold-pulse, 2.4s ease-in-out infinite). Runs only while hovered;
+   the preserved v2.2 red-tint base is the pulse trough so the button never
+   loses its base color. Applies to .subtle too (same class) — its hover
+   trough reads as a faint red ember; accepted, documented in migration rows.
+   DEVIATION NOTE: §E says "opacity pulse"; animating background-color is the
+   only pseudo-free way to pulse the hint (§G grants .drawer-action no
+   pseudo), at the cost of a tiny hover-only repaint — no continuous ambient
+   cost, GPU constraint's intent (transform/opacity for ambient loops) kept. */
+.drawer-action:hover { animation: drawer-gold-pulse 2.4s ease-in-out infinite; }
+
+/* owned keyframes — frozen name (Foundation §E): drawer-gold-pulse */
+@keyframes drawer-gold-pulse {
+  0%, 100% { background-color: rgba(230,57,70,0.12); } /* v2.2 base = rest */
+  50%      { background-color: rgba(255,215,0,0.08); } /* gold hint peak (§E) */
+}
+
+/* preserved verbatim (v2.2 lines 509–514) */
+.drawer-action.subtle {
+  border-color: #333;
+  background: #1C1C1C;
+  margin-top: 8px;
+  margin-bottom: 0;
+}
+
+/* preserved verbatim (v2.2 lines 516–536) */
+.drawer details {
+  border-top: 1px solid #262626;
+  padding: 12px 0;
+}
+.drawer summary {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.drawer summary::-webkit-details-marker { display: none; }
+.drawer summary::after {
+  content: "+";
+  float: right;
+  color: #555;
+}
+.drawer details[open] summary::after { content: "–"; }
+
+/* preserved verbatim (v2.2 lines 538–556) */
+.history-list, .error-list {
+  list-style: none;
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.history-list li, .error-list li {
+  font-size: 13px;
+  line-height: 1.4;
+  background: #1A1A1A;
+  border-radius: 8px;
+  padding: 9px 11px;
+  color: #CCC;
+  word-break: break-word;
+}
+.history-list li .q { color: var(--muted); display: block; margin-bottom: 3px; font-size: 12px; }
+.error-list li { color: #C77; }
+.empty-note { color: #555 !important; background: none !important; font-style: italic; }
+
+/* preserved verbatim (v2.2 lines 558–583) */
+.settings { margin-top: 10px; display: flex; flex-direction: column; gap: 12px; }
+.settings label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.settings input[type="password"] {
+  background: #1C1C1C;
+  border: 1px solid #333;
+  border-radius: 8px;
+  color: var(--text);
+  padding: 9px 11px;
+  font-size: 14px;
+  outline: none;
+}
+.settings input[type="password"]:focus { border-color: var(--red); }
+.toggle-row {
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px !important;
+  color: var(--text) !important;
+}
+.toggle-row input { accent-color: var(--red); width: 20px; height: 20px; }
+
+/* preserved verbatim (v2.2 lines 585–590) */
+.about-text {
+  margin-top: 10px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #AAA;
+}
+
+/* ---------- TOAST — THE COUNCIL WHISPER ---------- */
+/* Component upgrade 8 (Master Prompt). Position, radius, padding, z-index
+   (200, §D invariant), box-shadow and toast-in preserved verbatim.
+   enhanced: background #1C1C1C → rgba(18,18,18,0.85) glass +
+   backdrop-filter: blur(12px) (+ -webkit- prefix). backdrop-filter is a
+   STATIC declaration — allowed (not animated; glass on small surfaces is
+   within the §H.5 performance budget). Neutral border stays --red. */
+.toast {
+  position: fixed;
+  bottom: calc(28px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(18,18,18,0.85); /* enhanced: was #1C1C1C — glassmorphism */
+  backdrop-filter: blur(12px); /* enhanced: new — static declaration, allowed */
+  -webkit-backdrop-filter: blur(12px); /* enhanced: new — Safari prefix */
+  border: 1px solid var(--red); /* neutral state — preserved color */
+  color: var(--text);
+  font-size: 13px;
+  font-family: 'Space Grotesk', sans-serif;
+  padding: 10px 18px;
+  border-radius: 24px;
+  z-index: 200;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+  animation: toast-in 200ms ease-out;
+}
+
+/* new: reactive border contract (Master Prompt component 8). CLASS CONTRACT:
+   .success (consensus reached / export done) → --gold; .error → --red-bright;
+   no modifier = neutral --red. DEAD CSS UNTIL JS ADOPTS IT — v2.2 JS sets
+   only textContent on #toast; no behavior change until JS adds the classes
+   (same accepted-dead-CSS posture as the R3 state contract). Documented in
+   V40-DOCS-W3.md JS integration rows. */
+.toast.success { border-color: var(--gold); }
+.toast.error   { border-color: var(--red-bright); }
+
+/* carried verbatim (v2.2 lines 609–612) — frozen name, unchanged (§E) */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(8px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+
+/* ---------- ACCESSIBILITY / MOTION ---------- */
+/* v2.2 focus style PRESERVED VERBATIM (context line; sits directly before the
+   reduced-motion block in v2.2 document order). */
+:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+
+/* Reduced motion — v2.2's universal rule PRESERVED VERBATIM (kills every
+   animation/transition, including all chamber drift), plus Foundation H.3
+   additions: fracture/hot layers hidden; static harmonious gradient on
+   body::after (v2.2's five radials, frozen in place, plus a faint gold
+   whisper for equilibrium — no motion of any kind); seal rotation off
+   (explicit line; .summon-btn::before owned by the summon writer). */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+
+  html::before,
+  html::after { display: none; }
+
+  body::after {
+    background:
+      radial-gradient(ellipse 60% 45% at 50% 18%, rgba(255, 77, 90, 0.16) 0%, transparent 70%),
+      radial-gradient(ellipse 55% 50% at 12% 78%, rgba(230, 57, 70, 0.14) 0%, transparent 70%),
+      radial-gradient(ellipse 50% 55% at 88% 70%, rgba(185, 28, 28, 0.16) 0%, transparent 70%),
+      radial-gradient(ellipse 70% 60% at 75% 10%, rgba(127, 29, 29, 0.20) 0%, transparent 70%),
+      radial-gradient(ellipse 80% 70% at 25% 30%, rgba(69, 10, 10, 0.55) 0%, transparent 75%),
+      radial-gradient(ellipse 50% 40% at 50% 45%, rgba(255, 215, 0, 0.05) 0%, transparent 70%);
+  }
+
+  .summon-btn::before { animation: none !important; } /* H.3: seal rotation off (explicit) */
+}
+
+/* ---------- MOBILE (max-width: 640px) — Foundation R14 / H.4, NET-NEW ----------
+   v2.2 has zero viewport media queries; this block is additive.
+   Chamber: base stream simplified to 3 stops (the hot core, the deep-red
+   east drift, and the oxblood floor); linear flow layer and the two
+   html pseudo-layers dropped (no fracture/intensity layers on mobile).
+   Transform drift continues — composited and cheap. */
+@media (max-width: 640px) {
+  body::after {
+    background:
+      radial-gradient(ellipse 70% 50% at 50% 18%, rgba(255, 77, 90, 0.14) 0%, transparent 70%),
+      radial-gradient(ellipse 60% 55% at 85% 70%, rgba(185, 28, 28, 0.16) 0%, transparent 70%),
+      radial-gradient(ellipse 85% 75% at 25% 30%, rgba(69, 10, 10, 0.55) 0%, transparent 75%);
+  }
+
+  html::before,
+  html::after { display: none; } /* H.4: no hot/harmony or fracture layers */
+
+  /* Component-level lines other writers' components need (H.4): */
+  .summon-btn::before { animation: none; } /* seal-rotate off (summon writer's layer) */
+  /* Crests (crest writer): no rule needed — §F silhouettes are ≤4-vertex and
+     already legible at 24px; crest geometry is unchanged at this breakpoint. */
+  /* Toast / consensus-bar: unaffected — fixed positioning, own stacking
+     contexts, no chamber-layer dependency. */
+}
+
+/* ==========================================================================
+   V4.0-LIVE — CHAMBER + LEGIBILITY OVERRIDE  (rev 2)
+   Fable, 2026-08-01. APPENDED: later rules win the cascade, so nothing in the
+   1,296 lines above is edited. Delete this whole block to revert cleanly.
+   ========================================================================== */
+
+/* ==========================================================================
+   PART A — CHAMBER MOTION
+   The v4.0 baseline does animate, but at translate3d(±2%) / scale(1.02) over
+   26 SECONDS: below the threshold of perception on a soft full-bleed radial,
+   which is why it read as a static background.
+
+   ⚠ WHAT REV 1 GOT WRONG — recorded so it is not repeated. Rev 1 kept a
+   linear-gradient on each moving layer and raised its alpha from ~0.12 to
+   ~0.42 to make the colour descent legible. Together those produced the pink
+   and gold BARS down the sides during output:
+     · A linear-gradient spans the ELEMENT, and these elements are 160vmax
+       wide. The viewport shows roughly a third of that, so smooth stops
+       compress into hard-edged bands across the screen.
+     · Rotating a linear-gradient turns those bands into a barber pole.
+       Radials rotate gracefully; linears do not.
+     · The gold band appeared specifically DURING OUTPUT because html::before
+       is gated by --chamber-hot-opacity, which climbs to 0.308 while thinking.
+
+   Rev 2 removes every linear-gradient from the moving layers. The colour
+   descent now comes from counter-rotating RADIAL stacks in different hues: as
+   they sweep past each other the blend at any point genuinely travels, and
+   every edge is a soft falloff, so nothing can read as a bar at any angle.
+   ========================================================================== */
+
+/* ---------- A1. Rotation-safe geometry ---------- */
+html::before,
+html::after,
+body::after {
+  /* inset:-20% cannot survive rotation — corners sweep into view. A centred
+     square of side >= the viewport diagonal (max 1.42 x vmax) always covers. */
+  inset: auto;
+  top: 50%;
+  left: 50%;
+  width: 160vmax;
+  height: 160vmax;
+  margin-top: -80vmax;
+  margin-left: -80vmax;
+  will-change: transform;
+}
+
+/* ---------- A2. Base chamber — the deep stream ----------
+   v2.2's five radials preserved in colour and intent, plus three at new angles
+   so rotation keeps bringing fresh hue into view rather than sweeping the same
+   five past you. Radials only. */
+body::after {
+  background:
+    radial-gradient(ellipse 60% 45% at 50% 18%, rgba(255, 77, 90, 0.18) 0%, transparent 70%),
+    radial-gradient(ellipse 55% 50% at 12% 78%, rgba(230, 57, 70, 0.16) 0%, transparent 70%),
+    radial-gradient(ellipse 50% 55% at 88% 70%, rgba(185, 28, 28, 0.18) 0%, transparent 70%),
+    radial-gradient(ellipse 70% 60% at 75% 10%, rgba(127, 29, 29, 0.22) 0%, transparent 70%),
+    radial-gradient(ellipse 65% 55% at 30% 50%, rgba(153, 27, 27, 0.20) 0%, transparent 72%),
+    radial-gradient(ellipse 58% 62% at 62% 88%, rgba(190, 40, 55, 0.15) 0%, transparent 72%),
+    radial-gradient(ellipse 75% 50% at  8% 22%, rgba(110, 20, 30, 0.24) 0%, transparent 74%),
+    radial-gradient(ellipse 80% 70% at 25% 30%, rgba(69, 10, 10, 0.55) 0%, transparent 75%);
+  animation:
+    chamber-turn calc(var(--gradient-drift-speed) * 3.2) linear infinite,
+    chamber-breathe var(--gradient-drift-speed) ease-in-out infinite alternate;
+}
+
+/* ---------- A3. Hot layer — counter-rotating, carries the descent ----------
+   Counter-rotation makes the two streams visibly interfere rather than travel
+   together; that interference IS the colour change. Gold stays low and spread
+   wide so it reads as warmth in the blend, never as its own shape. */
+html::before {
+  background:
+    radial-gradient(ellipse 55% 45% at 50% 30%, rgba(255,  77,  90, 0.30) 0%, transparent 72%),
+    radial-gradient(ellipse 60% 55% at 78% 22%, rgba(255, 215,   0, 0.10) 0%, transparent 78%),
+    radial-gradient(ellipse 58% 52% at 20% 75%, rgba(255, 215,   0, 0.07) 0%, transparent 78%),
+    radial-gradient(ellipse 62% 50% at 15% 40%, rgba(255, 120,  90, 0.14) 0%, transparent 74%),
+    radial-gradient(ellipse 60% 50% at 50% 85%, rgba(230,  57,  70, 0.22) 0%, transparent 72%);
+  /* ROTATION ONLY — deliberately no opacity animation. This layer is gated by
+     opacity: var(--chamber-hot-opacity), 0 at IDLE and raised per council
+     state. An opacity animation would OVERRIDE that variable and pin the layer
+     visible at idle, silently destroying the entire state map. */
+  animation: chamber-turn-reverse calc(var(--gradient-drift-speed) * 4.6) linear infinite;
+}
+
+/* ---------- A4. Fracture — gold dual-stream, DIVIDED only ---------- */
+html::after {
+  background:
+    radial-gradient(ellipse 58% 52% at 82% 30%, rgba(255, 215,  0, 0.16) 0%, transparent 76%),
+    radial-gradient(ellipse 52% 56% at 70% 78%, rgba(255, 215,  0, 0.10) 0%, transparent 78%),
+    radial-gradient(ellipse 60% 50% at 15% 60%, rgba(230,  57, 70, 0.16) 0%, transparent 74%);
+  animation: chamber-turn-reverse calc(var(--gradient-drift-speed) * 2.4) linear infinite;
+}
+
+/* ---------- A5. Keyframes ---------- */
+@keyframes chamber-turn {
+  from { transform: rotate(0deg)   scale(1);    }
+  to   { transform: rotate(360deg) scale(1);    }
+}
+@keyframes chamber-turn-reverse {
+  from { transform: rotate(360deg) scale(1.05); }
+  to   { transform: rotate(0deg)   scale(1.05); }
+}
+/* OPACITY ONLY, and ONLY on body::after — the always-on base, which has no
+   opacity variable to clobber. The other two layers are state-gated. */
+@keyframes chamber-breathe {
+  0%   { opacity: 0.85; }
+  50%  { opacity: 1;    }
+  100% { opacity: 0.90; }
+}
+
+/* ---------- A6. State response, widened so council state is legible ---------- */
+body:has(.agent.thinking),
+body:has(.consensus-bar.loading) { --gradient-drift-speed: 7s;  }
+body:has(.agent.consensus)       { --gradient-drift-speed: 34s; }
+body:has(.consensus-bar.divided) { --gradient-drift-speed: 11s; }
+
+
+/* ==========================================================================
+   PART B — RESPONSE PANEL: DARKER, CALMER GROUND
+   The verdict panel sat at rgba(20,8,8,0.72). At 28% transparency a now-moving
+   gradient shows straight through white body text, and moving contrast behind
+   static text is what causes the eye strain. Deeper, winier, and much more
+   opaque: the chamber still breathes AROUND the panel, but the reading surface
+   itself holds still.
+   ========================================================================== */
+.consensus-bar {
+  background: rgba(32, 9, 15, 0.93);          /* deep wine, near-opaque */
+  border-color: rgba(230, 57, 70, 0.55);      /* softer frame; full --red was hot against the darker fill */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+/* The divided panel is the longest read in the app — same treatment. */
+.divided-card,
+#rqSessions .rq-sess {
+  background: rgba(28, 8, 13, 0.94) !important;
+}
+.divided-card p,
+#rqSessions .rq-sess {
+  color: #ECE4E4;                              /* slightly warm white — pure #FFF glares on wine */
+}
+
+
+/* ==========================================================================
+   PART C — DRAWER: FIT THE TEXT TO THE PANEL
+   280px is too narrow for the log lines this app writes ("[P3] recorded
+   DEGRADED_WINDOW_SKIP tombstone: Context budget admitted only 4 of 10..."),
+   and #C77 on #1A1A1A is low contrast for what is really body text. The lines
+   were also set to word-break: break-word, which splits ordinary words
+   mid-character — the single worst thing for scanning a log.
+   ========================================================================== */
+.drawer {
+  width: 400px;
+  max-width: 92vw;                             /* still full-bleed-ish on a phone */
+  padding: 16px 18px 32px;
+}
+
+.history-list li,
+.error-list li {
+  font-size: 12.5px;
+  line-height: 1.55;
+  padding: 10px 12px;
+  color: #DCD2D2;                              /* was #CCC */
+  background: #17100F;                         /* warm near-black, sits with the wine palette */
+  border: 1px solid rgba(230, 57, 70, 0.10);
+  /* normal + anywhere: ordinary words stay whole and only unbreakable tokens
+     (URLs, uuids, model slugs) wrap. break-word split everything. */
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Log lines are technical: identifiers, hex ids, model slugs, SQL codes.
+   A tabular face makes them scannable instead of a wall of prose. */
+.error-list li {
+  color: #E3B9B9;                              /* was #C77 — same hue, readable weight */
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  letter-spacing: 0.01em;
+}
+
+/* Timeline cards live in the same drawer and inherit the same width problem. */
+#rqSessions .rq-sess-head { line-height: 1.5; }
+#rqSessions .rq-pos-clip,
+#rqSessions .rq-pos-full { word-break: normal; overflow-wrap: anywhere; }
+
+
+/* ==========================================================================
+   PART D — ACCESSIBILITY
+   Motion this visible must be defeatable. Rotation stops entirely; every
+   colour, contrast and state hook above survives.
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  html::before,
+  html::after,
+  body::after {
+    animation: none !important;
+    transform: none !important;
+  }
+}
