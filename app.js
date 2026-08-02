@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.6-stale-state";
+  const RQ_BUILD = "v3.9.7-mobile-flags";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4092,6 +4092,53 @@ roundData,
       };
       paintFT();
       e2.parentNode.insertBefore(ft, e2.nextSibling);
+
+      // v3.9.7 — MOBILE REACHABILITY. Every feature flag lives in localStorage,
+      // which is PER-DEVICE, and until now only rq_fulltext had a button. The
+      // other four were console-only — which on a phone means unreachable, so
+      // half of R134 shipped desktop-only without anyone noticing. Same pattern
+      // as the toggle above; each states its flag and repaints in place.
+      //
+      // Deliberately NOT hidden behind a "developer" section: these change what
+      // the app records and, for arc retrieval, what the seats read. If a
+      // setting is consequential enough to need a warning, it is consequential
+      // enough to be visible.
+      [
+        ["snapshotToggle", "rq_snapshot", "LEDGER SNAPSHOT",
+         "Snapshot + Restore buttons appear in the timeline header. Export the ledger to a file before any cache clear.",
+         "Snapshot/Restore hidden. New rounds are unaffected."],
+        ["ledgerSearchToggle", "rq_ledger_search", "LEDGER SEARCH",
+         "Search bar and seat/RESOLVED chips appear above the timeline.",
+         "Timeline shows the original five filter chips."],
+        ["p3ScoringToggle", "rq_p3_scoring", "P3: ARC SCORING",
+         "New arcs are scored on structural integrity, so they can become retrievable. Does NOT change what the seats read.",
+         "Arcs store UNSCORED, which means they can never be retrieved."],
+        ["p3RetrievalToggle", "rq_p3_retrieval", "P3: ARC RETRIEVAL",
+         "\u26A0 ARCS ENTER SEAT CONTEXT. Rounds run with this on are NOT baseline-comparable to rounds run without it.",
+         "Seats do not read arcs. This is the baseline condition."],
+      ].forEach(([id, flag, label, onMsg, offMsg]) => {
+        const b = document.createElement("button");
+        b.id = id; b.type = "button";
+        b.className = saveSettingsBtn.className || "";
+        b.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+        const paint = () => {
+          const on = localStorage.getItem(flag) === "on";
+          b.textContent = label + ": " + (on ? "ON" : "OFF");
+        };
+        paint();
+        ft.parentNode.insertBefore(b, ft.nextSibling);
+        b.addEventListener("click", () => {
+          try {
+            const now = localStorage.getItem(flag) !== "on";
+            localStorage.setItem(flag, now ? "on" : "off");
+            paint();
+            logError("[SETTINGS] " + label + " " + (now ? "ON" : "OFF") + " \u2014 " + (now ? onMsg : offMsg) +
+              " Reload to apply UI changes.");
+          } catch (_) {
+            logError("[SETTINGS] Could not write " + flag + " \u2014 localStorage unavailable (private browsing?).");
+          }
+        });
+      });
       ft.addEventListener("click", () => {
         try {
           const now = !fullTextEnabled();
