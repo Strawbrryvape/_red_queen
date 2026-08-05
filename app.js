@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.7-mobile-flags";
+  const RQ_BUILD = "v3.9.8-counterstamp";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -5031,7 +5031,16 @@ roundData,
         };
       }
       // Still divided — attach any located contested claims for display.
-      return { text: null, divided: true, answers, contestedNote: adj ? adj.contestedNote : null };
+      // v3.9.8 COUNTERSTAMP (R1) — propagate the adjudication verdict stream and
+      // the shadow-partition read that runAdjudication already computed. They
+      // were being dropped here; Gate 3 has no primary input without them.
+      // Additive keys only, null when adjudication was disabled/unavailable.
+      return { text: null, divided: true, answers, contestedNote: adj ? adj.contestedNote : null,
+               verdicts: adj ? adj.verdicts : null,
+               shadowPartition: adj ? adj.shadowPartition : null,
+               shadowPartitionDegraded: adj ? adj.shadowPartitionDegraded : null,
+               shadowPartitionSeats: adj ? adj.shadowPartitionSeats : null,
+               shadowPartitionReason: adj ? adj.shadowPartitionReason : null };
     }
     if (outliers.length > 0) {
       outliers.forEach((o) =>
@@ -6316,6 +6325,425 @@ roundData,
       return null;
     });
   }
+
+  // ================= v3.9.8: COUNTERSTAMP disagreement diagnostic =================
+  // K3 Round 155 (Kimi design) + OSD visual layer (Gemini) — spec
+  // COUNTERSTAMP-SPEC-DRAFT.md, governed by CS-FOUNDATION.md (R1–R13).
+  //
+  // Deterministic, surface-only, ZERO API calls (R2). Runs AFTER a genuinely
+  // divided live round and classifies the KIND of disagreement the flat
+  // DIVIDED tag cannot express. Never blocks, delays, or re-runs a round;
+  // every throw is caught by the dispatch hook and logged "— round unaffected."
+  // (fail-soft precedent: the P4 catch in p4ScoreRound).
+  //
+  // BUILD NOTE — this pass ships gates + storage ONLY. The OSD render layer
+  // (ensureCounterstampUI / csChip / expandCsEvidence) is deliberately NOT
+  // built: the spec's own Quick-Start forbids UI before shadow validation,
+  // because chips render stored entry.cs values and there is nothing to show
+  // until shadow rounds accumulate.
+
+  // Gate-1 shared-object floor. PROVISIONAL — the spec's 0.12 was tuned
+  // against synthetic vectors, not real rounds. Round 138 measured real
+  // agreeing seats at 0.128/0.129/0.183 on this same Jaccard, so 0.12 sits
+  // 0.008 away from a known measurement failure. Every round logs its actual
+  // max overlap so 20 shadow rounds can set this from data.
+  const CS_GATE1_MIN_SIM = 0.12;
+
+  // Gate-1 floor applied when p4DetectPartition already returned positive.
+  // RULED 2026-08-04 (K3): Gate 1 defers to the partition detector, because a
+  // SHEAR round is by definition low-overlap and would otherwise be rejected
+  // as PARALLEL (the spec's own V5 scores 0.100 against a 0.120 floor).
+  //
+  // BUILD-SEAT AMENDMENT, flagged back to K3: the ruling says the detector
+  // "computes structural shared-ground at higher fidelity than first-line
+  // Jaccard." It does not. Its whole decision chain is verdict shape, polarity,
+  // position length and cross-citation — there is no topical test anywhere in
+  // it. Three seats answering three UNRELATED questions, all HOLD and all
+  // substantive, are partition-positive too. A bare bypass would therefore
+  // collapse PARALLEL into SHEAR and hand the operator SYNTHESIZE where the
+  // correct action is MERGE. So partition-positive LOWERS the floor rather
+  // than removing it: V5 at 0.100 reaches SHEAR, V2 at 0.000 still returns
+  // PARALLEL. PROVISIONAL value — needs the ledger dump like the main floor.
+  // PROVISIONAL, and the margin is thin. Measured with the real similarity():
+  //   spec V5, three orthogonal facets of one question   -> 0.1111  (want SHEAR)
+  //   three genuinely unrelated long answers             -> 0.0588  (want PARALLEL)
+  // 0.07 separates the only two labelled examples that exist, and that is all
+  // it does. A 0.05-wide band is close to this comparator's resolution limit,
+  // which is itself the evidence for the original finding: Jaccard is being
+  // asked to distinguish "facets of one question" from "different questions",
+  // and it can barely do it. Do not treat this constant as settled until it has
+  // been fitted against hand-labelled rounds from the ledger dump.
+  const CS_GATE1_MIN_SIM_PARTITION = 0.07;
+
+  // Gate-2 skew rule selector. K3 RULING 1 (2026-08-04) AMENDED Foundation §E
+  // from "identity" to "degradation".
+  //   "identity"    — the original frozen rule: any tier>=1 / provider!=primary
+  //                   asymmetry is skew. It fails on the intended architecture:
+  //                   seatTier returns 1 for groq and cerebras and 0 for
+  //                   primary, so the standard roster (kimi primary@t0 +
+  //                   gemini cerebras@t1 + claude groq@t1) is three
+  //                   provisioning classes and FIELD SKEW on EVERY round,
+  //                   structurally annihilating Gate 3.
+  //   "degradation" — RATIFIED: skew only when a seat is BELOW ITS OWN
+  //                   configured provider. Narrows the test from "different
+  //                   from primary" to "worse than configured", which is the
+  //                   asymmetry that actually indicates a provisioning
+  //                   failure, and respects the founder's seating decisions
+  //                   recorded in SEAT_WEIGHTS.
+  // Both rules are still computed every round and disagreement is logged, so
+  // the amendment is validated against 20 shadow rounds rather than asserted.
+  // K3 expects the dual-log to retire once that data confirms the fix.
+  const CS_SKEW_RULE = "degradation";
+
+  const CS_ACTIONS = {
+    "PARALLEL":    "MERGE, do not adjudicate",
+    "FIELD SKEW":  "EQUALIZE and RE-RUN",
+    "TRUE SPLIT":  "OPERATOR ADJUDICATION",
+    "FORK":        "RECORD BOTH CANDIDATES",
+    "SHEAR":       "SYNTHESIZE",
+    "UNRESOLVED":  "Supply missing resource and re-run",
+  };
+
+  // Flag reader — conceptMode() string-flag precedent, NOT the rack "on"/"off"
+  // convention. Default off (R6).
+  function counterstampMode() {
+    const v = localStorage.getItem("rq_counterstamp");
+    return (v === "shadow" || v === "live") ? v : "off";
+  }
+
+  function csFirstLine(a) {
+    return String((a && a.text) || "").split("\n")[0].trim();
+  }
+
+  // ---- GATE 1 — OBJECT. Is there a single shared proposition under dispute?
+  // Reuses tokenize()/similarity() (Jaccard over canonicalized tokens).
+  // Second argument is optional and additive; the frozen signature
+  // csGateObject(answers) still works and still means the same thing.
+  function csGateObject(answers, partitionPositive) {
+    const floor = partitionPositive ? CS_GATE1_MIN_SIM_PARTITION : CS_GATE1_MIN_SIM;
+    const usable = (answers || []).map(csFirstLine).filter((l) => l.length > 0);
+    if (usable.length < 2) {
+      return { passed: null, unresolved: true, maxSim: null,
+               evidence: ["fewer than 2 non-empty first lines"] };
+    }
+    let best = 0;
+    for (let i = 0; i < usable.length; i++) {
+      for (let j = i + 1; j < usable.length; j++) {
+        const s = similarity(usable[i], usable[j]);
+        if (s > best) best = s;
+      }
+    }
+    const deferred = !!partitionPositive && best < CS_GATE1_MIN_SIM && best >= floor;
+    return {
+      passed: best >= floor, unresolved: false, maxSim: best, deferred: deferred,
+      note: deferred
+        ? "GATE 1 DEFERRED (K3 Ruling 2) — overlap " + best.toFixed(3) +
+          " is below the normal floor " + CS_GATE1_MIN_SIM + " but p4DetectPartition is positive, " +
+          "so the floor drops to " + CS_GATE1_MIN_SIM_PARTITION + ". BOUNDED, not a bypass: the detector " +
+          "has no topical test, so unrelated answers scoring 0 still return PARALLEL."
+        : null,
+      evidence: [
+        "max first-line overlap " + best.toFixed(3) + " (floor " + floor +
+          (partitionPositive ? ", lowered from " + CS_GATE1_MIN_SIM + " — partition positive)" : ")"),
+        "first lines: " + usable.map((l) => clip(l, 60)).join(" | "),
+      ].concat(deferred ? ["GATE 1 DEFERRED (K3 Ruling 2) — bounded deferral, floor lowered to " + CS_GATE1_MIN_SIM_PARTITION] : []),
+    };
+  }
+
+  // ---- GATE 2 — GROUND. Did all seats see the same question with the same
+  // resources? Per-seat memory asymmetry is IMPOSSIBLE in this build — the
+  // composed prompt is byte-identical for every seat — so the memory check
+  // reduces to global on/off plus injection success when armed. Do not
+  // "implement" a per-seat memory read; there is nothing to read.
+  function csGateGround(result) {
+    const answers = (result && result.answers) || [];
+    const prov = answers.filter((a) => a && typeof a.tier === "number" && typeof a.provider === "string");
+    if (!answers.length || prov.length < answers.length) {
+      return { passed: null, unresolved: true, skews: [], skewsDegraded: [],
+               evidence: ["provisioning fields absent (demo-shaped answers?)"] };
+    }
+
+    // Signals both rules share.
+    const shared = [];
+    const mal = answers.filter((a) => a.malformed);
+    if (mal.length) shared.push(mal.length + " MALFORMED seat(s): " + mal.map((a) => a.name).join(", "));
+    const unav = ((result && result.verdicts) || []).filter((v) => v && v.unavailable);
+    if (unav.length) shared.push(unav.length + " adjudication UNAVAILABLE seat(s): " + unav.map((v) => v.seat).join(", "));
+    let configured = answers.length;
+    try { configured = Object.keys(seatProvider).length || answers.length; } catch (_) {}
+    if (answers.length < configured) shared.push("absent seat: " + answers.length + "/" + configured + " rendered");
+    try {
+      if (!memoryEnabled()) shared.push("memory subsystem OFF globally");
+      else if (injectionEnabled() && !_injectedThisRound) shared.push("injection armed but nothing reached the seats");
+    } catch (_) {}
+
+    // Rule A (FROZEN, Foundation §E): any difference in provider@tier class.
+    const classes = Array.from(new Set(prov.map((a) => a.provider + "@t" + a.tier)));
+    const skews = shared.slice();
+    if (classes.length > 1) skews.unshift("asymmetric provisioning: " + classes.join(", "));
+
+    // Rule B (PROPOSED, shadow): a seat is skewed only when it is operating
+    // BELOW its own configured provider — a real failover walk, not the
+    // designed heterogeneity of the seat roster.
+    const walked = prov.filter((a) => {
+      try { return a.provider !== configuredProvider(a.name); } catch (_) { return false; }
+    });
+    const skewsDegraded = shared.slice();
+    if (walked.length) {
+      skewsDegraded.unshift("seat(s) below configured provider: " +
+        walked.map((a) => a.name + " " + configuredProvider(a.name) + "->" + a.provider + "@t" + a.tier).join(", "));
+    }
+
+    let note = null;
+    const passedFrozen = skews.length === 0;
+    const passedDegraded = skewsDegraded.length === 0;
+    const evidence = ["provisioning classes: " + classes.join(", ") + "; " + answers.length + "/" + configured + " seats"]
+      .concat(CS_SKEW_RULE === "degradation" ? skewsDegraded : skews);
+    if (passedFrozen !== passedDegraded) {
+      note = "◇ SKEW RULE DIVERGENCE — identity rule says " + (passedFrozen ? "pass" : "SKEW") +
+        ", degradation rule says " + (passedDegraded ? "pass" : "SKEW") + "; this round is validation data for K3 Ruling 1";
+      evidence.push(note);
+    }
+    return {
+      passed: CS_SKEW_RULE === "degradation" ? passedDegraded : passedFrozen,
+      unresolved: false, skews, skewsDegraded,
+      passedFrozen, passedDegraded, evidence, note,
+    };
+  }
+
+  // ---- GATE 3 — COLLISION. Primary input is the adjudication verdict stream
+  // the round already paid for (propagated by the R1 edit). Degraded fallback
+  // is first-line polarity, and a degraded read NEVER guesses SHEAR.
+  function csGateCollision(result) {
+    const answers = (result && result.answers) || [];
+    const verdicts = (result && result.verdicts) || null;
+
+    if (verdicts && verdicts.length) {
+      const engaged = verdicts.filter((v) => v && v.counted && (v.verdict === "refute" || v.verdict === "concede"));
+      if (engaged.length) {
+        return { verdict: "TRUE SPLIT", degraded: false, evidence: engaged.map((v) =>
+          seatLabel(v.seat) + " " + String(v.verdict).toUpperCase() +
+          (v.target ? " -> " + v.target : "") + (v.error ? " — " + clip(v.error, 80) : "")) };
+      }
+      if (result.shadowPartition) {
+        return { verdict: "SHEAR", degraded: !!result.shadowPartitionDegraded, evidence: [
+          "shadowPartition positive" + (result.shadowPartitionSeats ? " (" + result.shadowPartitionSeats + ")" : "") +
+          ": " + (result.shadowPartitionReason || "")] };
+      }
+      const live = verdicts.filter((v) => v && v.parsed === true);
+      const substantive = answers.map(csFirstLine).filter((l) => l.length >= 40);
+      if (live.length >= 2 && live.every((v) => v.verdict === "hold") && substantive.length >= 2) {
+        return { verdict: "FORK", degraded: false, evidence: [
+          live.length + " readable HOLD verdict(s), no counted contradiction; " +
+          substantive.length + " distinct adoptable proposals"] };
+      }
+      return { verdict: "UNRESOLVED", unresolvedGate: 3, degraded: false,
+               evidence: ["adjudication stream present but inconclusive (unparsed verdicts)"] };
+    }
+
+    // Degraded fallback — adjudication disabled or returned null.
+    const usable = answers.map(csFirstLine).filter((l) => l.length > 0);
+    if (usable.length < 2) {
+      return { verdict: "UNRESOLVED", unresolvedGate: 3, degraded: true,
+               evidence: ["no adjudication stream; fewer than 2 first lines"] };
+    }
+    const stated = usable.map((l) => verdictPolarity(l)).filter((x) => x !== 0);
+    if (stated.length >= 2 && stated.some((x) => x !== stated[0])) {
+      return { verdict: "TRUE SPLIT", degraded: true,
+               evidence: ["DEGRADED fallback: opposing first-line polarity over shared subject"] };
+    }
+    const distinct = usable.filter((l, i) => usable.every((m, j) => i === j || similarity(l, m) < 0.5));
+    if (distinct.length >= 2) {
+      return { verdict: "FORK", degraded: true,
+               evidence: ["DEGRADED fallback: shared subject, no polarity opposition, " + distinct.length + " distinct proposals"] };
+    }
+    return { verdict: "UNRESOLVED", unresolvedGate: 3, degraded: true,
+             evidence: ["DEGRADED fallback inconclusive — never guess SHEAR on a degraded read"] };
+  }
+
+  function csClassify(gateResults) {
+    const g1 = gateResults.g1, g2 = gateResults.g2, g3 = gateResults.g3;
+    let verdict, gate = null, unresolvedGate = null, degraded = false, evidence = [];
+    if (g1.unresolved)      { verdict = "UNRESOLVED"; unresolvedGate = 1; evidence = g1.evidence; }
+    else if (!g1.passed)    { verdict = "PARALLEL";   gate = 1;           evidence = g1.evidence; }
+    else if (g2.unresolved) { verdict = "UNRESOLVED"; unresolvedGate = 2; evidence = g2.evidence; }
+    else if (!g2.passed)    { verdict = "FIELD SKEW"; gate = 2;           evidence = g2.evidence; }
+    else {
+      verdict = g3.verdict; gate = 3;
+      unresolvedGate = g3.unresolvedGate || null;
+      degraded = !!g3.degraded; evidence = g3.evidence || [];
+    }
+    return {
+      verdict: verdict,
+      gate: unresolvedGate || gate,
+      unresolvedGate: unresolvedGate,
+      gate1: g1.unresolved ? null : !!g1.passed,
+      gate2: (verdict === "PARALLEL" || g2.unresolved) ? null : (g2.passed == null ? null : !!g2.passed),
+      gate3: (verdict === "PARALLEL" || verdict === "FIELD SKEW" || unresolvedGate) ? null : true,
+      degraded: degraded,
+      evidence: evidence,
+      action: CS_ACTIONS[verdict] || CS_ACTIONS.UNRESOLVED,
+    };
+  }
+
+  function csLabel(cs) {
+    // UNRESOLVED@N composes from the two lean fields. There is NO
+    // unresolvedGate key on entry.cs — the shape is frozen at {verdict, gate,
+    // actions} by R7a. Do not widen it.
+    return (cs && cs.verdict === "UNRESOLVED" && typeof cs.gate === "number")
+      ? "UNRESOLVED@" + cs.gate : (cs && cs.verdict) || "UNRESOLVED";
+  }
+
+  function runCounterstamp(result, query) {
+    if (counterstampMode() === "off") return null;
+    const g1 = csGateObject(result && result.answers, !!(result && result.shadowPartition));
+
+    // K3 RULING 2 (2026-08-04) — Gate 1 DEFERS its Jaccard block when
+    // p4DetectPartition is positive. SHEAR is defined as seats describing
+    // perpendicular facets of one question, which means low lexical overlap —
+    // the exact property Gate 1 reads as "no shared proposition." Measured:
+    // the spec's own SHEAR vector scores 0.100 against a 0.12 floor and comes
+    // back PARALLEL. Jaccard cannot separate "different facets of one
+    // question" from "different questions"; the partition detector already
+    // establishes shared ground at higher fidelity. Gate 1's job is to cheaply
+    // exit truly unrelated answers (0.000), not to block an intentionally
+    // low-overlap divergence type.
+    // Gate 1 stays fully authoritative when P4 is silent or negative — which
+    // includes every round where adjudication was disabled, since
+    // shadowPartition is null in that case. No floor retuning, no reorder.
+    // NOTE for the record: §E's amendment text says "p4DetectPartition > 0";
+    // the propagated value is a boolean, so this tests === true.
+    const g2 = g1.passed
+      ? csGateGround(result)
+      : { passed: null, unresolved: false, skews: [], skewsDegraded: [], evidence: ["not run — Gate 1 failed"] };
+    const g3 = (g1.passed && g2.passed)
+      ? csGateCollision(result)
+      : { verdict: null, evidence: ["not run — earlier gate failed"] };
+    const cs = csClassify({ g1: g1, g2: g2, g3: g3 });
+
+    // csClassify only carries the DECIDING gate's evidence. Notes raised by an
+    // earlier gate — the Ruling 2 deferral, the Ruling 1 rule divergence —
+    // would otherwise be computed and silently dropped, which is exactly the
+    // failure the R1 propagation edit existed to fix. Carry them explicitly.
+    const notes = [g1.note, g2.note].filter(Boolean);
+    logError("◇ COUNTERSTAMP — " + csLabel(cs) + " (gate " + cs.gate +
+      (cs.degraded ? ", DEGRADED read" : "") + (g1.deferred ? ", gate1 deferred" : "") + ") — " + cs.action +
+      ". Evidence: " + (cs.evidence || []).concat(notes).join(" | ") +
+      (g1.maxSim != null ? " | gate1 maxSim " + g1.maxSim.toFixed(3) : "") +
+      (counterstampMode() === "shadow"
+        ? ". SHADOW ONLY — the round is still tagged DIVIDED; nothing displayed." : ""));
+    return cs;
+  }
+
+  function csStoreLedger(entry, csResult) {
+    if (!entry || !csResult) return;
+    // csClassify emits singular `action`; the frozen ledger field is plural
+    // `actions`. The mapping lives here and nowhere else.
+    entry.cs = { verdict: csResult.verdict, gate: csResult.gate, actions: csResult.action };
+    persistLedger();
+  }
+
+  // Session-sticky degrade, copied from the positions_full precedent: one 400
+  // disables remote writes for the session with a single drawer line naming
+  // the SQL file. There is no generic patch() helper in this codebase — the
+  // spec's reference body called one that does not exist — so this uses the
+  // same inline fetch shape as the positions_full PATCH.
+  let _csRemoteColumn = true;
+  function csStoreRemote(roundId, csResult) {
+    if (!roundId || !csResult || !_csRemoteColumn) return;
+    try {
+      if (!sbConfigured()) return;
+      fetch(settings.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/rq_meta_consensus?round_event_id=eq." + roundId, {
+        method: "PATCH",
+        headers: {
+          apikey: settings.supabaseAnonKey,
+          Authorization: "Bearer " + settings.supabaseAnonKey,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify({
+          counterstamp_verdict: csResult.verdict,
+          unresolved_gate: csResult.verdict === "UNRESOLVED" ? csResult.gate : null,
+          gate1_passed: csResult.gate1,
+          gate2_passed: csResult.gate2,
+          gate3_passed: csResult.gate3,
+          operator_action: csResult.action,
+        }),
+      }).then((r) => {
+        if (r.ok) return;
+        if (r.status === 400) {
+          _csRemoteColumn = false;
+          logError("[CS] rq_meta_consensus PATCH 400 — COUNTERSTAMP columns missing. Run rq-counterstamp-migration.sql; remote writes disabled for this session, rounds unaffected.");
+        } else {
+          logError("[CS] rq_meta_consensus PATCH failed (HTTP " + r.status + ") — round unaffected.");
+        }
+      }).catch((e) => logError("[CS] rq_meta_consensus PATCH unreachable: " + ((e && e.message) || e) + " — round unaffected."));
+    } catch (e) {
+      logError("[CS] remote write threw: " + ((e && e.message) || e) + " — round unaffected.");
+    }
+  }
+  // =============== end COUNTERSTAMP ===============
+
+  // ================= v3.9.8: NO_LEDGER composite (Fourth Voice cell B) =================
+  // K3 asked for a NO_LEDGER toggle for the composer. This is deliberately NOT
+  // that: adding a suppression branch inside the composer would mean cell B runs
+  // on different code than production, and any drift between that branch and the
+  // real composer becomes an uncontrolled variable — we would be measuring the
+  // toggle. Four flags already exist and compose to exactly the cell-B state, so
+  // this switch sets those and nothing else. The composer is untouched.
+  //
+  //   rq_memory_enabled  — the council ledger in context
+  //   rq_inject          — Stage 3 retrieval injection
+  //   rq_p3_retrieval    — narrator arc retrieval
+  //   rq_chim            — CHIM compression
+  //
+  // Prior state is saved so the switch is reversible, and the composite is
+  // announced at boot alongside the four individual flag lines it implies, so
+  // the condition stays auditable from logs that already existed.
+  //
+  //   rqCellB(true)   -> strip ledger context   (cell B / cell D condition)
+  //   rqCellB(false)  -> restore previous state
+  //   rqCellB()       -> report current state without changing it
+  const CS_NOLEDGER_FLAGS = ["rq_memory_enabled", "rq_inject", "rq_p3_retrieval", "rq_chim"];
+  const CS_NOLEDGER_KEY = "rq_no_ledger_prev";
+
+  function noLedgerActive() { return localStorage.getItem(CS_NOLEDGER_KEY) !== null; }
+
+  function rqCellB(on) {
+    const state = () => CS_NOLEDGER_FLAGS.map((f) => f + "=" + (localStorage.getItem(f) || "unset")).join(", ");
+    if (on === undefined) {
+      logError("[NO_LEDGER] " + (noLedgerActive() ? "ACTIVE" : "inactive") + " — " + state());
+      return noLedgerActive();
+    }
+    if (on) {
+      if (noLedgerActive()) { logError("[NO_LEDGER] already active — " + state()); return true; }
+      const prev = {};
+      CS_NOLEDGER_FLAGS.forEach((f) => { prev[f] = localStorage.getItem(f); localStorage.setItem(f, "off"); });
+      localStorage.setItem(CS_NOLEDGER_KEY, JSON.stringify(prev));
+      logError("⚠ [NO_LEDGER] ACTIVE — ledger context stripped for the Fourth Voice cell-B/D condition. " +
+        "Rounds run WITHOUT memory, injection, arc retrieval or CHIM. Not a normal operating mode. " +
+        "Restore with rqCellB(false). Reload to apply.");
+      return true;
+    }
+    const raw = localStorage.getItem(CS_NOLEDGER_KEY);
+    if (raw === null) { logError("[NO_LEDGER] not active — nothing to restore."); return false; }
+    try {
+      const prev = JSON.parse(raw);
+      CS_NOLEDGER_FLAGS.forEach((f) => {
+        if (prev[f] === null || prev[f] === undefined) localStorage.removeItem(f);
+        else localStorage.setItem(f, prev[f]);
+      });
+    } catch (e) {
+      logError("[NO_LEDGER] restore failed to parse saved state: " + ((e && e.message) || e) +
+        " — flags left OFF. Set them by hand and clear " + CS_NOLEDGER_KEY + ".");
+      return true;
+    }
+    localStorage.removeItem(CS_NOLEDGER_KEY);
+    logError("[NO_LEDGER] restored — " + state() + ". Reload to apply.");
+    return false;
+  }
+  try { window.rqCellB = rqCellB; } catch (_) {}
+  // =============== end NO_LEDGER composite ===============
 
   // v3.4.6 (Kimi, 2026-07-22) — surface the routing artifact that makes
   // agreement look stronger than it is. When two seats fall back to the same
@@ -7679,6 +8107,28 @@ roundData,
         if (window.__rqIntro) { window.__rqIntro.remove(); window.__rqIntro = null; }
         warnSeatDiversity(result);
         logInstitutionalMemory(dispatchId, query, result);
+        // v3.9.8 COUNTERSTAMP — synchronous, deterministic, zero API calls.
+        // Genuine divided live rounds only: note/narrator/indexical return
+        // divided:true but are NOT divergences; sole/verified/provisional/
+        // resolved are not divided; demo rounds never reach this branch.
+        if (divided && !result.note && !result.narrator && !result.indexical && counterstampMode() !== "off") {
+          try {
+            const csResult = runCounterstamp(result, query);
+            if (csResult) {
+              csStoreLedger(ledger[ledger.length - 1], csResult);
+              // The timeline was already repainted above, before entry.cs
+              // existed — repaint again so a live-mode chip appears on the
+              // round that just finished rather than one round late.
+              if (window.__rqRenderSessions) { try { window.__rqRenderSessions(); } catch (_) {} }
+              document.addEventListener("rq:round-stored", function _csOnce(ev) {
+                document.removeEventListener("rq:round-stored", _csOnce);
+                try { csStoreRemote(ev.detail && ev.detail.id, csResult); } catch (_) {}
+              }, { once: true });
+            }
+          } catch (e) {
+            logError("[COUNTERSTAMP] threw: " + ((e && e.message) || e) + " — round unaffected.");
+          }
+        }
         // v3.8.0 F2 — fragility scoring, shadow only, detached. Needs the round's
         // Supabase id, which logInstitutionalMemory obtains asynchronously, so it
         // listens for the id rather than racing it.
@@ -7878,6 +8328,16 @@ roundData,
       logError(injectionEnabled()
         ? "[INJECT] Stage 3 injection is ON — retrieved rounds will be placed in seat context. A/B rows this session record injected:true."
         : "[INJECT] Stage 3 injection is OFF — control arm. Settings → STAGE 3 INJECTION to enable.");
+      logError(counterstampMode() === "off"
+        ? "[CS] COUNTERSTAMP OFF — divided rounds carry the legacy DIVIDED tag only. Enable: localStorage.setItem('rq_counterstamp','shadow') and reload."
+        : "[CS] COUNTERSTAMP " + counterstampMode().toUpperCase() +
+          " — divided rounds diagnosed through Gates 1-3 (OBJECT/GROUND/COLLISION), skew rule '" + CS_SKEW_RULE + "'. " +
+          (counterstampMode() === "shadow"
+            ? "Shadow only: logged + stored, no UI. Promote with rq_counterstamp='live' after validation."
+            : "Live: diagnoses stored; OSD chip layer is not built in this release."));
+      if (noLedgerActive()) {
+        logError("⚠ [NO_LEDGER] ACTIVE — memory, injection, arc retrieval and CHIM are all forced OFF for the Fourth Voice cell-B/D condition. Rounds this session are NOT comparable to normal rounds. Restore with rqCellB(false).");
+      }
       // Catalog check moved forward to boot when a key exists. It used to fire on
       // first dispatch, fire-and-forget — which meant Edit 12's floor repair could
       // not land until AFTER that round had already walked a dead list. Still
