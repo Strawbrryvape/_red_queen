@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.8-counterstamp";
+  const RQ_BUILD = "v3.9.9-episodic";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -6237,7 +6237,13 @@ roundData,
       // rather than letting the chain end quietly.
       if (row && row.id) {
         try { document.dispatchEvent(new CustomEvent("rq:round-stored", { detail: { id: row.id } })); } catch (_) {}
-        embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse);
+        // v3.9.9 EPISODIC-META FILTER — greetings, sign-offs and pure
+        // acknowledgement are chat, not operational memory, and they become
+        // retrieval hubs. Storage, ledger and rendering are untouched; only
+        // the embedding is withheld, and only in live mode.
+        if (shouldEmbedRound(_evPrompt)) {
+          embedAndStore(row.id, _evPrompt + "\n\n" + _evResponse);
+        }
         // v3.6.0 — stamp the receipt. Detached like the embed: a crypto or
         // network failure here must never delay or fail a round. Same text that
         // was written to the row, so the hash covers what retrieval will read.
@@ -6744,6 +6750,90 @@ roundData,
   }
   try { window.rqCellB = rqCellB; } catch (_) {}
   // =============== end NO_LEDGER composite ===============
+
+
+  // ============ v3.9.9: EPISODIC-META FILTER (keep chat out of memory) ============
+  // Round 151, Gemini seat: rounds that are greetings, sign-offs or pure
+  // acknowledgement should be tagged [EPISODIC_META] and "never retrieved for
+  // functional reasoning. They serve only as chat logs, not as operational
+  // memory." This is that tag, and the measurement that justified it:
+  //
+  // Across 20 near-miss retrieval queries (best_similarity 0.48-0.60), 100
+  // candidate slots drew from only 55 distinct rounds. The top twelve supplied
+  // 45 of them. The single worst offender — "Im going to bed so just use this
+  // round to review each other's points" — was a top-5 candidate for 5 of 20
+  // queries. An operator sign-off with no informational content was being
+  // handed to the seats as relevant history a quarter of the time.
+  //
+  // That is HUBNESS, not a bad floor: a few generically-worded rounds sit near
+  // the centroid of the embedding space and are moderately similar to
+  // everything. Lowering rq_sim_floor would surface MORE of them, not fewer.
+  // The fix is to stop embedding them.
+  //
+  // TWO THINGS THIS DOES NOT DO, stated plainly so nobody assumes otherwise:
+  //   1. It is PREVENTIVE, not curative. Rounds already embedded stay embedded;
+  //      the existing hubs remain until their vectors are explicitly nulled.
+  //      See rq-episodic-audit.sql — an operator decision, never automatic.
+  //   2. It NEVER affects dispatch, consensus, adjudication, the ledger, the
+  //      timeline or Supabase storage. The round runs and is recorded exactly
+  //      as before. The only thing withheld is the embedding, which is the
+  //      only thing that makes a round retrievable.
+  //
+  // DEFAULT IS SHADOW. This is a heuristic and heuristics are wrong sometimes;
+  // a false positive makes a genuinely memory-worthy round permanently
+  // unretrievable and silent about it. Shadow logs the decision without acting
+  // on it. Read the ◇ EPISODIC lines for a session or two, then promote.
+  //
+  // Deliberately NOT reusing isOperatorNote's explicit-only rule (#note / note:).
+  // That ruling governs SKIPPING CONSENSUS, where a false positive silently
+  // costs a real question its deliberation. The stakes here are far lower — a
+  // misfiled round is merely not retrievable — so a heuristic is proportionate.
+  // Different decision, different bar, and the ruling is not being weakened.
+
+  function episodicFilterMode() {
+    const v = localStorage.getItem("rq_episodic_filter");
+    return (v === "off" || v === "live") ? v : "shadow";   // default SHADOW
+  }
+
+  // Sign-offs, greetings and pure acknowledgement. Conservative by design:
+  // a missed exclusion costs one hub, a wrong exclusion costs a memory.
+  const EPISODIC_SIGNOFF = /\b(go(ing)?\s+to\s+bed|good\s?night|signing\s+off|call\s+it\s+a\s+night|that'?s\s+(all|it)\s+for\s+(today|tonight|now)|thats\s+all\s+for\s+(today|tonight)|rest\s+up|talk\s+(to\s+you\s+)?tomorrow|see\s+(you|ya)\s+tomorrow|catch\s+you\s+tomorrow|heading\s+(to\s+bed|out)|i'?m\s+off\s+to\s+bed)\b/i;
+  const EPISODIC_ACK = /^\s*(thanks|thank\s+you|thx|congratulations|congrats|nice\s+work|well\s+done|good\s+job|great\s+job|lol+|lmao+|haha+|awesome|amazing|beautiful|perfect|noted|ok(ay)?|got\s+it|sounds\s+good)\b/i;
+
+  // A round is episodic only if it carries no question AND matches a sign-off
+  // or opens with pure acknowledgement. The no-question requirement is the
+  // safety catch: anything the operator actually asked stays in memory, however
+  // casually it was phrased.
+  function isEpisodicMeta(prompt) {
+    const p = String(prompt || "").trim();
+    if (!p) return { episodic: true, reason: "empty prompt" };
+    if (isOperatorNote(p)) return { episodic: true, reason: "explicit operator note" };
+    if (p.indexOf("?") !== -1) return { episodic: false, reason: "contains a question" };
+    if (EPISODIC_SIGNOFF.test(p)) return { episodic: true, reason: "sign-off, no question" };
+    if (EPISODIC_ACK.test(p)) return { episodic: true, reason: "acknowledgement, no question" };
+    return { episodic: false, reason: "" };
+  }
+
+  // Returns true when the round should be embedded. Logs its reasoning either
+  // way in shadow, so the decision is auditable before it is trusted.
+  function shouldEmbedRound(prompt) {
+    const mode = episodicFilterMode();
+    if (mode === "off") return true;
+    const v = isEpisodicMeta(prompt);
+    if (!v.episodic) return true;
+    if (mode === "shadow") {
+      logError("◇ EPISODIC — would EXCLUDE from vector memory (" + v.reason +
+        "): \"" + clip(String(prompt || "").replace(/\s+/g, " "), 70) +
+        "\". SHADOW ONLY — the round IS being embedded. Promote with " +
+        "localStorage.setItem('rq_episodic_filter','live').");
+      return true;
+    }
+    logError("[EPISODIC] excluded from vector memory (" + v.reason +
+      "): \"" + clip(String(prompt || "").replace(/\s+/g, " "), 70) +
+      "\". The round is stored and rendered normally; it is only not retrievable.");
+    return false;
+  }
+  // ================ end EPISODIC-META FILTER ================
 
   // v3.4.6 (Kimi, 2026-07-22) — surface the routing artifact that makes
   // agreement look stronger than it is. When two seats fall back to the same
@@ -8328,6 +8418,12 @@ roundData,
       logError(injectionEnabled()
         ? "[INJECT] Stage 3 injection is ON — retrieved rounds will be placed in seat context. A/B rows this session record injected:true."
         : "[INJECT] Stage 3 injection is OFF — control arm. Settings → STAGE 3 INJECTION to enable.");
+      logError("[EPISODIC] filter " + episodicFilterMode().toUpperCase() +
+        (episodicFilterMode() === "shadow"
+          ? " — sign-off/acknowledgement rounds are LOGGED but still embedded. Read the ◇ EPISODIC lines, then promote with localStorage.setItem('rq_episodic_filter','live')."
+          : episodicFilterMode() === "live"
+            ? " — sign-off/acknowledgement rounds are NOT embedded. They still run, store and render normally; they are simply not retrievable."
+            : " — every round is embedded, including sign-offs. Retrieval hubs are expected."));
       logError(counterstampMode() === "off"
         ? "[CS] COUNTERSTAMP OFF — divided rounds carry the legacy DIVIDED tag only. Enable: localStorage.setItem('rq_counterstamp','shadow') and reload."
         : "[CS] COUNTERSTAMP " + counterstampMode().toUpperCase() +
