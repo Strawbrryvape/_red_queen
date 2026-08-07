@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.9-episodic";
+  const RQ_BUILD = "v3.9.10-rack-gate1";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4116,11 +4116,78 @@ roundData,
         ["p3RetrievalToggle", "rq_p3_retrieval", "P3: ARC RETRIEVAL",
          "\u26A0 ARCS ENTER SEAT CONTEXT. Rounds run with this on are NOT baseline-comparable to rounds run without it.",
          "Seats do not read arcs. This is the baseline condition."],
-      ].forEach(([id, flag, label, onMsg, offMsg]) => {
+
+        // ---- v3.9.10 F0 — INSTRUMENTS (tri-state). These three were console-only
+        // until now, which cost the 2026-08-06 session three divided rounds of
+        // COUNTERSTAMP data because localStorage is per-device and neither flag
+        // had been set on that browser. Cycle order off -> shadow -> live, so
+        // reaching live requires passing through shadow: the shadow-before-live
+        // doctrine is enforced by the control instead of by operator memory.
+        ["counterstampToggle", "rq_counterstamp", "COUNTERSTAMP", "", "",
+         { read: () => counterstampMode(), cycle: [
+           ["off", "Divided rounds carry the legacy DIVIDED tag only. No diagnosis runs."],
+           ["shadow", "Diagnoses computed, logged and stored. No UI, no operator action bound to them yet."],
+           ["live", "Diagnoses drive operator-facing output. Only after 20 hand-labelled rounds at \u226580% agreement."]] }],
+        ["episodicToggle", "rq_episodic_filter", "EPISODIC FILTER", "", "",
+         { read: () => episodicFilterMode(), cycle: [
+           ["off", "Sign-offs and acknowledgements embed normally. Hubs keep accumulating."],
+           ["shadow", "Would-exclude rounds are logged (\u25C7 EPISODIC) and embedded anyway. Read the lines before promoting."],
+           ["live", "Sign-offs, greetings and pure acknowledgement are withheld from the embedding corpus. Preventive only \u2014 rounds already embedded stay embedded."]] }],
+        // NOTE: conceptMode() is TWO-state (shadow | live, default shadow) \u2014 there
+        // is no "off". Verified in the tree, not assumed from the COUNTERSTAMP
+        // precedent it was modelled on.
+        ["conceptModeToggle", "rq_concept_mode", "CONCEPT COMPARATOR", "", "",
+         { read: () => conceptMode(), cycle: [
+           ["shadow", "Concept agreement is computed and divergence is logged, but the LEXICAL comparator still decides the round."],
+           ["live", "The concept comparator DECIDES consensus. Rounds are not baseline-comparable to lexical-decided rounds."]] }],
+      ].forEach((tuple) => {
+        const [id, flag, label, onMsg, offMsg, cyc] = tuple;
         const b = document.createElement("button");
         b.id = id; b.type = "button";
         b.className = saveSettingsBtn.className || "";
         b.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+
+        // ---- v3.9.10 F0: OPTIONAL 6th element = cycling (tri-state) tuple.
+        // Absent  -> the binary path below runs verbatim, byte-identical to
+        //            v3.9.9 for all four existing tuples.
+        // Present -> { read, cycle: [[value, message], ...] }. `read` is the
+        //            module's own accessor and is AUTHORITATIVE: rq_episodic_filter
+        //            defaults to "shadow" when the key is unset, so painting from
+        //            raw localStorage would show OFF while the module runs SHADOW.
+        //            A control that lies about state is worse than no control.
+        const cycling = cyc && Array.isArray(cyc.cycle) && cyc.cycle.length >= 2;
+        if (cycling) {
+          const states = cyc.cycle;
+          const readState = () => {
+            try {
+              if (typeof cyc.read === "function") {
+                const v = cyc.read();
+                if (states.some((s) => s[0] === v)) return v;
+              }
+            } catch (_) {}
+            const raw = localStorage.getItem(flag);
+            return states.some((s) => s[0] === raw) ? raw : states[0][0];
+          };
+          const paintCycle = () => { b.textContent = label + ": " + String(readState()).toUpperCase(); };
+          paintCycle();
+          ft.parentNode.insertBefore(b, ft.nextSibling);
+          b.addEventListener("click", () => {
+            try {
+              const cur = readState();
+              let i = states.findIndex((s) => s[0] === cur);
+              if (i < 0) i = 0;
+              const next = states[(i + 1) % states.length];
+              localStorage.setItem(flag, next[0]);
+              paintCycle();
+              logError("[SETTINGS] " + label + " \u2192 " + String(next[0]).toUpperCase() +
+                " \u2014 " + next[1] + " Reload to apply.");
+            } catch (_) {
+              logError("[SETTINGS] Could not write " + flag + " \u2014 localStorage unavailable (private browsing?).");
+            }
+          });
+          return;
+        }
+
         const paint = () => {
           const on = localStorage.getItem(flag) === "on";
           b.textContent = label + ": " + (on ? "ON" : "OFF");
@@ -6417,8 +6484,54 @@ roundData,
     return (v === "shadow" || v === "live") ? v : "off";
   }
 
+  // v3.9.10 — GATE 1 DEFECT #1. The first live COUNTERSTAMP fire returned
+  // PARALLEL at 0.071 because the Gemini seat opened with
+  // **GEMINI SEAT — POSITION STATEMENT** and Gate 1 compared a formatting
+  // header against two real positions. A banner is not a proposition; it is
+  // also not a proposal (Gate 3's substantive test, length >= 40) and has no
+  // polarity (Gate 3's degraded fallback). One helper, three call sites.
+  //
+  // Conservative by the same doctrine as the episodic filter: when EVERY line
+  // looks like a banner we return the original first line rather than nothing.
+  // A missed skip costs one bad score; an over-eager skip discards a position.
+  const CS_BANNER_MAX = 90;   // banners are short; a long line is prose
+
+  function csIsBannerLine(line) {
+    const s = String(line || "").trim();
+    if (!s) return true;
+    // Strip markdown wrappers: **bold**, __bold__, ## heading, > quote, --- rule.
+    const bare = s.replace(/^[#>\-*_\s]+/, "").replace(/[*_#\s]+$/, "").trim();
+    if (!bare) return true;                                   // pure rule / empty wrapper
+    const terminal = /[.?!]$/.test(bare);
+    // (a) ALL CAPS label with no sentence terminator: "GEMINI SEAT — POSITION STATEMENT".
+    //     Terminal punctuation exempts it, so a shouted real answer ("NO.") survives.
+    if (!terminal && bare.length <= CS_BANNER_MAX && bare === bare.toUpperCase() &&
+        /[A-Z]/.test(bare)) return true;
+    // (b) "<name> seat" / "seat: ..." nameplate in any case, no terminator.
+    if (!terminal && bare.length <= CS_BANNER_MAX &&
+        /^(?:[A-Za-z0-9]+\s+)?seat\b|^\s*seat\s*[:\-\u2014\u2013]/i.test(bare)) return true;
+    // (c) Bare section label: "Position Statement", "Answer:", "Verdict —".
+    if (/^(position|answer|response|verdict|summary|statement|analysis|opinion|conclusion|recommendation)\s*(statement)?\s*[:\-\u2014\u2013]?\s*$/i.test(bare)) return true;
+    return false;
+  }
+
+  // Returns { line, skipped } — skipped counts banner lines walked past, so the
+  // gates can say in evidence that they moved, rather than silently rescoring.
+  function csFirstLineMeta(a) {
+    const raw = String((a && a.text) || "").split("\n");
+    const first = (raw[0] || "").trim();
+    let skipped = 0;
+    for (let i = 0; i < raw.length; i++) {
+      const l = (raw[i] || "").trim();
+      if (!l) { continue; }
+      if (csIsBannerLine(l)) { skipped++; continue; }
+      return { line: l, skipped: skipped };
+    }
+    return { line: first, skipped: 0 };   // every line looked like a banner: keep line 1
+  }
+
   function csFirstLine(a) {
-    return String((a && a.text) || "").split("\n")[0].trim();
+    return csFirstLineMeta(a).line;
   }
 
   // ---- GATE 1 — OBJECT. Is there a single shared proposition under dispute?
@@ -6427,7 +6540,9 @@ roundData,
   // csGateObject(answers) still works and still means the same thing.
   function csGateObject(answers, partitionPositive) {
     const floor = partitionPositive ? CS_GATE1_MIN_SIM_PARTITION : CS_GATE1_MIN_SIM;
-    const usable = (answers || []).map(csFirstLine).filter((l) => l.length > 0);
+    const metas = (answers || []).map(csFirstLineMeta);
+    const skippedTotal = metas.reduce((n, m) => n + (m.skipped || 0), 0);
+    const usable = metas.map((m) => m.line).filter((l) => l.length > 0);
     if (usable.length < 2) {
       return { passed: null, unresolved: true, maxSim: null,
                evidence: ["fewer than 2 non-empty first lines"] };
@@ -6452,7 +6567,9 @@ roundData,
         "max first-line overlap " + best.toFixed(3) + " (floor " + floor +
           (partitionPositive ? ", lowered from " + CS_GATE1_MIN_SIM + " — partition positive)" : ")"),
         "first lines: " + usable.map((l) => clip(l, 60)).join(" | "),
-      ].concat(deferred ? ["GATE 1 DEFERRED (K3 Ruling 2) — bounded deferral, floor lowered to " + CS_GATE1_MIN_SIM_PARTITION] : []),
+      ].concat(skippedTotal ? ["BANNER SKIP (v3.9.10) — walked past " + skippedTotal +
+          " non-propositional line(s) to reach the scored lines above"] : [])
+       .concat(deferred ? ["GATE 1 DEFERRED (K3 Ruling 2) — bounded deferral, floor lowered to " + CS_GATE1_MIN_SIM_PARTITION] : []),
     };
   }
 
