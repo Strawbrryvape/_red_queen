@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.11-capacity-guard";
+  const RQ_BUILD = "v3.9.12-clear-consent";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -5251,6 +5251,22 @@ roundData,
   // exists this substrate can still drop rounds, so it must never do it
   // quietly. Warn ten rounds out — roughly one session of headroom.
   const LEDGER_WARN_AT = LEDGER_MAX_ENTRIES - 10;
+  // v3.9.12 — LEDGER-LOSS AUDIT TRAIL. Nothing distinguished "cleared
+  // deliberately" from "cleared by accident", and the ledger cannot record its
+  // own erasure. The breadcrumb lives in its OWN localStorage key so it
+  // survives the wipe it describes, and is stated at boot.
+  const LEDGER_CLEARED_KEY = "rq_ledger_cleared_at";
+  function noteLedgerCleared(source, count) {
+    try {
+      localStorage.setItem(LEDGER_CLEARED_KEY, JSON.stringify({
+        at: new Date().toISOString(), source: String(source || "unknown"), count: Number(count) || 0,
+      }));
+    } catch (_) {}
+    try {
+      logError("[LEDGER] CLEARED via " + source + " \u2014 " + count +
+        " round(s) erased from this browser. Supabase rows are unaffected; a snapshot file, if you have one, restores them.");
+    } catch (_) {}
+  }
   let _ledgerEvictAnnounced = false;    // one loud line per session on first eviction
   let _ledgerPersistFailed = false;     // set by persistLedger's catch; read by the banner
   const LEDGER_VERBATIM_ROUNDS = 3;     // newest N rounds get fuller text
@@ -6157,9 +6173,12 @@ roundData,
     forget.title = "Erase the council ledger (permanent)";
     toggle.addEventListener("click", () => { setMemoryEnabled(!memoryEnabled()); refresh(); });
     forget.addEventListener("click", () => {
-      if (!confirm("Erase the council's memory of " + ledger.length + " round(s)? This is permanent.")) return;
+      if (!confirm("Erase the council's memory of " + ledger.length + " round(s)?\n\n" +
+                   "Permanent for this browser. Supabase rows are NOT affected, and a snapshot file restores this ledger.\n\nContinue?")) return;
+      const _forgetCount = ledger.length;
       ledger = [];
       persistLedger();
+      noteLedgerCleared("FORGET", _forgetCount);
       clearFullTextStore();   // F1 — privacy parity; unconditional, unawaited
       refresh();
     });
@@ -7608,8 +7627,12 @@ roundData,
     clearAll.textContent = "Clear all";
     clearAll.style.cssText = statsBtn.style.cssText;
     clearAll.addEventListener("click", () => {
-      if (!confirm("Clear the whole timeline? (This also erases the council's memory.)")) return;
+      if (!confirm("Clear the whole timeline?\n\nThis also erases the council's memory: " +
+                   ledger.length + " round(s), permanently, from this browser. " +
+                   "Supabase rows are NOT affected.\n\nContinue?")) return;
+      const _clearAllCount = ledger.length;
       ledger = []; persistLedger(); clearFullTextStore(); renderSessions();   // F1 — privacy parity
+      noteLedgerCleared("Clear all", _clearAllCount);
       if (memoryPill && memoryPill.refresh) memoryPill.refresh();
     });
     title.appendChild(statsBtn);
@@ -7747,6 +7770,9 @@ roundData,
           ev.stopPropagation();
           deleteFullText(e.t);   // F1 — before the splice, while e is still in scope
           ledger.splice(i, 1); persistLedger(); renderSessions();
+          // v3.9.12 — no confirm here on purpose: one round, explicitly chosen,
+          // from a list. But it is still a loss, so it is still audible.
+          logError("[LEDGER] deleted 1 round (t=" + (e && e.t) + ") \u2014 " + ledger.length + " remain.");
           if (memoryPill && memoryPill.refresh) memoryPill.refresh();
         });
         body.appendChild(del);
@@ -8577,8 +8603,20 @@ roundData,
     // v2.9: New Session is a true fresh start — the council forgets the
     // conversation. (Ledger otherwise survives reloads; only the user
     // erases memory, via New Session or the FORGET pill.)
+    //
+    // v3.9.12 — THIS PATH HAD NO CONFIRMATION. FORGET and Clear-all both ask;
+    // New Session, which erases exactly as much, did not — and its name reads
+    // as "start a new conversation" rather than "erase N rounds permanently."
+    // The guard fires ONLY when there is something to lose, so the ordinary
+    // case (empty ledger, genuinely starting fresh) stays a single click.
+    if (ledger.length &&
+        !confirm("New Session erases this browser's council memory.\n\n" +
+                 ledger.length + " round(s) will be permanently deleted from this device. " +
+                 "Supabase rows are NOT affected.\n\nContinue?")) return;
+    const _clearedCount = ledger.length;
     ledger = [];
     persistLedger();
+    if (_clearedCount) noteLedgerCleared("New Session", _clearedCount);
     clearFullTextStore();   // F1 — privacy parity
     if (memoryPill && memoryPill.refresh) memoryPill.refresh();
     consensusBar.classList.add("is-empty");
@@ -8606,6 +8644,14 @@ roundData,
       logError(fullTextEnabled()
         ? "[F1] Full-text ledger is ON — seat responses stored verbatim (IndexedDB rq_fulltext_v1), clipped only at render."
         : "[F1] Full-text ledger is OFF — ledger stores 300-char clips exactly as v3.8.4. Settings → FULL-TEXT LEDGER to enable. (A hard cache clear resets this.)");
+      // v3.9.12 — if this browser's ledger was cleared, say so and say by what.
+      try {
+        const _cl = JSON.parse(localStorage.getItem(LEDGER_CLEARED_KEY) || "null");
+        if (_cl && _cl.at) {
+          logError("[LEDGER] last cleared " + _cl.at + " via " + _cl.source + " (" + _cl.count +
+            " round(s)). If that was not deliberate: Supabase still has the rows, and Restore takes a snapshot file back in.");
+        }
+      } catch (_) {}
       logError("[LEDGER] " + ledger.length + "/" + LEDGER_MAX_ENTRIES + " rounds \u2014 " +
         (ledger.length >= LEDGER_MAX_ENTRIES
           ? "\u26A0 AT CAPACITY, every new round evicts the oldest. Export a snapshot."
