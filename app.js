@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.10-rack-gate1";
+  const RQ_BUILD = "v3.9.11-capacity-guard";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -5244,6 +5244,15 @@ roundData,
   //    so a 200-entry ledger can never balloon a prompt past a free seat's
   //    limit. Tune MEMORY_CONTEXT_CHAR_CAP between the two, never above HARD_MAX.
   const LEDGER_MAX_ENTRIES = 200;       // persistent cap (localStorage hygiene)
+  // v3.9.11 — INTERIM CAPACITY GUARD (K3 ruling 2026-08-07 §4). The cap is a
+  // Pillar VI / Spine decision and is NOT changed here. What changes is that
+  // approaching it, and crossing it, are both AUDIBLE. "Compression, never
+  // disappearance" is the pillar's organising principle; until the Spine
+  // exists this substrate can still drop rounds, so it must never do it
+  // quietly. Warn ten rounds out — roughly one session of headroom.
+  const LEDGER_WARN_AT = LEDGER_MAX_ENTRIES - 10;
+  let _ledgerEvictAnnounced = false;    // one loud line per session on first eviction
+  let _ledgerPersistFailed = false;     // set by persistLedger's catch; read by the banner
   const LEDGER_VERBATIM_ROUNDS = 3;     // newest N rounds get fuller text
   const MEMORY_CONTEXT_CHAR_CAP = 6000; // ≈1500 tokens — injection budget (raised from 2400)
   const MEMORY_CONTEXT_HARD_MAX = 8000; // ≈2000 tokens — absolute ceiling; CHAR_CAP must never exceed this
@@ -5286,7 +5295,15 @@ roundData,
       });
       localStorage.setItem(LEDGER_KEY, JSON.stringify(lean));
     }
-    catch (e) { logError("Ledger persist failed (localStorage full?) — memory continues in-page only. " + (e.message || e)); }
+    catch (e) {
+      // v3.9.11 — this line always existed; what is new is that the failure is
+      // now STICKY and surfaced in the capacity banner too. A drawer line can
+      // scroll away; a persist failure means every subsequent round is
+      // in-page only and dies with the tab.
+      _ledgerPersistFailed = true;
+      logError("Ledger persist failed (localStorage full?) — memory continues in-page only. " + (e.message || e));
+      try { if (window.__rqMaybeSnapshotBanner) window.__rqMaybeSnapshotBanner(); } catch (_) {}
+    }
   }
 
   function memoryEnabled() {
@@ -5692,7 +5709,23 @@ roundData,
     });
     ledger.push(entry);
     if (ledger.length > LEDGER_MAX_ENTRIES) {
+      // v3.9.11 — this trim was SILENT. It is the one place the ledger loses
+      // rounds during normal operation, and the first sign used to be an old
+      // round simply not being there.
+      const _dropped = ledger.length - LEDGER_MAX_ENTRIES;
+      const _oldestKept = ledger[_dropped] && ledger[_dropped].t;
       ledger = ledger.slice(-LEDGER_MAX_ENTRIES);
+      if (!_ledgerEvictAnnounced) {
+        _ledgerEvictAnnounced = true;
+        logError("\u26A0 LEDGER AT CAPACITY \u2014 the " + LEDGER_MAX_ENTRIES +
+          "-round cap is now evicting. The oldest " + _dropped +
+          " round(s) have left the browser ledger THIS ROUND and every further round evicts one more. " +
+          "Rounds already sent to Supabase are still there; anything never synced is gone from this device. " +
+          "Export a snapshot now.");
+      } else {
+        logError("[LEDGER] cap " + LEDGER_MAX_ENTRIES + " \u2014 evicted " + _dropped +
+          " round(s); oldest retained t=" + (_oldestKept || "?") + ".");
+      }
       if (fullTextEnabled()) sweepFullTextOrphans();             // F1 — detached; trimmed entries orphan their IDB records
     }
     persistLedger();
@@ -7842,6 +7875,56 @@ roundData,
   // Idempotent: shows the banner when every condition holds, REMOVES it when
   // they stop holding (e.g. after an export, or after FORGET drops the count).
   function maybeShowSnapshotBanner() {
+    // v3.9.11 — CAPACITY GUARD runs FIRST and is deliberately NOT gated on
+    // snapshotEnabled(). An operator with the snapshot flag off is the one
+    // who most needs to hear this, and the banner tells them how to turn it
+    // on. Independent dismiss key, so dismissing the routine snapshot nudge
+    // does not silence the capacity warning.
+    try {
+      if (ledger.length >= LEDGER_WARN_AT || _ledgerPersistFailed) {
+        const capExisting = document.getElementById("rqCapacityBanner");
+        let capDismissed = null;
+        try { capDismissed = sessionStorage.getItem("rq_capacity_dismissed_session"); } catch (_) {}
+        if (capDismissed || busy !== false) {
+          if (capExisting) capExisting.remove();
+        } else if (!capExisting) {
+          const cap = document.createElement("div");
+          cap.id = "rqCapacityBanner";
+          const cmsg = document.createElement("div");
+          const room = LEDGER_MAX_ENTRIES - ledger.length;
+          cmsg.textContent = _ledgerPersistFailed
+            ? "\u26A0 LEDGER PERSIST FAILED — rounds are in-page only and will be lost on reload. Export now."
+            : (room > 0
+                ? "\u26A0 Ledger " + ledger.length + "/" + LEDGER_MAX_ENTRIES + " — " + room +
+                  " round(s) of headroom. At the cap the oldest rounds are evicted. Export a snapshot."
+                : "\u26A0 Ledger AT CAPACITY (" + ledger.length + "/" + LEDGER_MAX_ENTRIES +
+                  ") — every new round now evicts the oldest. Export a snapshot.");
+          cap.appendChild(cmsg);
+          if (snapshotEnabled()) {
+            const csave = document.createElement("button");
+            csave.textContent = "Export";
+            csave.addEventListener("click", () => { cap.remove(); exportLedgerSnapshot(); });
+            cap.appendChild(csave);
+          } else {
+            const hint = document.createElement("div");
+            hint.textContent = "Settings \u2192 LEDGER SNAPSHOT: ON to enable export.";
+            cap.appendChild(hint);
+          }
+          const cdis = document.createElement("button");
+          cdis.textContent = "Dismiss";
+          cdis.addEventListener("click", () => {
+            try { sessionStorage.setItem("rq_capacity_dismissed_session", "1"); } catch (_) {}
+            cap.remove();
+          });
+          cap.appendChild(cdis);
+          document.body.appendChild(cap);
+        }
+      } else {
+        const stale = document.getElementById("rqCapacityBanner");
+        if (stale) stale.remove();
+      }
+    } catch (_) { /* a banner is a nicety, never a fault */ }
+
     try {
       if (!snapshotEnabled()) return;
       const existing = document.getElementById("rqSnapshotBanner");
@@ -7973,6 +8056,29 @@ roundData,
     };
     reader.readAsText(file);
   }
+
+  // v3.9.11 — CAPACITY UI, deliberately OUTSIDE ensureSnapshotUI. That function
+  // returns early on !snapshotEnabled() AND on a missing timeline wrap, and it
+  // owns both the style injection and the window.__rqMaybeSnapshotBanner hook.
+  // Inheriting those gates would have silenced the capacity banner for the
+  // operator with the snapshot flag OFF — the one the banner text is written
+  // for. The guard owns its own CSS and its own hook; nothing here depends on
+  // a flag, a timeline, or a snapshot having ever been taken.
+  (function ensureCapacityUI() {
+    try {
+      const style = document.createElement("style");
+      style.textContent = [
+        "#rqCapacityBanner { position: fixed; bottom: 120px; left: 14px; z-index: 61; max-width: 300px; font-size: 0.75em; line-height: 1.5; padding: 8px 10px; border: 1px solid #b91c1c; border-radius: 8px; background: rgba(20,20,20,0.96); color: inherit; }",
+        "#rqCapacityBanner button { font-size: 0.95em; letter-spacing: 0.04em; padding: 2px 10px; border-radius: 999px; border: 1px solid #b91c1c; background: rgba(185,28,28,0.15); color: inherit; cursor: pointer; margin-right: 6px; margin-top: 6px; }",
+      ].join("\n");
+      document.head.appendChild(style);
+      // Same function object ensureSnapshotUI assigns later when its flag is on;
+      // assigning here first means the post-round kick (8398) and the persist
+      // catch both reach it regardless of rq_snapshot.
+      window.__rqMaybeSnapshotBanner = maybeShowSnapshotBanner;
+      maybeShowSnapshotBanner();
+    } catch (_) { /* cosmetic — never block boot */ }
+  })();
 
   (function ensureSnapshotUI() {
     try {
@@ -8500,6 +8606,12 @@ roundData,
       logError(fullTextEnabled()
         ? "[F1] Full-text ledger is ON — seat responses stored verbatim (IndexedDB rq_fulltext_v1), clipped only at render."
         : "[F1] Full-text ledger is OFF — ledger stores 300-char clips exactly as v3.8.4. Settings → FULL-TEXT LEDGER to enable. (A hard cache clear resets this.)");
+      logError("[LEDGER] " + ledger.length + "/" + LEDGER_MAX_ENTRIES + " rounds \u2014 " +
+        (ledger.length >= LEDGER_MAX_ENTRIES
+          ? "\u26A0 AT CAPACITY, every new round evicts the oldest. Export a snapshot."
+          : (ledger.length >= LEDGER_WARN_AT
+              ? "\u26A0 " + (LEDGER_MAX_ENTRIES - ledger.length) + " round(s) of headroom before eviction begins."
+              : (LEDGER_MAX_ENTRIES - ledger.length) + " round(s) of headroom.")));
       logError(snapshotEnabled()
         ? "[SNAPSHOT] Ledger snapshot/restore is ON — Snapshot + Restore buttons in the timeline header."
         : "[SNAPSHOT] Ledger snapshot/restore is OFF. Enable: localStorage.setItem('rq_snapshot','on') and reload.");
