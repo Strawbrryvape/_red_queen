@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.0.0-pillar7";
+  const RQ_BUILD = "v4.0.2-audit-evidence";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -7048,6 +7048,17 @@ roundData,
   // Returns true when the round should be embedded. Logs its reasoning either
   // way in shadow, so the decision is auditable before it is trusted.
   function shouldEmbedRound(prompt) {
+    // v4.0.2 — UNCONDITIONAL: an operator-injected SURPRISE AUDIT round carries
+    // verbatim prediction text in its prompt. That text may be read once, by
+    // seats, in a round the operator consented to — but it must NEVER become
+    // retrievable memory, or a scoring artifact turns into a permanent anchor.
+    // This gate is deliberately ahead of the episodic mode check and ignores
+    // every flag: there is no configuration in which embedding it is correct.
+    if (/^SURPRISE AUDIT:/.test(String(prompt || "").trim())) {
+      logError("[EPISODIC] audit round excluded from vector memory (operator-injected " +
+        "prediction evidence) \u2014 stored and rendered normally, never retrievable.");
+      return false;
+    }
     const mode = episodicFilterMode();
     if (mode === "off") return true;
     const v = isEpisodicMeta(prompt);
@@ -9103,9 +9114,20 @@ roundData,
   // seat identity substitution, no ledger content.
   const RQ_PRED_PROMPT_CLIP = 500;    // FROZEN (R-P7-12)
   const RQ_PRED_SURPRISE    = 0.7;    // FROZEN (R-P7-12) — similarity floor; surprise <=> sim < 0.7
-  const RQ_PRED_TIMEOUT_MS  = 20000;  // NEW — TUNE-AFTER-DATA, per-call race budget
+  // v4.0.1 — raised 20000 -> 45000. TUNE-AFTER-DATA and spec-local, NOT frozen
+  // by R-P7-12, so this needs no ruling. Live data forced it: the paid K3 seat
+  // blew the 20s budget and stored NO PREDICTION, which is a lost row rather
+  // than a protected round — the race exists to stop a hung provider delaying
+  // a round, and nothing here is awaited by dispatch, so a longer budget costs
+  // nothing but patience.
+  const RQ_PRED_TIMEOUT_MS  = 45000;  // TUNE-AFTER-DATA, per-call race budget
 
   let _predRoundId        = null;   // dispatch id predictions were fired for
+  // v4.0.1 — the round's RAW QUESTION, kept so a queued surprise audit can name
+  // what the round was about. This is the round's own prompt, not model output:
+  // it is already public corpus and carries none of the R-P7-11 restrictions
+  // that apply to predicted_own / actual_own.
+  let _predRoundPrompt    = null;
   let _predTableMissing   = false;  // session-sticky disable
   let _predStoredWatchdog = false;  // one "event never stored" line per session
   let _predVitalsMissing  = false;
@@ -9240,6 +9262,7 @@ roundData,
       if (!sbConfigured()) return;              // no storage => no spend (cost-consent doctrine)
       if (!seats || !seats.length) return;
       _predRoundId = dispatchId;
+      _predRoundPrompt = String(prompt == null ? "" : prompt);
       const fullCouncil = seats.length >= 3;    // operator 2-seat rule
       seats.forEach((seat) => {
         const predictionPrompt =
@@ -9294,7 +9317,9 @@ roundData,
     const t0 = Date.now();
     let edgeErrors = 0, scored = 0, surprises = 0;
     const roundId = _predRoundId;
+    const roundPrompt = _predRoundPrompt;
     _predRoundId = null;   // disarms the watchdog
+    _predRoundPrompt = null;
     try {
       if (!predictionsEnabled() || _predTableMissing || !sbConfigured()) return;
       if (!roundId || !eventId || !roundResult) return;
@@ -9340,8 +9365,35 @@ roundData,
           }
           if (surprise) {
             surprises++;
-            const qPrompt = "SURPRISE AUDIT: " + row.seat_name +
-              " predicted radically different from actual outcome. Re-examine reasoning.";
+            // v4.0.1 — ANSWERABLE AUDIT. The original one-liner named no round,
+            // no question and no magnitude, so the seat had nothing to reason
+            // about and correctly refused. This version supplies the referent
+            // (round id + the question that was asked + the error magnitude)
+            // and states which evidence is deliberately withheld, so no seat
+            // spends a round requesting what it will never be given.
+            //
+            // Still NO predicted_own and NO actual_own: model output does not
+            // enter seat context (R-P7-11). Everything interpolated below is
+            // either app-controlled (seat name, round id, a number) or the
+            // round's own question, which is already public corpus.
+            const qPrompt = "SURPRISE AUDIT: " + row.seat_name + " seat, round " + roundId + ".\n\n" +
+              "Before this round ran, you predicted your own final position. Your actual answer " +
+              "diverged from that prediction by " + errorScore + " on a 0\u20132 distance scale " +
+              "(0 = identical, " + (Math.round((1 - RQ_PRED_SURPRISE) * 1000) / 1000) +
+              " = the surprise threshold).\n\n" +
+              "The question that round was:\n\"" + clip(String(roundPrompt || "(not recorded)"), 400) + "\"\n\n" +
+              "WHAT YOU PREDICTED (verbatim):\n\"" + clip(String(row.predicted_own || ""), 900) + "\"\n\n" +
+              "WHAT YOU ACTUALLY ANSWERED (verbatim, as stored \u2014 clipped at 900 chars for scoring):\n\"" +
+              clip(String(actualOwn || ""), 900) + "\"\n\n" +
+              "PROVENANCE: both texts above are OPERATOR-INJECTED evidence supplied for this audit. " +
+              "They are NOT council memory and are NOT retrievable in later rounds \u2014 this round is " +
+              "excluded from the embedding corpus by design, so a scoring artifact can never become " +
+              "an anchor. Treat them as evidence in front of you now, not as something you remember.\n\n" +
+              "WHAT IS WORTH DOING: compare the two. State whether your position actually changed, " +
+              "and if so what changed it. If the two say the same thing at different lengths or " +
+              "levels of detail, say so \u2014 that is a MEASUREMENT ARTIFACT rather than a miss, and " +
+              "naming it is a useful finding, not a failure to cooperate. The scoring compares " +
+              "embeddings of these two texts, so elaboration alone can register as divergence.";
             // Dedup scoped to (source_round_id, pending, EXACT prompt) so F2's
             // RECONCILIATION rows are never matched or touched, and vice versa.
             const dupe = await _queueGet("source_round_id=eq." + encodeURIComponent(roundId) +
@@ -9407,6 +9459,14 @@ roundData,
     // query — consuming it above would silently lose endogenous:true.
     const _endogenous = (_rqEndogenousPrompt !== null && _rqEndogenousPrompt === query);
     _rqEndogenousPrompt = null;
+    // v4.0.2 — PROVENANCE (Kimi's own request, round 175): a seat needs to tell
+    // evidence supplied mid-session from consensus memory. Distinguish the two
+    // endogenous kinds rather than lumping them, since an audit round carries
+    // injected evidence and a reconciliation round does not.
+    const _endogenousKind = !_endogenous ? null
+      : (/^SURPRISE AUDIT:/.test(String(query || "").trim()) ? "OPERATOR-INJECTED-AUDIT"
+      : (/^RECONCILIATION TARGET/.test(String(query || "").trim()) ? "OPERATOR-INJECTED-RECONCILIATION"
+      : "OPERATOR-INJECTED"));
 
     resetSeatVisuals();
     clearDividedPanel();
@@ -9554,7 +9614,7 @@ roundData,
           seats: allAnswers.map((a) => ({ n: a.name, m: !!a.malformed })),
           // P7 F2 — additive spread: when the flag path never fired the key is
           // simply ABSENT, so the object literal is byte-identical to v3.9.14.
-          ...(_endogenous ? { endogenous: true } : {}),
+          ...(_endogenous ? { endogenous: true, provenance: _endogenousKind } : {}),
         });
         // P7 F1 — vitals, fire-and-forget, BEFORE logInstitutionalMemory so the
         // rq:round-stored listener is registered before the event can fire.
@@ -9630,6 +9690,7 @@ roundData,
           // THIS dispatchId belongs to an earlier round whose rq_events row never
           // landed — expire it now so it can never be misattributed (ADVISORY 9).
           _predRoundId = null;
+          _predRoundPrompt = null;
         }
         // Pillar 3 trigger. Detached and flag-gated: with rq_p3_narrator off this
         // is a no-op, and even on it can only run AFTER the round is fully
