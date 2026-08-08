@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v3.9.12-clear-consent";
+  const RQ_BUILD = "v4.0.0-pillar7";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -911,6 +911,39 @@
       const hasAlly = answers.some((b, j) => i !== j && pairSimilarity(a.text, b.text) >= effectiveThreshold(extractDirective(a.text) || a.text, extractDirective(b.text) || b.text));
       (hasAlly ? lexAgreed : lexOutliers).push(a);
     });
+
+    // --- v3.9.13 CHOICE EXTRACTOR (shadow) ---
+    // Narrow by design: fires ONLY when the seats' own text names a labelled
+    // option ("Option B", "option 3"). It reads the seats, not the prompt, so
+    // it needs no dispatch change and cannot fire on prose that never
+    // enumerated anything. Two seats naming the same label agree, whatever
+    // vocabulary they defended it in. Logs only — nothing decides on this.
+    try {
+      const pickOf = (text) => {
+        const s = String(text || "").slice(0, 600);
+        // "Option B" / "option 3" / "I choose Option A:" — the label must be
+        // preceded by the word option, so bare letters in prose never match.
+        const m = s.match(/\boption\s+([A-Da-d1-9])\b/i);
+        return m ? String(m[1]).toUpperCase() : null;
+      };
+      const picks = answers.map((a) => ({ name: a.name, pick: pickOf(a.text) }));
+      const named = picks.filter((p) => p.pick);
+      if (named.length >= 2) {
+        const tally = {};
+        named.forEach((p) => { tally[p.pick] = (tally[p.pick] || 0) + 1; });
+        const groups = Object.keys(tally).filter((k) => tally[k] >= 2);
+        const choiceAgreed = named.filter((p) => groups.indexOf(p.pick) !== -1).map((p) => p.name);
+        const detail = named.map((p) => p.name + "=" + p.pick).join(", ");
+        if (choiceAgreed.length >= 2) {
+          logError("\u25C7 CHOICE EXTRACTOR (shadow) — " + choiceAgreed.length +
+            " seat(s) named the SAME option: " + detail +
+            ". If lexical scored 0 agreements this round, that is a MISSED CONSENSUS by label.");
+        } else {
+          logError("\u25C7 CHOICE EXTRACTOR (shadow) — labelled options found but no two match: " +
+            detail + ". Genuine split by label.");
+        }
+      }
+    } catch (_) { /* shadow instrument: never a fault */ }
 
     // --- CONCEPT result (verdict-polarity + TF-IDF cosine) ---
     const conceptShadow = conceptConsensusShadow(answers);
@@ -2720,7 +2753,7 @@ roundData,
         headers: hdrs,
         body: JSON.stringify({
           query_embedding: "[" + vec.join(",") + "]",
-          match_count: RQ_TOP_K + 1,
+          match_count: govTopK() + 1,   // govTopK() === RQ_TOP_K unless mode is distress
           min_similarity: RQ_DIAG_FLOOR,
         }),
       });
@@ -2758,7 +2791,7 @@ roundData,
   function shapeRetrieval(rows, excludeId) {
     const candidates = (rows || [])
       .filter((r) => r && r.id !== excludeId)      // self-match exclusion (ruled)
-      .slice(0, RQ_TOP_K)
+      .slice(0, govTopK())
       .map((r) => ({
         id: r.id,
         prompt: clip(r.prompt || "", 100),
@@ -2804,6 +2837,9 @@ roundData,
       // excludeId is null on purpose: this round's row does not exist yet, so
       // there is nothing of its own to self-match against.
       const shaped = shapeRetrieval(res.rows, null);
+      // P7 F2 Phase A2 — post-filter, own bounded race (BLOCKER 2). Flag off:
+      // returns the same object untouched, zero network.
+      await filterConsolidatedFromRetrieval(shaped);
       // v3.6.0 — verify before injecting. Quarantined rows are DROPPED from the
       // hits actually placed in seat context; the drop is announced, never
       // silent, because "the council stopped citing that round" is exactly the
@@ -2924,7 +2960,7 @@ roundData,
         chim_enabled: !!sel.chim,
         chim_rounds: sel.entries || [],
         vector_rounds: _logShape(shaped.hits),
-        top_k: RQ_TOP_K,
+        top_k: govTopK(),   // the EFFECTIVE top_k — logging RQ_TOP_K in distress would lie to the tuning data
         similarity_floor: simFloor(),
         seat_degraded: !!seatDegraded,
         corpus_size: corpusSize,
@@ -4117,6 +4153,21 @@ roundData,
          "\u26A0 ARCS ENTER SEAT CONTEXT. Rounds run with this on are NOT baseline-comparable to rounds run without it.",
          "Seats do not read arcs. This is the baseline condition."],
 
+        ["governorToggle", "rq_governor", "P7: VITAL-SIGNS GOVERNOR",
+         "Vitals recorded to rq_vitals each round; sustained distress skips one P3 narrator cycle, halves memory injection, and asks for acknowledgement. Fails OPEN \u2014 telemetry errors never block a round.",
+         "No vitals recorded, no pre-dispatch check. Dispatch path is byte-identical to v3.9.13."],
+
+        ["consolidationToggle", "rq_consolidation", "P7: CONSOLIDATION",
+         "Consolidation client ON \u2014 pending sleep-cycle jobs execute at load/idle via the cheapest configured seat (operator-visible spend). Queue banner armed; self-prompts are NEVER auto-dispatched.",
+         "Consolidation client OFF \u2014 jobs accumulate server-side; nothing runs."],
+        ["consFilterToggle", "rq_consolidation_filter", "P7: CONS-FILTER",
+         "Merged ORIGINALS are excluded from retrieval injection; CONSOLIDATED summaries stay retrievable.",
+         "Retrieval behaves exactly as v3.9.14."],
+
+        ["predictionsToggle", "rq_predictions", "P7: PREDICTIONS",
+         "\u26A0 COSTS +1 API CALL PER SEAT PER ROUND. Each seat predicts its position and the consensus at dispatch (concurrent, never blocking); error is scored post-round to rq_predictions.",
+         "No prediction calls, no prediction rows, no scoring. Dispatch is byte-identical to pre-F3."],
+
         // ---- v3.9.10 F0 — INSTRUMENTS (tri-state). These three were console-only
         // until now, which cost the 2026-08-06 session three divided rounds of
         // COUNTERSTAMP data because localStorage is per-device and neither flag
@@ -4690,12 +4741,21 @@ roundData,
         const raw = await fn(prompt);
         const v = parseAdjVerdict(raw);
         if (!v) {
-          logError(`ADJUDICATION — ${seatLabel(p.seat)} (Position ${p.letter}) returned no parseable verdict. Treated as HOLD.`);
+          // v3.9.13 — was "Treated as HOLD", which is not what happens. Both
+          // consumers gate on parsed===true (p4DetectPartition, COUNTERSTAMP
+          // gate 3), so an unparseable verdict is EXCLUDED, not held. The old
+          // wording described a behaviour the code does not have.
+          logError(`ADJUDICATION — ${seatLabel(p.seat)} (Position ${p.letter}) returned no parseable verdict. NOT counted as HOLD — excluded from the partition test and from gate 3; the seat spoke but its verdict cannot be read.`);
           // parsed:false is load-bearing for the PARTITION rule below. An
           // unparseable verdict looks identical to a HOLD once it is stored, and
           // a round full of unparseable output would otherwise present as
           // beautiful complementary coverage.
-          verdicts.push({ letter: p.letter, seat: p.seat, verdict: "hold", target: null, error: "", counted: false, parsed: false });
+          // v3.9.13 — literal is "unparseable", not "hold". Every consumer
+          // already filters on parsed===true, so this changes no behaviour
+          // today; it removes the possibility that a future consumer reads
+          // verdict==="hold" without checking parsed and silently gains a
+          // vote that was never cast.
+          verdicts.push({ letter: p.letter, seat: p.seat, verdict: "unparseable", target: null, error: "", counted: false, parsed: false });
           continue;
         }
         // The sycophancy guard.
@@ -4714,6 +4774,7 @@ roundData,
         // resolution math; now the label says so and the seat is dropped from
         // the denominator below rather than silently blocking a RESOLVED.
         logError(`\u26A0 ADJUDICATION — ${seatLabel(p.seat)} UNAVAILABLE (${e.message || e}). Infrastructure failure, NOT an abstention. Excluded from the resolution denominator.`);
+        _govAdjUnavailable++;   // P7 F1 — counted into this round's edge_errors
         verdicts.push({ letter: p.letter, seat: p.seat, verdict: "unavailable", target: null, error: "", counted: false, unavailable: true, parsed: false });
       }
     }
@@ -4775,6 +4836,7 @@ roundData,
   }
 
   async function runLiveCouncil(query) {
+    _govAdjUnavailable = 0;   // P7 F1 — per-round edge-error instrumentation
     const calls = [];
     if (settings.keyGemini) {
       calls.push({ name: "gemini", fn: callGemini });
@@ -8291,6 +8353,1028 @@ roundData,
     queryInput.parentNode.insertBefore(mic, queryInput.nextSibling);
   })();
 
+  // ---------- Pillar VII F1: Homeostatic Vital-Signs Governor (rq_governor, default OFF) ----------
+  // The first ACTIVE self-regulation layer in this codebase. P4 fragility and
+  // the P4 drift monitor are shadow-only; the Governor ACTS. It is also the
+  // first hard gate on the dispatch path — nothing before it ever refused a
+  // dispatch (`if (busy) return;` only drops CONCURRENT ones).
+  //
+  // Doctrine (P7-FOUNDATION R-P7-2): FAIL-OPEN. Timeout, HTTP error, missing
+  // table, or an empty window all mean NORMAL MODE and the round proceeds.
+  // The Governor acts only on >= 1 real vitals row, and the only hold it can
+  // impose is a HUMAN acknowledgement. With rq_governor off, every consumption
+  // site reads false / early-returns and the dispatch path is byte-identical.
+  //
+  // TUNE-AFTER-DATA (R-P7-7): every weight and threshold below is a frozen
+  // CALIBRATION constant, not a measured value. They are grouped here so one
+  // edit retunes the lot once real rq_vitals rows accumulate.
+  const RQ_GOV_TIMEOUT_MS  = 1500;   // Promise.race cap on the pre-dispatch read
+  const RQ_GOV_WINDOW      = 5;      // distress window: last N rows, THIS session only
+  const RQ_GOV_W_FALLBACK  = 0.3;    // any seat answered via understudy/fallback
+  const RQ_GOV_W_EDGE      = 0.2;    // per failed seat call / unavailable adjudication
+  const RQ_GOV_W_LATENCY   = 0.2;    // round latency over RQ_GOV_LATENCY_MS
+  const RQ_GOV_W_QUEUE     = 0.15;   // queue signal UNAVAILABLE this build (R-P7-4) — armed, unreachable
+  const RQ_GOV_W_SEAT      = 0.25;   // any seat not "live"
+  const RQ_GOV_LATENCY_MS  = 10000;
+  const RQ_GOV_YELLOW      = 0.5;
+  const RQ_GOV_RED         = 0.8;
+  const RQ_GOV_TOP_K_RED   = 2;      // distress injection ceiling: RQ_TOP_K 5 -> 2
+  const RQ_GOV_INJECT_FRAC = 0.5;    // distress char-budget multiplier
+  const RQ_GOV_REPAIR_PROMPT =
+    "SELF-REPAIR: Review this session's recent failures (seat outages, fallback rescues, slow rounds). " +
+    "State what is degrading, what the council should stop doing, and one concrete corrective instruction " +
+    "for the next rounds. FINAL DIRECTIVE required.";
+
+  function governorEnabled() { return localStorage.getItem("rq_governor") === "on"; }
+
+  let _govMode          = "normal";  // "normal" | "caution" | "distress"
+  let _govSkipP3Next    = false;     // consumed at the P3 trigger
+  let _govInjectHalf    = false;     // consumed at the TOP_K and budget sites
+  let _govRoundStart    = 0;         // latency instrumentation (none existed before)
+  let _govAdjUnavailable = 0;        // adjudication "unavailable" verdicts this round
+  let _rqVitalsTable    = true;      // positions_full degrade precedent: 400/404 disables for the session
+  const _govLogged      = {};        // ONE drawer line per failure class per session
+
+  function govLogOnce(cls, msg) {
+    if (_govLogged[cls]) return;
+    _govLogged[cls] = true;
+    logError(msg);
+  }
+
+  function govTopK() { return _govInjectHalf ? RQ_GOV_TOP_K_RED : RQ_TOP_K; }
+
+  // REWEIGHT RULE (R-P7-7): only AVAILABLE signals contribute; unavailable
+  // signals add 0 and are NEVER guessed. malformedNames is a side channel so a
+  // malformed-but-rendered seat counts as degraded for the score while its
+  // stored seat_health stays honest ("live" — it did render).
+  function computeDistress(v, malformedNames) {
+    let score = 0;
+    if (v.fallback_used === true) score += RQ_GOV_W_FALLBACK;
+    if (typeof v.edge_errors === "number" && v.edge_errors > 0) score += RQ_GOV_W_EDGE * v.edge_errors;
+    if (typeof v.latency_ms === "number" && v.latency_ms > RQ_GOV_LATENCY_MS) score += RQ_GOV_W_LATENCY;
+    // No retrieval queue exists in this build (R-P7-4). Weight stays frozen;
+    // this branch can only fire if a future build sets queue_available.
+    if (v.queue_available === true && typeof v.retrieval_queue_depth === "number" && v.retrieval_queue_depth > 10) score += RQ_GOV_W_QUEUE;
+    const health = v.seat_health || {};
+    const names = Object.keys(health);
+    if (names.length) {
+      let degraded = names.filter((n) => health[n] !== "live").length;
+      (malformedNames || []).forEach((n) => { if (health[n] === "live") degraded++; });
+      if (degraded > 0) score += RQ_GOV_W_SEAT;
+    }
+    return Math.min(Math.round(score * 100) / 100, 1.0);   // cap 1.0; column is NUMERIC(3,2)
+  }
+
+  // NOT sbInsert: the degrade contract needs the 400/404 distinction, which the
+  // generic helper flattens. Fire-and-forget, never awaited on the dispatch path.
+  function rqVitalsPost(row) {
+    return fetch(p2Base() + "/rest/v1/rq_vitals", {
+      method: "POST",
+      headers: Object.assign(p2Headers(), { Prefer: "return=representation" }),
+      body: JSON.stringify([row]),
+    }).then((res) => {
+      if (res.ok) return res.json().then((rows) => (Array.isArray(rows) && rows[0] && rows[0].id) || null).catch(() => null);
+      if (res.status === 400 || res.status === 404) {
+        _rqVitalsTable = false;
+        govLogOnce("table", "[GOV] rq_vitals write HTTP " + res.status +
+          " — table missing or schema mismatch. Run rq-p7-f1-vitals.sql; Governor vitals disabled for this session, rounds unaffected.");
+      } else {
+        govLogOnce("write-" + res.status, "[GOV] rq_vitals write failed (HTTP " + res.status + ") — round unaffected.");
+      }
+      return null;
+    }).catch((e) => {
+      govLogOnce("unreachable", "[GOV] rq_vitals unreachable: " + (e.message || e) + " — round unaffected.");
+      return null;
+    });
+  }
+
+  // event_id backfill. Best-effort: on failure the row keeps event_id NULL.
+  // No retry — no hot loops (R-P7-11).
+  function rqVitalsPatchEventId(vitalsId, eventId) {
+    fetch(p2Base() + "/rest/v1/rq_vitals?id=eq." + encodeURIComponent(vitalsId), {
+      method: "PATCH",
+      headers: Object.assign(p2Headers(), { Prefer: "return=minimal" }),
+      body: JSON.stringify({ event_id: eventId }),
+    }).then((r) => {
+      if (!r.ok) govLogOnce("patch-" + r.status, "[GOV] vitals event_id PATCH failed (HTTP " + r.status +
+        ") — row kept with event_id NULL, round unaffected.");
+    }).catch(() => {});
+  }
+
+  // Signals derived from REAL fields only (R-P7-7):
+  //   down     = configured seat absent from answers[]
+  //   fallback = tier >= 1 or provider !== "primary"
+  //   live     = otherwise; malformed degrades the COUNT only
+  //   edge_errors = (configured - answered) + adjudication-unavailable count
+  function recordVitals(result, meta) {
+    if (!governorEnabled() || !sbConfigured() || _rqVitalsTable === false) return;
+    try {
+      const answers = (result && result.answers) || [];
+      const configured = Object.keys(seatProvider);
+      const seatHealth = {};
+      configured.forEach((n) => { seatHealth[n] = "down"; });
+      let fallback = false;
+      const malformed = [];
+      answers.forEach((a) => {
+        const fb = (a.tier >= 1) || ((a.provider || "primary") !== "primary");
+        seatHealth[a.name] = fb ? "fallback" : "live";
+        if (fb) fallback = true;
+        if (a.malformed) malformed.push(a.name);
+      });
+      const row = {
+        round_id: (meta && meta.dispatchId) || null,
+        session_id: RQ_SESSION_ID,
+        operation: "round",
+        latency_ms: (meta && typeof meta.latencyMs === "number" && isFinite(meta.latencyMs)) ? Math.round(meta.latencyMs) : null,
+        fallback_used: fallback,
+        edge_errors: Math.max(0, configured.length - answers.length) + (_govAdjUnavailable || 0),
+        token_budget_remaining: null,   // R-P7-4: no token estimator exists
+        retrieval_queue_depth: 0,       // R-P7-4: no queue exists
+        seat_health: seatHealth,
+      };
+      row.distress_score = computeDistress(row, malformed);
+      // event_id join (R-P7-6): the rq_events id does not exist yet. Register
+      // the one-shot listener SYNCHRONOUSLY so it cannot race the event, then
+      // PATCH once both ids are known. If the event never fires, the row simply
+      // keeps event_id NULL.
+      let eventId = null, vitalsId = null, patched = false;
+      const maybePatch = () => {
+        if (patched || !eventId || !vitalsId) return;
+        patched = true;
+        rqVitalsPatchEventId(vitalsId, eventId);
+      };
+      try {
+        document.addEventListener("rq:round-stored", function _govOnce(ev) {
+          document.removeEventListener("rq:round-stored", _govOnce);
+          eventId = (ev.detail && ev.detail.id) || null;
+          maybePatch();
+        }, { once: true });
+      } catch (_) {}
+      rqVitalsPost(row).then((id) => { vitalsId = id; maybePatch(); });
+    } catch (_) { /* vitals are advisory — never a round fault */ }
+  }
+
+  // Pre-dispatch gate (R-P7-2). The ONLY new await on the dispatch path; its
+  // network portion is capped by Promise.race at RQ_GOV_TIMEOUT_MS and every
+  // failure class resolves to normal mode with ONE drawer line per session.
+  //
+  // The operation=eq.round filter is LOAD-BEARING CROSS-SPEC: F2/F3 write
+  // rq_vitals rows with operation 'consolidation'/'prediction_scoring' and
+  // distress_score NULL. Without the filter those rows enter the window and
+  // Number(null) === 0 silently dilutes the average, making red harder to
+  // reach the more work the system does. The client-side guard on the scores
+  // line below is the belt-and-braces twin of the server filter.
+  async function governorCheck() {
+    _govSkipP3Next = false;   // per-dispatch state, re-derived below
+    _govInjectHalf = false;
+    if (!governorEnabled()) { _govMode = "normal"; return { proceed: true, mode: "normal" }; }
+    if (!sbConfigured()) {
+      govLogOnce("unconfigured", "[GOV] Supabase not configured — Governor inert this session, rounds proceed normally.");
+      _govMode = "normal";
+      return { proceed: true, mode: "normal" };
+    }
+    if (_rqVitalsTable === false) { _govMode = "normal"; return { proceed: true, mode: "normal" }; }
+    const read = fetch(p2Base() + "/rest/v1/rq_vitals?select=operation,distress_score,created_at&session_id=eq." +
+      encodeURIComponent(RQ_SESSION_ID) + "&operation=eq.round&order=created_at.desc&limit=" + RQ_GOV_WINDOW,
+      { headers: p2Headers() }
+    ).then((res) => {
+      if (res.ok) return res.json().then((rows) => ({ rows: Array.isArray(rows) ? rows : [] })).catch(() => ({ rows: [] }));
+      if (res.status === 400 || res.status === 404) {
+        _rqVitalsTable = false;
+        govLogOnce("table", "[GOV] rq_vitals read HTTP " + res.status +
+          " — table missing. Run rq-p7-f1-vitals.sql; Governor disabled for this session, rounds unaffected.");
+      } else {
+        govLogOnce("read-" + res.status, "[GOV] vitals read failed (HTTP " + res.status + ") — round proceeds normally (fail-open).");
+      }
+      return { err: res.status };
+    }).catch((e) => {
+      govLogOnce("unreachable", "[GOV] vitals read unreachable: " + (e.message || e) + " — round proceeds normally (fail-open).");
+      return { err: "net" };
+    });
+    const res = await Promise.race([
+      read,
+      new Promise((r) => setTimeout(() => r("__timeout__"), RQ_GOV_TIMEOUT_MS)),
+    ]);
+    // Both failure exits below return normal mode and the degrade knobs were
+    // already reset at entry, so the round runs UNDEGRADED. _govMode keeps its
+    // last known value on purpose — the banner is a last-known-state
+    // indicator, and hiding it during a telemetry outage would falsely claim
+    // recovery.
+    if (res === "__timeout__") {
+      govLogOnce("timeout", "[GOV] vitals read exceeded " + (RQ_GOV_TIMEOUT_MS / 1000) +
+        "s — round proceeds normally (fail-open).");
+      return { proceed: true, mode: "normal" };
+    }
+    if (res.err) return { proceed: true, mode: "normal" };
+    const scores = res.rows
+      .filter((r) => r && r.operation === "round" && r.distress_score !== null && r.distress_score !== undefined)
+      .map((r) => Number(r.distress_score))
+      .filter((n) => isFinite(n));
+    if (!scores.length) { _govMode = "normal"; maybeShowGovBanner(); return { proceed: true, mode: "normal" }; }
+    const avg = scores.reduce((s, n) => s + n, 0) / scores.length;
+    if (avg >= RQ_GOV_RED) return applyGovernorMode("distress", avg, scores.length);
+    if (avg >= RQ_GOV_YELLOW) {
+      _govMode = "caution";
+      maybeShowGovBanner();
+      govLogOnce("yellow", "[GOV] elevated distress — avg " + avg.toFixed(2) + " over last " + scores.length +
+        " vitals row(s) (yellow \u2265 " + RQ_GOV_YELLOW + "). Round proceeds UNCHANGED; warning only.");
+      return { proceed: true, mode: "caution" };
+    }
+    _govMode = "normal";
+    maybeShowGovBanner();
+    return { proceed: true, mode: "normal" };
+  }
+
+  // Distress consequences — REAL KNOBS ONLY (R-P7-2). Returns the gate verdict;
+  // only a HUMAN choosing "Run repair round" yields proceed:false.
+  async function applyGovernorMode(mode, avg, n) {
+    _govMode = mode;
+    if (mode !== "distress") { maybeShowGovBanner(); return { proceed: true, mode: mode }; }
+    _govSkipP3Next = true;
+    _govInjectHalf = true;
+    maybeShowGovBanner();
+    logError("[GOV] DISTRESS — avg " + avg.toFixed(2) + " over last " + n + " vitals row(s) \u2265 red " + RQ_GOV_RED +
+      ". This round: P3 narrator skipped, injection halved (TOP_K " + RQ_TOP_K + "\u2192" + RQ_GOV_TOP_K_RED +
+      ", budgets \u00D7" + RQ_GOV_INJECT_FRAC + "). Awaiting operator ack.");
+    const ack = await govAckModal(avg, n);
+    return { proceed: !!ack.proceed, mode: "distress" };
+  }
+
+  // Persistent distress banner — snapshot-banner pattern: idempotent, per-session
+  // dismissal, all dynamic content through textContent.
+  function maybeShowGovBanner() {
+    try {
+      const existing = document.getElementById("rqGovBanner");
+      let dismissed = null;
+      try { dismissed = sessionStorage.getItem("rq_gov_dismissed_session"); } catch (_) {}
+      const want = governorEnabled() && _govMode === "distress" && !dismissed;
+      if (!want) { if (existing) existing.remove(); return; }
+      if (existing) return;
+      const banner = document.createElement("div");
+      banner.id = "rqGovBanner";
+      banner.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:60;display:flex;gap:10px;align-items:center;" +
+        "justify-content:center;padding:8px 12px;background:#3a0d0d;color:#f3d9d9;border-top:1px solid #8a3a3a;font-size:13px;";
+      const msg = document.createElement("div");
+      msg.textContent = "\u26A0 GOVERNOR: system under sustained distress — rounds run degraded (P3 skipped, injection halved) until vitals recover.";
+      const dismiss = document.createElement("button");
+      dismiss.textContent = "Dismiss";
+      dismiss.addEventListener("click", () => {
+        try { sessionStorage.setItem("rq_gov_dismissed_session", "1"); } catch (_) {}
+        banner.remove();
+      });
+      banner.appendChild(msg); banner.appendChild(dismiss);
+      document.body.appendChild(banner);
+    } catch (_) { /* a banner is a nicety, never a fault */ }
+  }
+
+  // Human-ack modal — showSnapshotModal pattern. rqModal's innerHTML takes
+  // STATIC app copy only; every dynamic string is appended via textContent.
+  // Resolves {proceed:true} on Acknowledge AND on scrim/dismissal (fail-open —
+  // a dismissed ack must never wedge a round with busy=true). {proceed:false}
+  // ONLY on "Run repair round", which pre-fills and never auto-dispatches.
+  function govAckModal(avg, n) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      try {
+        if (document.querySelector(".rq-modal-scrim")) {
+          logError("[GOV] distress ack not shown — another modal is open. Round proceeds in degraded mode.");
+          finish({ proceed: true });
+          return;
+        }
+        rqModal("<h3>System under stress</h3><p></p>");
+        const scrim = document.querySelector(".rq-modal-scrim");
+        const box = document.querySelector(".rq-modal");
+        if (!scrim || !box) { finish({ proceed: true }); return; }
+        const p = box.querySelector("p");
+        if (p) p.textContent = "Average distress over the last " + n + " recorded round(s) is " + avg.toFixed(2) +
+          " (red \u2265 " + RQ_GOV_RED + "). This round runs degraded: P3 narrator skipped, memory injection halved. " +
+          "Acknowledge to proceed, or run a repair round to let the council diagnose itself.";
+        scrim.addEventListener("click", (e) => {
+          if (e.target === scrim || (e.target.classList && e.target.classList.contains("rq-close"))) {
+            logError("[GOV] distress ack dismissed — treated as acknowledged; round proceeds degraded.");
+            finish({ proceed: true });
+          }
+        });
+        const close = () => { const sc = document.querySelector(".rq-modal-scrim"); if (sc) sc.remove(); };
+        const ack = document.createElement("button");
+        ack.className = "rq-snap-mode";
+        ack.textContent = "Acknowledge — run degraded round";
+        ack.addEventListener("click", () => {
+          close();
+          logError("[GOV] distress acknowledged by operator — round proceeds degraded.");
+          finish({ proceed: true });
+        });
+        const repair = document.createElement("button");
+        repair.className = "rq-snap-mode";
+        repair.textContent = "Run repair round (pre-fills input — you press Send)";
+        repair.addEventListener("click", () => {
+          close();
+          try {
+            queryInput.value = RQ_GOV_REPAIR_PROMPT;   // static app copy, never model text
+            queryInput.dispatchEvent(new Event("input", { bubbles: true }));
+          } catch (_) {}
+          logError("[GOV] repair round pre-filled — press Send to dispatch. NEVER auto-dispatched.");
+          finish({ proceed: false });
+        });
+        box.appendChild(ack);
+        box.appendChild(repair);
+      } catch (_) { finish({ proceed: true }); }   // a broken modal must never hold a round
+    });
+  }
+
+  // FROZEN cross-spec contract (R-P7-12). F2/F3 read Governor state ONLY
+  // through this accessor — never _govMode, never the banner DOM. Literals are
+  // exactly "normal" | "caution" | "distress" and never change. Returns
+  // "normal" before the first governorCheck and whenever the flag is off.
+  // This is the closure of audit BLOCKER 1: F2's precondition was coded
+  // against an accessor that did not exist, comparing to a literal ("red")
+  // that was never in the domain.
+  window.__rqGovernorMode = function () { return _govMode; };
+
+  // ---------- Pillar VII F2: Autonomous Consolidation Cycles (rq_consolidation, default OFF) ----------
+  // The Red Queen is 100% reactive: no prompt, no thought. Memory grows
+  // monotonically — Pillar IV adds embeddings, nothing compresses. F2 adds
+  // endogenous offline processing, "sleep cycles" that metabolize the ledger:
+  //
+  //   Phase A  (edge, cron)   stale near-duplicate rounds are CLUSTERED and
+  //                           seeded as rq_consolidation_jobs rows.
+  //   Phase A  (client, here) a job is claimed, summarized through the cheapest
+  //                           configured seat, written as a CONSOLIDATED row,
+  //                           and the originals are FLAGGED — never deleted.
+  //   Phase B  (edge, cron)   the highest-fragility unresolved DIVIDED round is
+  //                           queued as a self-generated prompt.
+  //   Phase A2 (client, here) consolidated originals are optionally excluded
+  //                           from retrieval injection; summaries stay.
+  //
+  // HYBRID BY NECESSITY (R-P7-5): provider keys live in rq_settings_v21 and are
+  // never exported, so the edge function CANNOT summarize or embed. It selects;
+  // the client executes. Nothing here fabricates server-side generation.
+  //
+  // CONSENT (R-P7-10): a queued self-prompt is NEVER auto-dispatched. It fills
+  // the input box and the operator presses send. One click = human consent for
+  // API spend; a click never spends anything by itself.
+  const RQ_CONS_STALE_H            = 24;        // frozen (edge-side; restated for the drawer line)
+  const RQ_CONS_SIM                = 0.9;       // frozen (edge-side clustering threshold)
+  const RQ_CONS_BATCH              = 50;        // frozen (edge-side batch ceiling)
+  const RQ_CONS_MAX_JOBS_PER_LOAD  = 3;         // NEW — TUNE-AFTER-DATA: spend ceiling per load
+  const RQ_CONS_CLAIM_TTL_MS       = 30 * 60000;// NEW — stale 'running' reset window
+  const RQ_CONS_ROW_CLIP           = 400;       // NEW — per-row clip into the summary prompt
+  const RQ_CONS_MAX_ROWS_IN_PROMPT = 20;        // NEW — prompt size ceiling
+  const RQ_CONS_FILTER_TIMEOUT_MS  = 2000;      // NEW — TUNE-AFTER-DATA. BLOCKER 2: the 12s inject
+                                                // race closes BEFORE shapeRetrieval, so the Phase-A2
+                                                // filter GET must carry its own bound or it is an
+                                                // UNBOUNDED await on the dispatch path.
+
+  let _consRunning        = false;   // re-entrancy (a second kick while running is a no-op)
+  let _consDisabledSession = false;  // session-sticky degrade (positions_full precedent)
+  let _consVitalsDown     = false;   // session-sticky vitals suppressor
+  let _rqEndogenousPrompt = null;    // set ONLY by the banner's Inject button
+  const _consFailLines    = {};      // one drawer line per failure class per session
+
+  function consolidationEnabled()  { return localStorage.getItem("rq_consolidation") === "on"; }
+  function consFilterEnabled()     { return localStorage.getItem("rq_consolidation_filter") === "on"; }
+
+  function _consLineOnce(cls, msg) {
+    if (_consFailLines[cls]) return;
+    _consFailLines[cls] = true;
+    logError(msg);
+  }
+
+  // Cheapest CONFIGURED seat first. Free tiers before paid primaries, and the
+  // seat is NAMED in the drawer line because this is real, operator-visible spend.
+  function _pickConsolidationSeat() {
+    if (settings.keyGroq)       return { name: "groq (free tier)",   fn: callGroq };
+    if (settings.keyCerebras)   return { name: "cerebras (free tier)", fn: callCerebras };
+    if (settings.keyOpenRouter) return { name: "openrouter (walk)",  fn: (q) => callOpenRouterWalk(q, "claude") };
+    if (settings.keyGemini)     return { name: "gemini (PAID)",      fn: callGemini };
+    if (settings.keyKimi)       return { name: "kimi (PAID)",        fn: callKimi };
+    if (settings.keyClaude)     return { name: "claude (PAID)",      fn: callClaude };
+    return null;
+  }
+
+  async function _consFetch(path) {
+    const res = await fetch(p2Base() + "/rest/v1/" + path, { headers: p2Headers() });
+    if (!res.ok) {
+      const b = await res.text().catch(() => "");
+      const err = new Error("HTTP " + res.status + " " + b.slice(0, 200));
+      err.status = res.status;
+      throw err;
+    }
+    return res.json();
+  }
+
+  // return=representation so a zero-row update (RLS denial or a lost claim) is
+  // VISIBLE rather than silently successful.
+  async function _consPatch(path, body) {
+    const res = await fetch(p2Base() + "/rest/v1/" + path, {
+      method: "PATCH",
+      headers: Object.assign(p2Headers(), { Prefer: "return=representation" }),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const b = await res.text().catch(() => "");
+      const err = new Error("HTTP " + res.status + " " + b.slice(0, 200));
+      err.status = res.status;
+      throw err;
+    }
+    const rows = await res.json().catch(() => []);
+    return Array.isArray(rows) ? rows.length : 0;
+  }
+
+  // NOT sbInsert: its non-OK drawer line fires PER CALL, so N failed jobs would
+  // print N lines. One line per session, then silence (R-P7-11).
+  // BLOCKER 3: distress_score is deliberately absent from this row and
+  // operation is 'consolidation', so F1's operation=eq.round window never sees it.
+  async function _consVitalsInsert(row) {
+    if (_consVitalsDown) return;
+    try {
+      const res = await fetch(p2Base() + "/rest/v1/rq_vitals", {
+        method: "POST",
+        headers: Object.assign(p2Headers(), { Prefer: "return=minimal" }),
+        body: JSON.stringify([row]),
+      });
+      if (!res.ok) {
+        _consVitalsDown = true;
+        _consLineOnce("vitals", "[CONS] rq_vitals insert failed (HTTP " + res.status +
+          ") — vitals telemetry suppressed for the rest of this session; consolidation outcome unaffected. Has rq-p7-f1-vitals.sql been run?");
+      }
+    } catch (e) {
+      _consVitalsDown = true;
+      _consLineOnce("vitals", "[CONS] rq_vitals unreachable (" + ((e && e.message) || e) +
+        ") — vitals telemetry suppressed for this session; consolidation outcome unaffected.");
+    }
+  }
+
+  async function runConsolidationJobsClient() {
+    if (!consolidationEnabled()) return;
+    if (_consDisabledSession || _consRunning) return;
+    if (!sbConfigured()) { _consLineOnce("cfg", "[CONS] Supabase not configured — consolidation client idle."); return; }
+    const seat = _pickConsolidationSeat();
+    if (!seat) { _consLineOnce("seat", "[CONS] No provider key configured — cannot summarize. Jobs stay pending."); return; }
+    _consRunning = true;
+    try {
+      // Reset stale 'running' claims (crash mid-job).
+      let running = [];
+      try {
+        running = await _consFetch("rq_consolidation_jobs?status=eq.running&select=id,payload,created_at");
+      } catch (e) {
+        if (e.status === 404) {
+          _consDisabledSession = true;
+          logError("[CONS] rq_consolidation_jobs GET 404 — table missing. Run rq-p7-f2-consolidation.sql; consolidation client disabled for this session, rounds unaffected.");
+          return;
+        }
+        throw e;
+      }
+      const now = Date.now();
+      for (const j of running || []) {
+        const claimedAt = j.payload && j.payload.claimed_at ? Date.parse(j.payload.claimed_at) : 0;
+        if (!claimedAt || now - claimedAt > RQ_CONS_CLAIM_TTL_MS) {
+          await _consPatch("rq_consolidation_jobs?id=eq." + j.id + "&status=eq.running",
+            { status: "pending", payload: Object.assign({}, j.payload, { claimed_at: null }) }).catch(() => {});
+        }
+      }
+      const pending = await _consFetch("rq_consolidation_jobs?status=eq.pending&order=created_at.asc&select=id,job_type,payload,run_id,created_at");
+      const queue = (pending || []).slice(0, RQ_CONS_MAX_JOBS_PER_LOAD);
+      if ((pending || []).length > queue.length) {
+        logError("[CONS] " + ((pending || []).length - queue.length) +
+          " consolidation job(s) remain pending after this load's cap of " + RQ_CONS_MAX_JOBS_PER_LOAD + ".");
+      }
+      for (const job of queue) {
+        if (job.job_type !== "compression") {
+          await _consPatch("rq_consolidation_jobs?id=eq." + job.id, { status: "error", done_at: new Date().toISOString() }).catch(() => {});
+          _consLineOnce("type", "[CONS] Unknown job_type '" + job.job_type + "' — marked error, never retried.");
+          continue;
+        }
+        await _runCompressionJobClient(job, seat);
+      }
+    } catch (e) {
+      _consLineOnce("loop", "[CONS] executor loop failed: " + ((e && e.message) || e) + " — jobs stay pending; rounds unaffected.");
+    } finally {
+      _consRunning = false;
+    }
+  }
+
+  // Order is FIXED and failure-atomic: claim -> idempotency check -> fetch ->
+  // summarize -> insert -> embed (detached) -> flag originals -> done -> vitals.
+  // Originals are NEVER flagged before the summary row exists, and a summary row
+  // is never deleted on a later failure. Error jobs are never auto-retried.
+  async function _runCompressionJobClient(job, seat) {
+    const t0 = Date.now();
+    const ids = (job.payload && job.payload.cluster_event_ids) || [];
+    const claimed = await _consPatch(
+      "rq_consolidation_jobs?id=eq." + job.id + "&status=eq.pending",
+      { status: "running", payload: Object.assign({}, job.payload, { claimed_at: new Date().toISOString() }) }).catch(() => 0);
+    if (claimed === 0) { _consLineOnce("claim", "[CONS] job claim matched zero rows (RLS or race) — skipping job " + String(job.id).slice(0, 8) + "."); return; }
+    try {
+      // Crash-after-insert safety: if a summary already exists for this job,
+      // skip generation and only replay the flag step.
+      const prior = await _consFetch("rq_events?row_type=eq.CONSOLIDATED&provenance->>job_id=eq." + encodeURIComponent(job.id) + "&select=id&limit=1");
+      let summaryId = prior && prior.length ? prior[0].id : null;
+
+      const rows = await _consFetch("rq_events?id=in.(" + ids.join(",") + ")&select=id,prompt,response,consensus_status,created_at,consolidated");
+      const live = (rows || []).filter((r) => !r.consolidated);
+      if (!summaryId && live.length < 2) {
+        await _consPatch("rq_consolidation_jobs?id=eq." + job.id, { status: "done", done_at: new Date().toISOString() }).catch(() => {});
+        logError("[CONS] job " + String(job.id).slice(0, 8) + " collapsed below 2 live rows — nothing to merge, marked done.");
+        return;
+      }
+
+      if (!summaryId) {
+        const feed = live.slice(0, RQ_CONS_MAX_ROWS_IN_PROMPT).map((r, i) =>
+          "[" + (i + 1) + "] Q: " + clip(String(r.prompt || ""), RQ_CONS_ROW_CLIP) +
+          "\nA: " + clip(String(r.response || ""), RQ_CONS_ROW_CLIP)).join("\n\n");
+        const promptText =
+          "You are the Red Queen's consolidation pass — offline memory maintenance, not a council round.\n" +
+          "Below are " + live.length + " stored council rounds that near-duplicate each other.\n" +
+          "Write ONE merged memory: the shared conclusion, any caveat exactly one source held, and nothing else.\n" +
+          "Plain prose, under 200 words, no preamble, no markdown headers.\n\n" + feed;
+        logError("[CONS] summarizing cluster of " + live.length + " via " + seat.name +
+          " (operator-visible spend, job " + String(job.id).slice(0, 8) + ")\u2026");
+        let summary;
+        try {
+          summary = String(await seat.fn(promptText) || "").trim();
+        } catch (e) {
+          await _consPatch("rq_consolidation_jobs?id=eq." + job.id, { status: "error", done_at: new Date().toISOString() }).catch(() => {});
+          _consLineOnce("summ", "[CONS] summarizer seat failed (" + ((e && e.message) || e) + ") — job " +
+            String(job.id).slice(0, 8) + " marked error, NOT retried hot. Originals untouched.");
+          return;
+        }
+        if (summary.length < 40) {
+          await _consPatch("rq_consolidation_jobs?id=eq." + job.id, { status: "error", done_at: new Date().toISOString() }).catch(() => {});
+          _consLineOnce("summ", "[CONS] summarizer returned a degenerate (" + summary.length + "-char) summary — job " +
+            String(job.id).slice(0, 8) + " marked error. Originals untouched.");
+          return;
+        }
+        const sumPrompt = "CONSOLIDATION of " + live.length + " rounds (run " + (job.run_id || "?") + ")";
+        let row = await sbInsertReturning("rq_events", {
+          prompt: sumPrompt,
+          response: clip(summary, 900),
+          consensus_status: null,
+          row_type: "CONSOLIDATED",
+          provenance: { source_event_ids: live.map((r) => r.id), run_id: job.run_id || null, job_id: job.id },
+        });
+        if (!row && sbConfigured()) {
+          // Migration columns missing: retry bare, exactly the prompt_class
+          // precedent. A bare row is worth less but never worth losing silently
+          // — and originals are NOT flagged, because they would point at an
+          // unmarked row.
+          row = await sbInsertReturning("rq_events", { prompt: sumPrompt, response: clip(summary, 900), consensus_status: null });
+          if (row && row.id) {
+            _consLineOnce("cols", "[CONS] summary insert without row_type/provenance — rq-p7-f2-consolidation.sql columns missing? Row stored bare; originals NOT flagged this run.");
+            await _consPatch("rq_consolidation_jobs?id=eq." + job.id, { status: "error", done_at: new Date().toISOString() }).catch(() => {});
+            return;
+          }
+        }
+        if (!row || !row.id) {
+          await _consPatch("rq_consolidation_jobs?id=eq." + job.id, { status: "error", done_at: new Date().toISOString() }).catch(() => {});
+          _consLineOnce("ins", "[CONS] summary insert returned no row — job " + String(job.id).slice(0, 8) + " marked error.");
+          return;
+        }
+        summaryId = row.id;
+        embedAndStore(summaryId, sumPrompt + "\n\n" + clip(summary, 900));   // detached; null embedding is acceptable
+      }
+
+      let flagged = 0;
+      for (const r of live) {
+        const n = await _consPatch("rq_events?id=eq." + r.id, { consolidated: true, consolidation_group: summaryId }).catch(() => 0);
+        if (n > 0) flagged++;
+      }
+      if (flagged < live.length) {
+        await _consPatch("rq_consolidation_jobs?id=eq." + job.id, { status: "error", done_at: new Date().toISOString() }).catch(() => {});
+        _consLineOnce("flag", "[CONS] only " + flagged + "/" + live.length + " originals flagged (RLS?) — job " +
+          String(job.id).slice(0, 8) + " marked error; summary row " + String(summaryId).slice(0, 8) + " retained for manual repair.");
+        return;
+      }
+
+      await _consPatch("rq_consolidation_jobs?id=eq." + job.id, { status: "done", done_at: new Date().toISOString() }).catch(() => {});
+      _consVitalsInsert({
+        round_id: null,
+        event_id: summaryId,
+        session_id: RQ_SESSION_ID,
+        operation: "consolidation",       // BLOCKER 3: never 'round', so F1's window excludes it
+        latency_ms: Date.now() - t0,
+        fallback_used: seat.name.indexOf("PAID") === -1 && seat.name.indexOf("walk") !== -1,
+        edge_errors: 0,
+        token_budget_remaining: null,
+        retrieval_queue_depth: 0,
+        seat_health: { summarizer: seat.name, rows_merged: live.length },
+      });
+      logError("[CONS] job " + String(job.id).slice(0, 8) + " done — " + live.length +
+        " rows merged into " + String(summaryId).slice(0, 8) + " via " + seat.name + ".");
+    } catch (e) {
+      await _consPatch("rq_consolidation_jobs?id=eq." + job.id, { status: "error", done_at: new Date().toISOString() }).catch(() => {});
+      _consLineOnce("job", "[CONS] job " + String(job.id).slice(0, 8) + " threw: " + ((e && e.message) || e) + " — marked error, rounds unaffected.");
+    }
+  }
+
+  // Phase A2 — post-filter only. match_rounds is NOT modified; consolidated
+  // ORIGINALS are dropped from the shaped lists. CONSOLIDATED summaries have
+  // consolidated=false and stay retrievable — that is their entire purpose.
+  //
+  // BLOCKER 2: this runs AFTER the 12s inject race has closed, so it carries
+  // its OWN bound. Fail-open in every direction: timeout, throw, or a non-array
+  // response all mean "skip filtering", never "fail the round".
+  async function filterConsolidatedFromRetrieval(shaped) {
+    if (!consFilterEnabled() || !shaped) return shaped;
+    try {
+      const ids = []
+        .concat(shaped.hits || [], shaped.candidates || [])
+        .map((h) => h && h.id)
+        .filter((id) => !!id);
+      if (!ids.length) return shaped;
+      const uniq = Array.from(new Set(ids));
+      const get = fetch(p2Base() + "/rest/v1/rq_events?id=in.(" + uniq.join(",") + ")&select=id,consolidated",
+        { headers: p2Headers() }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      const res = await Promise.race([
+        get,
+        new Promise((r) => setTimeout(() => r("__timeout__"), RQ_CONS_FILTER_TIMEOUT_MS)),
+      ]);
+      if (res === "__timeout__" || !Array.isArray(res)) {
+        _consLineOnce("filter", "[CONS-FILTER] consolidated lookup " +
+          (res === "__timeout__" ? "timed out" : "failed") + " — injection proceeds UNFILTERED (fail-open), round unaffected.");
+        return shaped;
+      }
+      const drop = new Set(res.filter((r) => r && r.consolidated === true).map((r) => r.id));
+      if (!drop.size) return shaped;
+      const before = (shaped.hits || []).length + (shaped.candidates || []).length;
+      if (shaped.hits) shaped.hits = shaped.hits.filter((h) => !drop.has(h.id));
+      if (shaped.candidates) shaped.candidates = shaped.candidates.filter((h) => !drop.has(h.id));
+      const after = (shaped.hits || []).length + (shaped.candidates || []).length;
+      logError("[CONS-FILTER] " + (before - after) + " consolidated original(s) excluded from injection — merged summary remains retrievable.");
+      return shaped;
+    } catch (e) {
+      _consLineOnce("filter", "[CONS-FILTER] threw (" + ((e && e.message) || e) + ") — injection proceeds unfiltered, round unaffected.");
+      return shaped;
+    }
+  }
+
+  // Self-prompt consumption (R-P7-10). Inject FILLS THE INPUT BOX; the operator
+  // presses send. There is no code path here that dispatches.
+  async function consumeSelfPromptBanner() {
+    try {
+      if (!consolidationEnabled()) return;
+      if (_consDisabledSession || !sbConfigured()) return;
+      // BLOCKER 1: Governor state is read ONLY through the frozen accessor, and
+      // the red literal is "distress". Absent accessor => false => fail-open.
+      if (typeof window.__rqGovernorMode === "function" && window.__rqGovernorMode() === "distress") {
+        _consLineOnce("govred", "[CONS] self-prompt banner suppressed — Governor is in distress.");
+        return;
+      }
+      if (document.getElementById("rqSelfPromptBanner")) return;
+      let dismissed = null;
+      try { dismissed = sessionStorage.getItem("rq_selfprompt_dismissed_session"); } catch (_) {}
+      if (dismissed || busy !== false) return;
+      let rows;
+      try {
+        rows = await _consFetch("rq_self_prompt_queue?status=eq.pending&order=created_at.asc&select=id,source_round_id,prompt,created_at");
+      } catch (e) {
+        if (e.status === 404) {
+          _consDisabledSession = true;
+          logError("[CONS] rq_self_prompt_queue GET 404 — table missing. Run rq-p7-f2-consolidation.sql; banner disabled for this session, rounds unaffected.");
+        }
+        return;
+      }
+      if (!rows || !rows.length) return;
+      const oldest = rows[0];
+      const banner = document.createElement("div");
+      banner.id = "rqSelfPromptBanner";
+      banner.style.cssText = "position:fixed;left:14px;right:14px;bottom:64px;z-index:59;padding:8px 10px;border:1px solid #8a6a3a;" +
+        "border-radius:8px;background:rgba(20,20,20,0.96);color:inherit;font-size:0.78em;line-height:1.5;";
+      const msg = document.createElement("div");
+      // UNTRUSTED stored model text: textContent ONLY, never innerHTML/mdPaint.
+      msg.textContent = rows.length + " self-generated prompt(s) pending — oldest: " + clip(String(oldest.prompt || ""), 140);
+      const inject = document.createElement("button"); inject.textContent = "Inject";
+      const skip   = document.createElement("button"); skip.textContent = "Skip";
+      const dismiss = document.createElement("button"); dismiss.textContent = "Dismiss";
+      [inject, skip, dismiss].forEach((b) => {
+        b.style.cssText = "font-size:0.95em;padding:2px 10px;margin-right:6px;margin-top:6px;border-radius:999px;" +
+          "border:1px solid #8a6a3a;background:rgba(138,106,58,0.15);color:inherit;cursor:pointer;";
+      });
+      inject.addEventListener("click", () => {
+        queryInput.value = String(oldest.prompt || "");
+        try { queryInput.dispatchEvent(new Event("input", { bubbles: true })); } catch (_) {}
+        try { queryInput.focus(); } catch (_) {}
+        _rqEndogenousPrompt = String(oldest.prompt || "");
+        _consPatch("rq_self_prompt_queue?id=eq." + oldest.id + "&status=eq.pending", { status: "processed" }).catch(() => {});
+        banner.remove();
+        logError("[CONS] self-prompt injected into the input box — press send to run it. NEVER auto-dispatched. The next round will carry endogenous:true.");
+      });
+      skip.addEventListener("click", () => {
+        _consPatch("rq_self_prompt_queue?id=eq." + oldest.id + "&status=eq.pending", { status: "skipped" }).catch(() => {});
+        banner.remove();
+        logError("[CONS] self-prompt skipped.");
+      });
+      dismiss.addEventListener("click", () => {
+        try { sessionStorage.setItem("rq_selfprompt_dismissed_session", "1"); } catch (_) {}
+        banner.remove();
+      });
+      banner.appendChild(msg); banner.appendChild(inject); banner.appendChild(skip); banner.appendChild(dismiss);
+      document.body.appendChild(banner);
+    } catch (_) { /* a banner is a nicety, never a fault */ }
+  }
+
+  // Post-round / idle kick. Never on the dispatch path, never awaited.
+  window.__rqConsolidationKick = function () {
+    try {
+      if (!consolidationEnabled() || busy !== false) return;
+      runConsolidationJobsClient();
+      consumeSelfPromptBanner();
+    } catch (_) {}
+  };
+
+  // ---------- Pillar VII F3: Prediction-Error Self-Model (rq_predictions, default OFF) ----------
+  // At dispatch each seat predicts (a) its own final position and (b) the
+  // consensus outcome. Post-round the prediction is scored against reality and
+  // large error ("surprise") queues an audit prompt. This is the only
+  // instrument in the system that is falsifiable BY CONSTRUCTION: a prediction
+  // is wrong or it isn't, and the number says which.
+  //
+  // COST CONSENT (R-P7-3): +1 API call per seat per round. Flag default OFF,
+  // stated in the rack copy and at boot. Prediction calls fire CONCURRENTLY
+  // with dispatch and are NEVER awaited — a hung provider cannot add a
+  // millisecond to a round. Exactly ONE call per seat on its CONFIGURED
+  // provider: no failover walk, no circuit trip, no seatProvider mutation.
+  //
+  // UNTRUSTED (R-P7-11): prediction/actual text is model output. It is never
+  // rendered (no innerHTML path), never enters any seat's context, memory
+  // block, ledger entry, or the embedding corpus. The prediction prompt itself
+  // contains ONLY the raw query clip plus instructions — no memory block, no
+  // seat identity substitution, no ledger content.
+  const RQ_PRED_PROMPT_CLIP = 500;    // FROZEN (R-P7-12)
+  const RQ_PRED_SURPRISE    = 0.7;    // FROZEN (R-P7-12) — similarity floor; surprise <=> sim < 0.7
+  const RQ_PRED_TIMEOUT_MS  = 20000;  // NEW — TUNE-AFTER-DATA, per-call race budget
+
+  let _predRoundId        = null;   // dispatch id predictions were fired for
+  let _predTableMissing   = false;  // session-sticky disable
+  let _predStoredWatchdog = false;  // one "event never stored" line per session
+  let _predVitalsMissing  = false;
+  let _predQueueMissingSeen = false;
+
+  function predictionsEnabled() { return localStorage.getItem("rq_predictions") === "on"; }
+
+  // Mirror of the real seat selection — same predicates, same understudy rules,
+  // MINUS the failover-chain wrapper. A prediction is one best-effort call.
+  function predictionSeats() {
+    const seats = [];
+    if (settings.keyGemini) seats.push({ name: "gemini", fn: callGemini });
+    else if (settings.keyCerebras) seats.push({ name: "gemini", fn: callCerebras });
+    if (settings.keyKimi) {
+      if (kimiK3Enabled()) seats.push({ name: "kimi", fn: callKimi });
+      else if (settings.keyOpenRouter) seats.push({ name: "kimi", fn: (q) => callOpenRouter(q, "kimi") });
+    }
+    if (settings.keyClaude) seats.push({ name: "claude", fn: callClaude });
+    else if (settings.keyGroq) seats.push({ name: "claude", fn: callGroq });
+    return seats;
+  }
+
+  // Model output is UNTRUSTED. Accepts bare JSON or fenced/prose-wrapped JSON;
+  // returns null on anything else. Never throws.
+  function predJsonParse(raw) {
+    try {
+      const s = String(raw == null ? "" : raw);
+      const i = s.indexOf("{"), j = s.lastIndexOf("}");
+      if (i === -1 || j <= i) return null;
+      const o = JSON.parse(s.slice(i, j + 1));
+      return (o && typeof o === "object") ? o : null;
+    } catch (_) { return null; }
+  }
+
+  // BLOCKER 5. sbInsert strips control bytes from every string field at the
+  // wire; F3's raw-PostgREST writes do NOT go through sbInsert, so they must do
+  // the same. Without this, one model-emitted control byte fails Postgres with
+  // 22P05 -> HTTP 400 -> misdiagnosed as "table missing" -> feature disabled
+  // for the session. A bad byte must not look like a bad migration.
+  function _predStrip(obj) {
+    try {
+      const out = {};
+      Object.keys(obj || {}).forEach((k) => {
+        out[k] = typeof obj[k] === "string" ? rqStripControls(obj[k]) : obj[k];
+      });
+      return out;
+    } catch (_) { return obj; }
+  }
+
+  function _predInsert(obj) {
+    if (!sbConfigured() || _predTableMissing) return Promise.resolve();
+    return fetch(p2Base() + "/rest/v1/rq_predictions", {
+      method: "POST",
+      headers: Object.assign(p2Headers(), { Prefer: "return=minimal" }),
+      body: JSON.stringify(_predStrip(obj)),
+    }).then((res) => {
+      if (res.ok) return;
+      if (res.status === 404 || res.status === 400) {
+        _predTableMissing = true;
+        logError("[P7-F3] rq_predictions insert " + res.status +
+          " — table/column missing. Run rq-p7-f3-predictions.sql; predictions disabled for this session, rounds unaffected.");
+      } else {
+        logError("[P7-F3] rq_predictions insert failed (HTTP " + res.status + ") — round unaffected.");
+      }
+    }).catch((e) => logError("[P7-F3] rq_predictions unreachable: " + (e.message || e) + " — round unaffected."));
+  }
+
+  function _predGet(qs) {
+    if (!sbConfigured()) return Promise.resolve(null);
+    return fetch(p2Base() + "/rest/v1/rq_predictions?" + qs, { headers: p2Headers() })
+      .then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  }
+
+  function _predPatch(qs, body) {
+    if (!sbConfigured() || _predTableMissing) return Promise.resolve();
+    return fetch(p2Base() + "/rest/v1/rq_predictions?" + qs, {
+      method: "PATCH",
+      headers: Object.assign(p2Headers(), { Prefer: "return=minimal" }),
+      body: JSON.stringify(_predStrip(body)),   // same wire-strip as the insert
+    }).then((r) => {
+      if (r.ok) return;
+      if (r.status === 404 || r.status === 400) {
+        _predTableMissing = true;
+        logError("[P7-F3] rq_predictions PATCH " + r.status +
+          " — table/column missing. Run rq-p7-f3-predictions.sql; predictions disabled for this session, rounds unaffected.");
+      } else {
+        logError("[P7-F3] rq_predictions PATCH failed (HTTP " + r.status + ") — row left unscored, round unaffected.");
+      }
+    }).catch((e) => logError("[P7-F3] rq_predictions PATCH unreachable: " + (e.message || e) + " — round unaffected."));
+  }
+
+  function _queueGet(qs) {
+    if (!sbConfigured()) return Promise.resolve(null);
+    return fetch(p2Base() + "/rest/v1/rq_self_prompt_queue?" + qs, { headers: p2Headers() })
+      .then((r) => (r.ok ? r.json() : (r.status === 404 ? false : null)))   // false => table missing
+      .catch(() => null);
+  }
+
+  function _predQueueMissing() {
+    if (_predQueueMissingSeen) return;
+    _predQueueMissingSeen = true;
+    logError("[P7-F3] rq_self_prompt_queue missing or unreachable — surprise rows NOT queued. Run rq-p7-f2-consolidation.sql; scoring itself is unaffected.");
+  }
+
+  function _predVitalsInsert(obj) {
+    if (!sbConfigured() || _predVitalsMissing) return Promise.resolve();
+    return fetch(p2Base() + "/rest/v1/rq_vitals", {
+      method: "POST",
+      headers: Object.assign(p2Headers(), { Prefer: "return=minimal" }),
+      body: JSON.stringify([obj]),
+    }).then((r) => {
+      if (r.ok) return;
+      if (r.status === 404 || r.status === 400) {
+        _predVitalsMissing = true;
+        logError("[P7-F3] rq_vitals insert " + r.status + " — run rq-p7-f1-vitals.sql; vitals reporting disabled for this session, scoring unaffected.");
+      }
+    }).catch(() => {});
+  }
+
+  // cosineVec in this file is a SPARSE-object TF-IDF cosine — wrong shape for
+  // dense 384-vectors. F3 carries its own dense helper.
+  function _cosine384(a, b) {
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    return (na && nb) ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+  }
+
+  // Fires CONCURRENTLY with dispatch. The caller NEVER awaits this.
+  function collectPredictions(dispatchId, seats, prompt) {
+    try {
+      if (!predictionsEnabled() || _predTableMissing) return;
+      if (!sbConfigured()) return;              // no storage => no spend (cost-consent doctrine)
+      if (!seats || !seats.length) return;
+      _predRoundId = dispatchId;
+      const fullCouncil = seats.length >= 3;    // operator 2-seat rule
+      seats.forEach((seat) => {
+        const predictionPrompt =
+          "You are the " + seat.name + " seat in the Red Queen council. " +
+          "Before the council answers, predict:\n" +
+          "1. Your own final position, in 2-3 sentences.\n" +
+          (fullCouncil
+            ? "2. The likely consensus outcome — one sentence, or the single word DIVIDED.\n"
+            : "2. Consensus prediction SKIPPED — council size < 3 (2-seat rule).\n") +
+          "\nMain prompt (context only — do NOT answer it): \"" +
+          clip(prompt, RQ_PRED_PROMPT_CLIP) + "\"\n\n" +
+          "Respond ONLY with this JSON object — no prose, no markdown fences:\n" +
+          "{\"predicted_own\": \"...\", \"predicted_consensus\": \"" + (fullCouncil ? "..." : "N/A") + "\"}";
+        Promise.race([
+          seat.fn(predictionPrompt),
+          sleep(RQ_PRED_TIMEOUT_MS).then(() => "__timeout__"),
+        ]).then((raw) => {
+          const parsed = (raw === "__timeout__") ? null : predJsonParse(raw);
+          if (raw === "__timeout__") {
+            logError("[P7-F3] " + seat.name + " prediction exceeded " + RQ_PRED_TIMEOUT_MS +
+              "ms — storing NO PREDICTION; round unaffected.");
+          }
+          _predInsert({
+            round_id: dispatchId,
+            seat_name: seat.name,
+            predicted_own: (parsed && parsed.predicted_own) ? clip(String(parsed.predicted_own), 900) : "NO PREDICTION",
+            predicted_consensus: !fullCouncil ? "N/A"
+              : (parsed && parsed.predicted_consensus) ? clip(String(parsed.predicted_consensus), 300) : "NO PREDICTION",
+          });
+        }).catch((e) => {
+          logError("[P7-F3] " + seat.name + " prediction call failed: " + (e.message || e) + " — storing NO PREDICTION; round unaffected.");
+          _predInsert({ round_id: dispatchId, seat_name: seat.name,
+            predicted_own: "NO PREDICTION", predicted_consensus: fullCouncil ? "NO PREDICTION" : "N/A" });
+        });
+      });
+    } catch (e) {
+      try { logError("[P7-F3] collectPredictions threw: " + (e.message || e) + " — round unaffected."); } catch (_) {}
+    }
+  }
+
+  // Post-round, detached, flag-gated. FROZEN scoring definition:
+  //   similarity  = cosine(embed(predicted_own), embed(actual_own))
+  //   error_score = 1 - similarity          (a DISTANCE: 0 identical, 1 opposite)
+  //   surprise    = error_score > (1 - RQ_PRED_SURPRISE)   <=> similarity < 0.7
+  // Boundary, stated once: similarity exactly 0.700 -> error 0.300 -> NOT
+  // surprise (strictly greater). 0.699 -> surprise.
+  //
+  // The consensus prediction is NOT embedded: a one-token status ("divided")
+  // embeds meaninglessly. It is compared by normalized string match and only
+  // REPORTED.
+  async function scorePredictionsClient(roundResult, eventId) {
+    const t0 = Date.now();
+    let edgeErrors = 0, scored = 0, surprises = 0;
+    const roundId = _predRoundId;
+    _predRoundId = null;   // disarms the watchdog
+    try {
+      if (!predictionsEnabled() || _predTableMissing || !sbConfigured()) return;
+      if (!roundId || !eventId || !roundResult) return;
+      if (roundResult.note || roundResult.indexical || roundResult.narrator) return;
+      await _predPatch("round_id=eq." + encodeURIComponent(roundId) + "&event_id=is.null", { event_id: eventId });
+      // error_score IS NULL is the idempotency key: a second invocation selects
+      // zero rows and is a no-op.
+      const rows = await _predGet("round_id=eq." + encodeURIComponent(roundId) +
+        "&error_score=is.null&select=id,seat_name,predicted_own,predicted_consensus");
+      if (!rows || !rows.length) return;
+      const answers = (roundResult && roundResult.answers) || [];
+      // Byte-identical derivation of the literal the client writes to
+      // rq_events.consensus_status — not a re-interpretation.
+      const actualConsensus = roundResult.divided ? "divided" : (roundResult.trust || "unknown");
+      for (const row of rows) {
+        try {
+          const a = answers.find((x) => x.name === row.seat_name);
+          const actualOwn = a ? clip(String(a.text == null ? "" : a.text), 900) : null;
+          let errorScore = null, surprise = false;
+          if (actualOwn && row.predicted_own !== "NO PREDICTION") {
+            const pv = await embedText(row.predicted_own);
+            const av = await embedText(actualOwn);
+            if (pv && av) {
+              const sim = _cosine384(pv, av);
+              errorScore = Math.round((1 - sim) * 1000) / 1000;
+              surprise = errorScore > (1 - RQ_PRED_SURPRISE);
+            } else {
+              edgeErrors++;   // worker down — scored NULL, never guessed
+            }
+          }
+          await _predPatch("id=eq." + row.id, {
+            actual_own: actualOwn, actual_consensus: actualConsensus,
+            error_score: errorScore, surprise: surprise,
+          });
+          scored++;
+          if (row.predicted_consensus && row.predicted_consensus !== "N/A" && row.predicted_consensus !== "NO PREDICTION") {
+            const saidDivided = /divided/i.test(row.predicted_consensus);
+            const wasDivided = actualConsensus === "divided";
+            if (saidDivided !== wasDivided) {
+              logError("[P7-F3] " + row.seat_name + " consensus prediction missed: predicted " +
+                (saidDivided ? "DIVIDED" : "convergence") + ", actual " + actualConsensus + ".");
+            }
+          }
+          if (surprise) {
+            surprises++;
+            const qPrompt = "SURPRISE AUDIT: " + row.seat_name +
+              " predicted radically different from actual outcome. Re-examine reasoning.";
+            // Dedup scoped to (source_round_id, pending, EXACT prompt) so F2's
+            // RECONCILIATION rows are never matched or touched, and vice versa.
+            const dupe = await _queueGet("source_round_id=eq." + encodeURIComponent(roundId) +
+              "&status=eq.pending&prompt=eq." + encodeURIComponent(qPrompt) + "&select=id&limit=1");
+            if (dupe && dupe.length) {
+              /* already queued */
+            } else if (dupe) {
+              sbInsert("rq_self_prompt_queue", {
+                source_round_id: roundId,
+                prompt: qPrompt,             // static text + app-controlled seat name only
+                status: "pending",
+              });
+            } else {
+              _predQueueMissing();
+            }
+          }
+        } catch (e) {
+          logError("[P7-F3] scoring row " + row.id + " failed: " + (e.message || e) + " — row skipped, round unaffected.");
+        }
+      }
+      _predVitalsInsert({
+        round_id: roundId, event_id: eventId, session_id: RQ_SESSION_ID,
+        operation: "prediction_scoring",   // BLOCKER 3: never 'round'
+        latency_ms: Date.now() - t0, fallback_used: false, edge_errors: edgeErrors,
+        token_budget_remaining: null, retrieval_queue_depth: 0, seat_health: null,
+      });
+      logError("[P7-F3] scoring done for " + roundId + ": " + scored + " row(s), " +
+        surprises + " surprise(s), " + edgeErrors + " embed failure(s), " + (Date.now() - t0) + "ms.");
+    } catch (e) {
+      try { logError("[P7-F3] scorePredictionsClient failed: " + (e.message || e) + " — round unaffected."); } catch (_) {}
+    }
+  }
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -8305,6 +9389,24 @@ roundData,
   async function dispatch(query) {
     if (busy) return;
     busy = true;
+
+    // P7 F1 (rq_governor) — the ONLY gate on the dispatch path, and it fails
+    // OPEN: any telemetry fault resolves to normal inside RQ_GOV_TIMEOUT_MS.
+    // Flag off = one localStorage read and an immediate return. proceed:false
+    // is reachable ONLY from the operator's "Run repair round" button, so the
+    // veto below can never surprise anyone.
+    const _gov = await governorCheck();
+    if (!_gov.proceed) { busy = false; return; }
+    // Latency instrumentation (none existed before). Started AFTER the gate so
+    // operator think-time in the ack modal is never counted as system latency.
+    _govRoundStart = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+
+    // P7 F2 — endogenous marker, read-and-clear. ADVISORY 10: this lands AFTER
+    // F1's governor gate on purpose. If the operator vetoes at the gate ("Run
+    // repair round"), the marker must SURVIVE for the next dispatch of the same
+    // query — consuming it above would silently lose endogenous:true.
+    const _endogenous = (_rqEndogenousPrompt !== null && _rqEndogenousPrompt === query);
+    _rqEndogenousPrompt = null;
 
     resetSeatVisuals();
     clearDividedPanel();
@@ -8342,12 +9444,24 @@ roundData,
       // budget, and no retrieval request is made at all.
       _noteRound = isOperatorNote(query);
       _indexicalRound = isIndexicalPrompt(query);
+      // P7 F3 — predictions fire CONCURRENTLY and are NEVER awaited (R-P7-3).
+      // Flag off: one localStorage read and nothing else. Note/indexical rounds
+      // have no adjudication to predict, so they are excluded here AND at the
+      // scoring-listener registration below (ADVISORY 9).
+      if (predictionsEnabled() && !_noteRound && !_indexicalRound) {
+        try { collectPredictions(dispatchId, predictionSeats(), query); } catch (_) {}
+      }
       let _vectorBlock = "";
       let _memBudget = MEMORY_CONTEXT_CHAR_CAP;
       _injectedThisRound = false;
       if (injectionEnabled()) {
-        const vecBudget = Math.floor(MEMORY_CONTEXT_CHAR_CAP * RQ_INJECT_VECTOR_FRAC);
-        _memBudget = MEMORY_CONTEXT_CHAR_CAP - vecBudget;
+        // P7 F1 — distress halves the injection budget alongside the item
+        // count. Multiplier is 1 unless applyGovernorMode set _govInjectHalf
+        // THIS dispatch. The arc budget is deliberately NOT halved: arcs are a
+        // separate small P3_ARC_FRAC share, and the narrator that refreshes
+        // them is what distress already skips.
+        const vecBudget = Math.floor(MEMORY_CONTEXT_CHAR_CAP * RQ_INJECT_VECTOR_FRAC * (_govInjectHalf ? RQ_GOV_INJECT_FRAC : 1));
+        _memBudget = Math.floor((MEMORY_CONTEXT_CHAR_CAP - vecBudget) * (_govInjectHalf ? RQ_GOV_INJECT_FRAC : 1));
         const inj = await retrieveForInjection(query);
         _vectorBlock = inj ? buildVectorBlock(inj.hits, vecBudget) : "";
         if (inj && !inj.hits.length) {
@@ -8438,11 +9552,23 @@ roundData,
           // v3.0.2: per-seat roster for Seat Stats — who answered, who was
           // malformed; absent seats failed that round.
           seats: allAnswers.map((a) => ({ n: a.name, m: !!a.malformed })),
+          // P7 F2 — additive spread: when the flag path never fired the key is
+          // simply ABSENT, so the object literal is byte-identical to v3.9.14.
+          ...(_endogenous ? { endogenous: true } : {}),
+        });
+        // P7 F1 — vitals, fire-and-forget, BEFORE logInstitutionalMemory so the
+        // rq:round-stored listener is registered before the event can fire.
+        // No-op when rq_governor is off.
+        recordVitals(result, {
+          dispatchId,
+          latencyMs: ((typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now()) - _govRoundStart,
         });
         if (typeof playConsensusFlow === "function" && settings.flowAnim !== false) playConsensusFlow(divided, result.trust);
         if (memoryPill && memoryPill.refresh) memoryPill.refresh();
         if (window.__rqRenderSessions) window.__rqRenderSessions();
         if (window.__rqMaybeSnapshotBanner) window.__rqMaybeSnapshotBanner();   // F2 — no-op when the flag is off
+        // P7 F2 — idle kick. Guarded, detached, re-checks its own flag and busy.
+        if (window.__rqConsolidationKick) window.__rqConsolidationKick();
         if (window.__rqIntro) { window.__rqIntro.remove(); window.__rqIntro = null; }
         warnSeatDiversity(result);
         logInstitutionalMemory(dispatchId, query, result);
@@ -8478,12 +9604,43 @@ roundData,
             try { p4DriftHook(ev.detail && ev.detail.id, result); } catch (_) {}
           }, { once: true });
         }
+        // P7 F3 — prediction scoring. Same one-shot pattern, detached,
+        // flag-gated, runs only after the round is fully recorded.
+        // ADVISORY 9: the round-type gate here MATCHES the collection hook.
+        // Note/indexical rounds fire rq:round-stored too, and registering with
+        // a stale _predRoundId from an earlier unstored round would misattribute
+        // THIS round's event to THAT round's predictions.
+        if (predictionsEnabled() && !_noteRound && !_indexicalRound &&
+            !(result && (result.note || result.indexical))) {
+          document.addEventListener("rq:round-stored", function _p7f3(ev) {
+            document.removeEventListener("rq:round-stored", _p7f3);
+            try { scorePredictionsClient(result, ev.detail && ev.detail.id); } catch (_) {}
+          }, { once: true });
+          const _predWatchdogRound = _predRoundId;
+          setTimeout(() => {
+            if (_predStoredWatchdog || !_predWatchdogRound) return;
+            if (_predRoundId === _predWatchdogRound) {
+              _predStoredWatchdog = true;
+              logError("[P7-F3] rq_events row never stored for " + _predWatchdogRound +
+                " — prediction rows stay event_id NULL, scoring skipped. (Supabase off or insert failed.)");
+            }
+          }, 60000);
+        } else if (_predRoundId && _predRoundId !== dispatchId) {
+          // This round fired NO predictions. A non-null _predRoundId that is not
+          // THIS dispatchId belongs to an earlier round whose rq_events row never
+          // landed — expire it now so it can never be misattributed (ADVISORY 9).
+          _predRoundId = null;
+        }
         // Pillar 3 trigger. Detached and flag-gated: with rq_p3_narrator off this
         // is a no-op, and even on it can only run AFTER the round is fully
         // recorded, so a narrator failure can never touch the round that caused it.
-        if (PILLAR3.enabled() && PILLAR3.narratorPass()) {
+        if (PILLAR3.enabled() && PILLAR3.narratorPass() && !_govSkipP3Next) {
           setTimeout(() => { p3NarratorPass(false); }, 1500);
+        } else if (_govSkipP3Next) {
+          logError("[GOV] P3 narrator skipped this cycle (distress mode) — cadence window " + P3_N +
+            " rounds, next cycle re-evaluates.");
         }
+        _govSkipP3Next = false;   // one-cycle consume; already false when rq_governor is off
         // Trust-state prefix (v2.4): the bar itself carries the verification
         // level — a sole understudy's opinion must never wear the Council's
         // crown unmarked. "Always check the error logs" — founder, 2026-07-12.
@@ -8693,6 +9850,27 @@ roundData,
       logError(injectionEnabled()
         ? "[INJECT] Stage 3 injection is ON — retrieved rounds will be placed in seat context. A/B rows this session record injected:true."
         : "[INJECT] Stage 3 injection is OFF — control arm. Settings → STAGE 3 INJECTION to enable.");
+      logError(predictionsEnabled()
+        ? "[P7-F3] Predictions ON — +1 API call per seat per round (concurrent, never blocks dispatch); post-round scoring to rq_predictions." +
+          (_predTableMissing ? " \u26A0 TABLE MISSING, run rq-p7-f3-predictions.sql." : "")
+        : "[P7-F3] Predictions OFF — no prediction calls or writes; dispatch byte-identical.");
+      logError(consolidationEnabled()
+        ? "[CONS] Consolidation client ON — pending sleep-cycle jobs run at load/idle via the cheapest configured seat. Queue banner armed."
+        : "[CONS] Consolidation client OFF — server-side selection (if the cron is deployed) accumulates jobs; nothing executes. Settings \u2192 P7: CONSOLIDATION to enable.");
+      logError(consFilterEnabled()
+        ? "[CONS-FILTER] ON — consolidated originals excluded from retrieval injection; CONSOLIDATED summaries remain retrievable."
+        : "[CONS-FILTER] OFF — retrieval identical to v3.9.14.");
+      if (consolidationEnabled()) {
+        // Advisory work runs AFTER load, never in it (P3 narrator detach precedent).
+        setTimeout(() => {
+          try { runConsolidationJobsClient(); } catch (_) {}
+          try { consumeSelfPromptBanner(); } catch (_) {}
+        }, 5000);
+      }
+      logError(governorEnabled()
+        ? "[GOV] Homeostatic Governor ON — vitals recorded to rq_vitals each round; avg distress \u2265 " + RQ_GOV_RED +
+          " over the last " + RQ_GOV_WINDOW + " rows degrades the next round (P3 skip, halved injection, ack modal). Fails OPEN: telemetry errors never block a round."
+        : "[GOV] Homeostatic Governor OFF — no vitals, no pre-dispatch check; dispatch byte-identical to v3.9.13. Settings \u2192 P7: VITAL-SIGNS GOVERNOR to enable.");
       logError("[EPISODIC] filter " + episodicFilterMode().toUpperCase() +
         (episodicFilterMode() === "shadow"
           ? " — sign-off/acknowledgement rounds are LOGGED but still embedded. Read the ◇ EPISODIC lines, then promote with localStorage.setItem('rq_episodic_filter','live')."
