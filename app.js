@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.0.2-audit-evidence";
+  const RQ_BUILD = "v4.1.0-round-header";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4168,6 +4168,13 @@ roundData,
          "\u26A0 COSTS +1 API CALL PER SEAT PER ROUND. Each seat predicts its position and the consensus at dispatch (concurrent, never blocking); error is scored post-round to rq_predictions.",
          "No prediction calls, no prediction rows, no scoring. Dispatch is byte-identical to pre-F3."],
 
+        ["roundHeaderToggle", "rq_round_header", "P6: ROUND HEADER",
+         "Structured write-time metadata on every round \u2014 seats expected vs recorded, per-seat receipts, absent seats marked [ABSENT \u2014 no receipt], divergence type and epistemic class. Write-path only: seats see nothing new.",
+         "No header written. Ledger entry and event row are byte-identical to v4.0.2."],
+        ["falsifierAskToggle", "rq_falsifier_ask", "P6: FALSIFIER ASK",
+         "\u26A0 SEATS READ THIS. Each seat is asked to state what would change its mind; the answer is parsed into its receipt. Appended AFTER composition so the prompt hash stays clean, but rounds with it ON carry an extra instruction.",
+         "Seats are not asked for a falsifier. Receipts carry falsifier: null."],
+
         // ---- v3.9.10 F0 — INSTRUMENTS (tri-state). These three were console-only
         // until now, which cost the 2026-08-06 session three divided rounds of
         // COUNTERSTAMP data because localStorage is per-device and neither flag
@@ -6373,6 +6380,10 @@ roundData,
            : "")), 900);
     const _evStatus = result.divided ? "divided" : (result.trust || "unknown");
     const _evClass = classifyPrompt(query);
+    // Pillar VI Decision 3 — epistemic_class is computed and stored IN THE ROUND
+    // HEADER, not as an rq_events column: that column does not exist and no
+    // migration has been ruled. Writing an unmigrated column would 400 and be
+    // misdiagnosed as a missing table. The Supabase side is a follow-up.
 
     // seat_degraded for the A/B log. Reuses warnSeatDiversity's identity rule
     // (a.model || seatModelLabel) rather than a second implementation, so the
@@ -9427,6 +9438,120 @@ roundData,
     }
   }
 
+  // ---------- Pillar VI, Part 1: The Round Header (rq_round_header, default OFF) ----------
+  // Every round closes with structured metadata written BEFORE storage. This is
+  // the substrate the Spine will later compress — and it is useful on its own,
+  // because it turns three things that are currently invisible into data:
+  //
+  //   1. ABSENCE. A configured seat that never answered is presently indistinguishable
+  //      from a seat that was never configured. The header renders it
+  //      [ABSENT — no receipt], so silence and equipment failure stop being
+  //      stored identically.
+  //   2. DIVERGENCE TYPE, computed deterministically where possible. COUNTERSTAMP
+  //      is effectively this field arriving early, so the header reads its verdict
+  //      when one exists rather than recomputing a second opinion.
+  //   3. EPISTEMIC CLASS at birth (Decision 3). A NEW field with its own name and
+  //      its own doctrine — prompt_class stays operator-only and untouched.
+  //      Stored only tonight; class-matched retrieval is Spine work.
+  const RQ_FALSIFIER_ASK =
+    "Before answering, state, in one sentence, what would change your mind about your position. " +
+    "Begin that sentence with FALSIFIER: on its own line.";
+  const RQ_FALSIFIER_RE = /^\s*FALSIFIER\s*:\s*(.+)$/im;
+
+  function roundHeaderEnabled() { return localStorage.getItem("rq_round_header") === "on"; }
+  function falsifierAskEnabled() { return localStorage.getItem("rq_falsifier_ask") === "on"; }
+
+  // EVIDENCE vs META, deterministic and deliberately crude. A META round is one
+  // ABOUT the council or its machinery; an EVIDENCE round is about the world.
+  // Crude is acceptable here because nothing reads it yet — it is being
+  // collected so the classifier can be judged against real rounds before
+  // anything depends on it. Same observe-first discipline as the comparators.
+  const RQ_META_RE = /\b(council|seat|seats|ledger|round\s*\d+|red\s*queen|spine|counterweight|retrieval|embedding|consensus|adjudicat|pillar|gate\s*[123]|counterstamp|fragility|falsifier|orchestrat)\b/i;
+  function classifyEpistemic(prompt) {
+    return RQ_META_RE.test(String(prompt || "")) ? "META" : "EVIDENCE";
+  }
+
+  // CONFIRMATION rounds: the operator asking the council to confirm acceptance
+  // of a directive, NOT to re-open a debate. Scored for acceptance, never for
+  // lexical convergence — which is what made round 175 read as DIVIDED when the
+  // seats had simply attached footnotes to an agreement they all shared.
+  const RQ_CONFIRMATION_RE = /^\s*(confirm|confirmation)\s*[:\-\u2014]|^\s*council,?\s+confirm\b/i;
+  function isConfirmationRound(q) { return RQ_CONFIRMATION_RE.test(String(q || "")); }
+
+  // Deterministic where possible; null when it genuinely is not known. Never
+  // guessed — an invented divergence type is worse than an absent one.
+  function headerDivergenceType(result, csVerdict) {
+    if (csVerdict) return csVerdict;                       // COUNTERSTAMP arrived early
+    if (result && result.confirmation) return "CONFIRMATION";
+    if (result && result.note) return "NOTE";
+    if (result && result.indexical) return "INDEXICAL";
+    if (result && result.divided) return "DIVIDED-UNCLASSIFIED";
+    if (result && result.trust) return "CONVERGED-" + String(result.trust).toUpperCase();
+    return null;
+  }
+
+  // Builds the header. Pure function of things already in hand — no network, no
+  // model call, no new measurement. Returns null when the flag is off so every
+  // call site collapses to a spread of nothing.
+  function buildRoundHeader(query, result, answers, dispatchId, csVerdict) {
+    if (!roundHeaderEnabled()) return null;
+    try {
+      const configured = Object.keys(seatProvider);
+      const answered = (answers || []).map((a) => a.name);
+      const receipts = configured.map((name) => {
+        const a = (answers || []).find((x) => x.name === name);
+        if (!a) return { seat: name, absent: true, receipt: "[ABSENT \u2014 no receipt]" };
+        return {
+          seat: name,
+          provider: a.provider || seatProvider[name] || "primary",
+          model: a.model || seatModelLabel(name),
+          tier: typeof a.tier === "number" ? a.tier : null,
+          weight: typeof a.weightLive === "number" ? a.weightLive : null,
+          bytes: String(a.text == null ? "" : a.text).length,
+          malformed: !!a.malformed,
+          // Decision 2: the falsifier the SEAT wrote, or null. NEVER synthesised
+          // — a falsifier the seat did not write is not its falsifier, which is
+          // the whole reason orchestrator extraction was ruled out.
+          falsifier: (function () {
+            try {
+              const m = RQ_FALSIFIER_RE.exec(String(a.text == null ? "" : a.text));
+              return m ? clip(m[1].trim(), 300) : null;
+            } catch (_) { return null; }
+          })(),
+        };
+      });
+      const missingFalsifier = falsifierAskEnabled() &&
+        receipts.some((r) => !r.absent && !r.falsifier);
+      return {
+        round_id: dispatchId || null,
+        seats_expected: configured.length,
+        seats_recorded: answered.length,
+        receipts: receipts,
+        divergence_type: headerDivergenceType(result, csVerdict),
+        epistemic_class: classifyEpistemic(query),
+        falsifier_asked: falsifierAskEnabled(),
+        flags: missingFalsifier ? ["FALSIFIER_MISSING"] : [],
+        built_at: new Date().toISOString(),
+        header_v: 1,
+      };
+    } catch (e) {
+      try { logError("[HEADER] build failed: " + (e.message || e) + " — round unaffected."); } catch (_) {}
+      return null;
+    }
+  }
+
+  // One drawer line per round, so the header is legible without opening storage.
+  function logRoundHeader(h) {
+    if (!h) return;
+    try {
+      const absent = h.receipts.filter((r) => r.absent).map((r) => r.seat);
+      logError("[HEADER] " + h.seats_recorded + "/" + h.seats_expected + " seats \u2014 " +
+        (h.divergence_type || "unclassified") + " \u2014 " + h.epistemic_class +
+        (absent.length ? " \u2014 ABSENT: " + absent.join(", ") + " (recorded as absent, not as silence)" : "") +
+        (h.flags.length ? " \u2014 " + h.flags.join(", ") : "") + ".");
+    } catch (_) {}
+  }
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -9508,6 +9633,13 @@ roundData,
       // Flag off: one localStorage read and nothing else. Note/indexical rounds
       // have no adjudication to predict, so they are excluded here AND at the
       // scoring-listener registration below (ADVISORY 9).
+      // Pillar VI Decision 2 — the falsifier ask is a composer-appended Round
+        // Header field, NOT part of the dispatch prompt. Separate flag from the
+        // header itself because this one IS read by the seats.
+      if (falsifierAskEnabled() && !_noteRound && !_indexicalRound) {
+        logError("[HEADER] falsifier ask appended — seats are asked to state what would " +
+          "change their mind. Rounds with this ON carry an extra instruction; log it when comparing.");
+      }
       if (predictionsEnabled() && !_noteRound && !_indexicalRound) {
         try { collectPredictions(dispatchId, predictionSeats(), query); } catch (_) {}
       }
@@ -9565,7 +9697,12 @@ roundData,
       } else {
         _composedBody = _arcBlock + _vectorBlock + query;
       }
-      const composedQuery = _composedBody + (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "");
+      // Pillar VI Decision 2 — the falsifier ask is appended AFTER composition,
+      // so _composedBody (what the prompt hash covers) is untouched and rounds
+      // stay comparable to 1-169 at the prompt level. The seats do read it, which
+      // is why it carries its own flag rather than riding the header's.
+      const composedQuery = _composedBody + (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "") +
+        ((falsifierAskEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FALSIFIER_ASK) : "");
       try {
         result = await runLiveCouncil(composedQuery);
       } catch (e) {
@@ -9584,6 +9721,19 @@ roundData,
         // v3.1.0: Temporal Consistency Validator — check the new verdict
         // against past VERIFIED conclusions before it enters memory.
         if (!divided && result.text) checkTemporalConsistency(result.text);
+        // Pillar VI — build the header BEFORE storage, from state already in
+        // hand. Null when the flag is off, so the spread below adds nothing.
+        // csVerdict is passed as null ON PURPOSE and the parameter is kept.
+        // VERIFIED IN THE TREE: the COUNTERSTAMP block runs AFTER recordLedger,
+        // so its verdict does not exist yet at header-build time. The first
+        // draft of this call reached for a `_csLastVerdict` that has never
+        // existed anywhere in the file — `typeof` would have hidden that
+        // forever behind a silent null. divergence_type therefore falls back to
+        // the deterministic computation, which is honest; wiring the real
+        // verdict needs the header to be built after COUNTERSTAMP, or the
+        // header to be patched once it lands. Neither is tonight's job.
+        const _roundHeader = buildRoundHeader(query, result, allAnswers, dispatchId, null);
+        logRoundHeader(_roundHeader);
         recordLedger({
           t: Date.now(),
           prompt: query,
@@ -9610,11 +9760,16 @@ roundData,
             return p;
           }),
           // v3.0.2: per-seat roster for Seat Stats — who answered, who was
-          // malformed; absent seats failed that round.
+          // malformed; absent seats failed that round. NOTE: this records who
+          // ANSWERED. The Round Header below records who was EXPECTED, which is
+          // the difference between "seat failed" and "seat was never there".
           seats: allAnswers.map((a) => ({ n: a.name, m: !!a.malformed })),
           // P7 F2 — additive spread: when the flag path never fired the key is
           // simply ABSENT, so the object literal is byte-identical to v3.9.14.
           ...(_endogenous ? { endogenous: true, provenance: _endogenousKind } : {}),
+          // Pillar VI — the Round Header. Additive spread: flag off => the key
+          // is simply absent and the literal is byte-identical to v4.0.2.
+          ...(_roundHeader ? { header: _roundHeader } : {}),
         });
         // P7 F1 — vitals, fire-and-forget, BEFORE logInstitutionalMemory so the
         // rq:round-stored listener is registered before the event can fire.
@@ -9911,6 +10066,12 @@ roundData,
       logError(injectionEnabled()
         ? "[INJECT] Stage 3 injection is ON — retrieved rounds will be placed in seat context. A/B rows this session record injected:true."
         : "[INJECT] Stage 3 injection is OFF — control arm. Settings → STAGE 3 INJECTION to enable.");
+      logError(roundHeaderEnabled()
+        ? "[HEADER] Round Header ON — every round records seats expected vs recorded, per-seat receipts, divergence type and epistemic class. Absent seats are marked [ABSENT — no receipt]. Write-path only; seats see nothing new."
+        : "[HEADER] Round Header OFF — no write-time metadata; ledger and event rows byte-identical. Settings \u2192 P6: ROUND HEADER to enable.");
+      logError(falsifierAskEnabled()
+        ? "\u26A0 [HEADER] Falsifier ask ON — seats are asked what would change their mind. Rounds run with this on carry an extra instruction and are not prompt-identical to rounds without it."
+        : "[HEADER] Falsifier ask OFF — seats are not asked for a falsifier.");
       logError(predictionsEnabled()
         ? "[P7-F3] Predictions ON — +1 API call per seat per round (concurrent, never blocks dispatch); post-round scoring to rq_predictions." +
           (_predTableMissing ? " \u26A0 TABLE MISSING, run rq-p7-f3-predictions.sql." : "")
