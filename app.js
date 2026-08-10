@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.1.0-round-header";
+  const RQ_BUILD = "v4.2.1-verdict-tally";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4175,6 +4175,10 @@ roundData,
          "\u26A0 SEATS READ THIS. Each seat is asked to state what would change its mind; the answer is parsed into its receipt. Appended AFTER composition so the prompt hash stays clean, but rounds with it ON carry an extra instruction.",
          "Seats are not asked for a falsifier. Receipts carry falsifier: null."],
 
+        ["claimDiffToggle", "rq_claim_diff", "CLAIM DIFF",
+         "Every scored prediction also gets a claim-level decomposition \u2014 restated / extended / replaced / contradicted / added \u2014 logged next to the scalar, so you can see WHICH KIND of divergence a number describes. Deterministic, zero API calls. Cannot change error_score or surprise.",
+         "No decomposition. Scoring and logging identical to v4.1.0."],
+
         // ---- v3.9.10 F0 — INSTRUMENTS (tri-state). These three were console-only
         // until now, which cost the 2026-08-06 session three divided rounds of
         // COUNTERSTAMP data because localStorage is per-device and neither flag
@@ -4680,7 +4684,20 @@ roundData,
       // CONCEDE means a seat located a real flaw in another position, which is
       // engagement over one shared proposition: contradiction, not partition.
       const engaged = live.filter((v) => v.counted && (v.verdict === "refute" || v.verdict === "concede"));
-      if (engaged.length) return { partition: false, reason: engaged.length + " counted " + engaged[0].verdict + "(s) — seats located flaws in each other" };
+      if (engaged.length) {
+        // v4.2.1 — this line used to read engaged.length + " counted " +
+        // engaged[0].verdict + "(s)", taking the FIRST engaged seat's verdict
+        // and applying that label to the whole set. Live failure 2026-08-10:
+        // one CONCEDE and two REFUTEs reported as "3 counted concede(s)",
+        // silently relabelling two refutations as concessions. The count was
+        // right and the noun was a lie — same class as the old "Treated as
+        // HOLD". Tally each verdict type instead of generalising from one.
+        const tally = {};
+        engaged.forEach((v) => { tally[v.verdict] = (tally[v.verdict] || 0) + 1; });
+        const parts = Object.keys(tally).sort().map((k) => tally[k] + " " + k + "(s)");
+        return { partition: false,
+                 reason: parts.join(" + ") + " — seats located flaws in each other" };
+      }
       if (!live.every((v) => v.verdict === "hold")) return { partition: false, reason: "not all readable verdicts are HOLD" };
 
       // Base 3 — no opposing polarity. Seats answering different questions
@@ -9356,7 +9373,20 @@ roundData,
             if (pv && av) {
               const sim = _cosine384(pv, av);
               errorScore = Math.round((1 - sim) * 1000) / 1000;
+              // Tool 2 — report the decomposition ALONGSIDE the scalar, exactly
+              // as specified. Cannot touch errorScore or surprise: both are
+              // frozen and K3 has not ruled on the metric.
               surprise = errorScore > (1 - RQ_PRED_SURPRISE);
+              // Tool 2 — report the decomposition ALONGSIDE the scalar, exactly
+              // as specified. Deliberately placed AFTER both assignments so it
+              // cannot even be read as participating in either: error_score and
+              // RQ_PRED_SURPRISE are frozen (R-P7-12) and K3 has not ruled.
+              if (claimDiffEnabled()) {
+                try {
+                  logClaimDiff(row.seat_name + " prediction vs answer",
+                    await decomposeClaims(row.predicted_own, actualOwn), errorScore);
+                } catch (_) {}
+              }
             } else {
               edgeErrors++;   // worker down — scored NULL, never guessed
             }
@@ -9549,6 +9579,153 @@ roundData,
         (h.divergence_type || "unclassified") + " \u2014 " + h.epistemic_class +
         (absent.length ? " \u2014 ABSENT: " + absent.join(", ") + " (recorded as absent, not as silence)" : "") +
         (h.flags.length ? " \u2014 " + h.flags.join(", ") : "") + ".");
+    } catch (_) {}
+  }
+
+  // ---------- Claim-level divergence decomposer (rq_claim_diff, default OFF) ----------
+  // Takes two answers, extracts atomic claims from each, aligns them, and labels
+  // every pair restated / extended / replaced / contradicted — then reports the
+  // decomposition next to the scalar so a human can tell WHICH KIND of
+  // divergence a number is describing.
+  //
+  // The case it exists to settle: a seat predicted "hold the floor at 0.600,
+  // lowering without evidence admits noise" and then answered "keep 0.600, I'd
+  // raise it before lowering." Same stance. It scored 0.679 — the worst error on
+  // record — because the answer was longer and carried extra content. A scalar
+  // cannot separate that from a genuine reversal. A claim diff can: mostly
+  // RESTATED plus several ADDED reads as ELABORATION, not REVERSAL.
+  //
+  // Thresholds are TUNE-AFTER-DATA and fitted to nothing. They are grouped here
+  // so one edit retunes the lot once real labelled pairs exist — and, per K3's
+  // standing ruling, they stay constants rather than becoming operator knobs.
+  // THE FIRST DRAFT USED THE LEXICAL JACCARD AND FAILED ITS OWN ACCEPTANCE CASE.
+  // On the real 0.679 pair it returned 0 restated / 0 extended / 2 replaced and
+  // read REPLACEMENT — for two texts that say the same thing in different words.
+  // That is the SAME failure this project has documented four times: a
+  // word-overlap comparator cannot see agreement across disjoint vocabulary.
+  // Using it to diagnose a comparator problem would have shipped the bug inside
+  // its own instrument.
+  //
+  // Alignment now runs on embeddings via the existing LOCAL worker (embedText,
+  // Xenova, no API call, no spend); the Jaccard survives only as a fallback when
+  // the worker is unavailable. Thresholds are cosine and fitted to nothing.
+  const RQ_CLAIM_MATCH   = 0.50;   // below this, a predicted claim has no counterpart
+  const RQ_CLAIM_STRONG  = 0.75;   // at or above this, the claim is restated
+  const RQ_CLAIM_MATCH_LEX  = 0.34;   // fallback thresholds, worker down
+  const RQ_CLAIM_STRONG_LEX = 0.55;
+  const RQ_CLAIM_MIN_LEN = 25;     // shorter fragments are not claims
+  const RQ_CLAIM_MAX     = 12;     // per side; long answers are truncated, not sampled
+
+  function claimDiffEnabled() { return localStorage.getItem("rq_claim_diff") === "on"; }
+
+  // Atomic claims ≈ sentences. Markdown headers, bullets and banner lines are
+  // stripped first: csIsBannerLine already knows what a non-proposition looks
+  // like, and reusing it means one definition, one place to fix.
+  function claimSplit(text) {
+    try {
+      const raw = String(text == null ? "" : text)
+        .replace(/```[\s\S]*?```/g, " ")          // code fences are not claims
+        .split("\n")
+        .filter((l) => !csIsBannerLine(l))
+        .join(" ");
+      return raw
+        .split(/(?<=[.!?])\s+|\s*[;\u2014]\s+/)   // sentence ends, semicolons, em dashes
+        .map((s) => s.replace(/^[\s*_>#\-\d.)]+/, "").trim())
+        .filter((s) => s.length >= RQ_CLAIM_MIN_LEN)
+        .slice(0, RQ_CLAIM_MAX);
+    } catch (_) { return []; }
+  }
+
+  // Conservative polarity. Only fires on explicit reversal markers, because a
+  // false CONTRADICTED is the one label that would actively mislead — it is the
+  // difference between "the seat changed its mind" and "the seat said more".
+  const RQ_NEG_RE = /\b(not|never|no longer|cannot|can't|won't|shouldn't|instead of|rather than|reject|disagree|incorrect|wrong|mistaken|reverse|abandon)\b/i;
+  const RQ_ANTONYMS = [["raise", "lower"], ["increase", "decrease"], ["keep", "change"],
+                       ["accept", "reject"], ["higher", "lower"], ["more", "less"],
+                       ["add", "remove"], ["enable", "disable"], ["local", "remote"]];
+  function claimPolarityOpposed(a, b) {
+    try {
+      const A = String(a).toLowerCase(), B = String(b).toLowerCase();
+      if (RQ_NEG_RE.test(A) !== RQ_NEG_RE.test(B)) return true;
+      for (const [x, y] of RQ_ANTONYMS) {
+        const rx = new RegExp("\\b" + x + "\\w*\\b"), ry = new RegExp("\\b" + y + "\\w*\\b");
+        if ((rx.test(A) && ry.test(B)) || (ry.test(A) && rx.test(B))) return true;
+      }
+      return false;
+    } catch (_) { return false; }
+  }
+
+  // Returns a decomposition, or null when there is nothing to compare. Never
+  // throws; a diagnostic that can fail a round is not a diagnostic.
+  async function decomposeClaims(predicted, actual) {
+    try {
+      const P = claimSplit(predicted), A = claimSplit(actual);
+      if (!P.length || !A.length) return null;
+      // Embed every claim once, locally. embedText returns null on failure and
+      // never throws. If ANY embedding is missing we drop to lexical for the
+      // WHOLE comparison rather than mixing two scales inside one table.
+      let pv = null, av = null, lexical = false;
+      try {
+        pv = await Promise.all(P.map((x) => embedText(x)));
+        av = await Promise.all(A.map((x) => embedText(x)));
+      } catch (_) { pv = av = null; }
+      if (!pv || !av || pv.some((v) => !v) || av.some((v) => !v)) lexical = true;
+      const MATCH  = lexical ? RQ_CLAIM_MATCH_LEX  : RQ_CLAIM_MATCH;
+      const STRONG = lexical ? RQ_CLAIM_STRONG_LEX : RQ_CLAIM_STRONG;
+      const score = (i, j) => (lexical ? similarity(P[i], A[j]) : _cosine384(pv[i], av[j]));
+      const usedActual = new Set();
+      const pairs = [];
+      P.forEach((p, pi) => {
+        let best = -1, bestSim = 0;
+        A.forEach((a, i) => {
+          const s = score(pi, i);
+          if (s > bestSim) { bestSim = s; best = i; }
+        });
+        let label;
+        if (bestSim < MATCH) {
+          label = "replaced";                       // predicted claim has no counterpart
+        } else if (claimPolarityOpposed(p, A[best])) {
+          label = "contradicted";                   // matched topic, opposed stance
+        } else if (bestSim >= STRONG) {
+          label = "restated";
+        } else {
+          label = "extended";                       // same ground, more detail
+        }
+        if (best >= 0 && label !== "replaced") usedActual.add(best);
+        pairs.push({ claim: clip(p, 120), label: label, sim: Math.round(bestSim * 100) / 100 });
+      });
+      const counts = { restated: 0, extended: 0, replaced: 0, contradicted: 0 };
+      pairs.forEach((x) => { counts[x.label]++; });
+      counts.added = A.length - usedActual.size;    // actual claims with no predicted origin
+
+      // The reading. This is the sentence a human actually needs.
+      let reading;
+      if (counts.contradicted > 0) {
+        reading = "REVERSAL — at least one claim is stated with opposed polarity";
+      } else if (counts.replaced > (counts.restated + counts.extended)) {
+        reading = "REPLACEMENT — most predicted claims have no counterpart in the answer";
+      } else if (counts.added > 0 && (counts.restated + counts.extended) >= counts.replaced) {
+        reading = "ELABORATION — the predicted claims survive and the answer adds " +
+                  counts.added + " more; a high distance here is length, not disagreement";
+      } else {
+        reading = "RESTATEMENT — the answer says what was predicted, at similar scope";
+      }
+      return { pairs: pairs, counts: counts, reading: reading, lexical_fallback: lexical,
+               predicted_claims: P.length, actual_claims: A.length };
+    } catch (_) { return null; }
+  }
+
+  function logClaimDiff(tag, d, errorScore) {
+    if (!d) return;
+    try {
+      const c = d.counts;
+      logError("\u25C7 CLAIM DIFF (shadow) " + tag + " — " +
+        c.restated + " restated, " + c.extended + " extended, " + c.replaced + " replaced, " +
+        c.contradicted + " contradicted, " + c.added + " added (" +
+        d.predicted_claims + " predicted claims vs " + d.actual_claims + " actual). " +
+        (typeof errorScore === "number" ? "Scalar said " + errorScore + "; " : "") +
+        (d.lexical_fallback ? "[LEXICAL FALLBACK \u2014 embed worker down; alignment is word-overlap and WILL under-match across vocabularies] " : "") +
+        "claim diff reads: " + d.reading + ". SHADOW ONLY — error_score and surprise are unchanged (frozen R-P7-12).");
     } catch (_) {}
   }
 
@@ -10072,6 +10249,9 @@ roundData,
       logError(falsifierAskEnabled()
         ? "\u26A0 [HEADER] Falsifier ask ON — seats are asked what would change their mind. Rounds run with this on carry an extra instruction and are not prompt-identical to rounds without it."
         : "[HEADER] Falsifier ask OFF — seats are not asked for a falsifier.");
+      logError(claimDiffEnabled()
+        ? "\u25C7 [CLAIM DIFF] ON (shadow) — scored predictions also get a restated/extended/replaced/contradicted/added breakdown beside the scalar. Zero API cost; error_score and surprise are untouched."
+        : "[CLAIM DIFF] OFF — scalar only.");
       logError(predictionsEnabled()
         ? "[P7-F3] Predictions ON — +1 API call per seat per round (concurrent, never blocks dispatch); post-round scoring to rq_predictions." +
           (_predTableMissing ? " \u26A0 TABLE MISSING, run rq-p7-f3-predictions.sql." : "")
