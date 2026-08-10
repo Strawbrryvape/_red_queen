@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.2.1-verdict-tally";
+  const RQ_BUILD = "v4.2.2-resolution-honesty";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4826,8 +4826,24 @@ roundData,
 
     if (winner) {
       const w = positions.find((p) => p.letter === winner);
-      logError(`\u2713 RESOLVED — Position ${winner} (${seatLabel(w.seat)}) survived cross-examination; every other seat located a specific error in its own position and conceded. Won by adjudication, NOT by vote.`);
-      return { resolved: true, winnerSeat: w.seat, winnerText: w.text, verdicts, contestedNote: null };
+      // v4.2.2 — this line used to claim "every other seat located a specific
+      // error in its own position and conceded" REGARDLESS of how many seats
+      // actually spoke. Live 2026-08-10: two rounds resolved on ONE readable
+      // concession while the other seats were excluded as infrastructure, and
+      // the sentence claimed they had all conceded. The RULE is right —
+      // RESOLVED is won by argument, not by vote, and unavailable seats must
+      // not block it — but the sentence describing it was a lie. Sibling of
+      // the verdict-tally bug; same fix, report what actually happened.
+      const _unavail = verdicts.filter((v) => v.unavailable).length;
+      const _readable = positions.length - _unavail;
+      const _conceded = verdicts.filter((v) => v.verdict === "concede" && v.counted).length;
+      logError(`\u2713 RESOLVED — Position ${winner} (${seatLabel(w.seat)}) survived cross-examination. ` +
+        `${_conceded} of ${_readable} readable verdict(s) conceded to it` +
+        (_unavail ? `; ${_unavail} seat(s) excluded as infrastructure and never spoke` : "") +
+        `. Won by adjudication, NOT by vote.`);
+      return { resolved: true, winnerSeat: w.seat, winnerText: w.text, verdicts,
+               contestedNote: null, resolvedReadable: _readable,
+               resolvedConceded: _conceded, resolvedUnavailable: _unavail };
     }
 
     // Not resolved: surface the specific contested claims (the real
@@ -5181,6 +5197,9 @@ roundData,
           agreedCount: 1,
           eligibleCount: eligible.length,
           resolvedBy: seatLabel(adj.winnerSeat),
+          resolvedReadable: adj.resolvedReadable,
+          resolvedConceded: adj.resolvedConceded,
+          resolvedUnavailable: adj.resolvedUnavailable,
         };
       }
       // Still divided — attach any located contested claims for display.
@@ -10060,7 +10079,15 @@ roundData,
           // seat located a specific error in its own position and conceded to
           // this one. Won by adjudication, not by vote — a stronger object than
           // an uncontested VERIFIED, because it survived an attempt to break it.
-          trustPrefix = `\u25C8 RESOLVED — The council first split, then challenged each other; this position survived cross-examination after ${result.resolvedBy} and the others located specific errors in their own and conceded: `;
+          // v4.2.2 — the banner no longer asserts that "the others" conceded
+          // when some of them never rendered. It states the readable count, so
+          // a resolution reached with a seat down reads as what it is.
+          trustPrefix = (typeof result.resolvedReadable === "number")
+            ? `\u25C8 RESOLVED — The council split, then challenged each other. This position (${result.resolvedBy}) survived cross-examination` +
+              (result.resolvedUnavailable
+                ? ` on ${result.resolvedReadable} readable verdict(s) — ${result.resolvedUnavailable} seat(s) were unavailable and never spoke: `
+                : `; every other seat located a specific error in its own position and conceded: `)
+            : `\u25C8 RESOLVED — The council first split, then challenged each other; this position survived cross-examination after ${result.resolvedBy} and the others located specific errors in their own and conceded: `;
         }
       }
     } else {
