@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.2.2-resolution-honesty";
+  const RQ_BUILD = "v4.3.0-demo-honesty";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -530,14 +530,25 @@
       return "We are the Council — Gemini, Kimi, and Claude — synthesized through Red Queen. Three perspectives, one answer.";
     }
     if (q.includes("meaning of life")) {
-      return "Split vote: Gemini says 42, Kimi says purpose is constructed, Claude says it emerges through connection. Synthesis: build something that matters.";
+      return "SIMULATED — no model was called. (Demo easter egg: a real council would give you three genuinely different answers to this one, which is the point of it.)";
     }
 
+    // v4.3.0 — these templates used to assert named-seat conduct: "Kimi's
+    // framing carried the vote, with amendments from Claude", "Gemini favored
+    // breadth, Kimi pushed for precision". No seat did any of that — in demo
+    // mode no model is called at all. Live 2026-08-10: all three chains
+    // exhausted, the fallback fired, and the operator read an adjudication
+    // outcome for a round that never dispatched.
+    //
+    // A system built to keep an honest record should not ship a mode that
+    // fabricates seat behaviour in seat-shaped language. These describe the
+    // SHAPE of a council answer, attribute conduct to nobody, and say plainly
+    // that no model was consulted.
     const templates = [
-      `The Council deliberated on "${topic}". Gemini favored breadth, Kimi pushed for precision, Claude weighed the tradeoffs. Consensus: proceed, but define your success criteria first.`,
-      `Three perspectives converged on "${topic}". Synthesis: the core question is well-formed, but the Council recommends breaking it into two smaller decisions before acting.`,
-      `Deliberation complete on "${topic}". Kimi's framing carried the vote, with amendments from Claude. Consensus: the simplest viable path is the right one here.`,
-      `The Council reviewed "${topic}" in two rounds. Initial disagreement resolved on round two. Consensus: gather one more data point, then commit fully.`,
+      `SIMULATED — no model was called. A real round on "${topic}" would return three independent positions, then a cross-examination pass in which each seat must locate a specific error or hold. Configure a working API key to run it.`,
+      `SIMULATED — no model was called. This is placeholder text showing where the council's synthesis appears. Nothing here was reasoned, and no seat produced or endorsed it.`,
+      `SIMULATED — no model was called. On "${topic}" a live council would either converge, split into a DIVIDED verdict with per-seat positions rendered verbatim, or resolve by adjudication. None of that happened here.`,
+      `SIMULATED — no model was called. Demo mode fills this slot so the interface can be inspected without spending API credit. It is not an answer and it is not stored in the ledger.`,
     ];
     return templates[Math.floor(Math.random() * templates.length)];
   }
@@ -3507,7 +3518,10 @@ roundData,
     // found these two in the live catalog at 12:00:28 and they answered. ling
     // leads because north-mini-code is a CODE model and is a last-resort seat on
     // a deliberation council; see the deny-list in orPickScore.
-    gemini: ["inclusionai/ling-3.0-flash:free", "cohere/north-mini-code:free"],
+    // v4.3.0 — PERSISTED FROM LIVE REPAIR (2026-08-10). ling-3.0-flash left the
+    // free catalog; repairDeadFloors replaced it with ling-3.0-tiny at every
+    // boot for two weeks and told us each time to paste the result here.
+    gemini: ["cohere/north-mini-code:free", "inclusionai/ling-3.0-tiny:free"],
     // v3.8.1 (2026-07-28) — THE PERMUTATION BUG, FIXED.
     // These two chains were PERMUTATIONS of the same pair:
     //   kimi:   [gemma, nemotron]      claude: [nemotron, gemma]
@@ -3526,8 +3540,21 @@ roundData,
     // UNVERIFIED BY FABLE — no network here. Run TEST OPENROUTER MODELS after
     // deploying; anything that 404s, repairDeadFloors replaces from the live
     // catalog at boot and logs what it chose.
-    kimi:   ["google/gemma-4-31b-it:free", "mistralai/mistral-small-3.2-24b-instruct:free"],
-    claude: ["nvidia/nemotron-3-super-120b-a12b:free", "meta-llama/llama-3.3-70b-instruct:free"],
+    // v4.3.0 — PERSISTED FROM LIVE REPAIR (2026-08-10). mistral-small-3.2 was
+    // recorded dead on 2026-07-30 and was STILL configured eleven days later;
+    // llama-3.3-70b left the free catalog too. Both were replaced from the live
+    // catalog on every boot. Disjointness at every depth is preserved — gemma
+    // family on kimi, nemotron family on claude, cohere/ling on gemini, and no
+    // collision with the non-OpenRouter occupants (Groq Llama on the Claude
+    // seat, Cerebras GLM on the Gemini seat).
+    //
+    // These are still UNVERIFIED HERE — no network in the build environment.
+    // repairDeadFloors remains armed and will replace anything that 404s, but
+    // it should now find nothing to repair. If the boot log still prints three
+    // CATALOG CHECK failures, the catalog has moved again and this list needs
+    // another paste.
+    kimi:   ["google/gemma-4-31b-it:free", "google/gemma-4-26b-a4b-it:free"],
+    claude: ["nvidia/nemotron-3-super-120b-a12b:free", "nvidia/nemotron-3-nano-30b-a3b:free"],
   };
   const orActiveModel = {}; // seat -> slug currently answering (labels/visuals)
 
@@ -9569,7 +9596,17 @@ roundData,
           })(),
         };
       });
-      const missingFalsifier = falsifierAskEnabled() &&
+      // v4.2.3 — the ask is only APPENDED on adjudicated rounds (the composer
+      // gates it on !_noteRound && !_indexicalRound), so flagging
+      // FALSIFIER_MISSING on a note or indexical round accused the seats of
+      // failing to answer a question nobody asked them. Live 2026-08-10: an
+      // INDEXICAL round logged "3/3 seats — INDEXICAL — META — FALSIFIER_MISSING".
+      // The flag must mirror the ask's own gate, or the record blames seats for
+      // the harness's choice. Third instance this week of a message asserting
+      // something that did not happen.
+      const _askActuallySent = falsifierAskEnabled() &&
+        !(result && (result.note || result.indexical || result.narrator));
+      const missingFalsifier = _askActuallySent &&
         receipts.some((r) => !r.absent && !r.falsifier);
       return {
         round_id: dispatchId || null,
@@ -9578,7 +9615,7 @@ roundData,
         receipts: receipts,
         divergence_type: headerDivergenceType(result, csVerdict),
         epistemic_class: classifyEpistemic(query),
-        falsifier_asked: falsifierAskEnabled(),
+        falsifier_asked: _askActuallySent,   // whether it was SENT, not whether the flag is on
         flags: missingFalsifier ? ["FALSIFIER_MISSING"] : [],
         built_at: new Date().toISOString(),
         header_v: 1,
