@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.3.0-demo-honesty";
+  const RQ_BUILD = "v4.4.0-fulltext-request";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4206,6 +4206,13 @@ roundData,
          "Every scored prediction also gets a claim-level decomposition \u2014 restated / extended / replaced / contradicted / added \u2014 logged next to the scalar, so you can see WHICH KIND of divergence a number describes. Deterministic, zero API calls. Cannot change error_score or surprise.",
          "No decomposition. Scoring and logging identical to v4.1.0."],
 
+        ["fulltextRetrieveToggle", "rq_fulltext_retrieve", "P6: FULL-TEXT REQUEST",
+         "\u26A0 SEATS READ THIS. A seat may write [REQUEST_FULLTEXT: 173, 174] and those rounds are injected VERBATIM on the next round. Explicit request only \u2014 never heuristic. Capped at 3 rounds / 6000 chars.",
+         "Seats cannot request full text; context carries clipped ledger excerpts only."],
+        ["confirmationToggle", "rq_confirmation", "P6: CONFIRMATION ROUNDS",
+         "Prompts opening with \"Confirm:\" or \"Council, confirm\" bypass adjudication and are tagged RESOLVED-BY-OPERATOR \u2014 a state distinct from VERIFIED. Stops a directive-acceptance round scoring as a contested one.",
+         "Confirmation prompts are adjudicated like any other round."],
+
         // ---- v3.9.10 F0 — INSTRUMENTS (tri-state). These three were console-only
         // until now, which cost the 2026-08-06 session three divided rounds of
         // COUNTERSTAMP data because localStorage is per-device and neither flag
@@ -5114,6 +5121,22 @@ roundData,
     if (_noteRound) {
       logError("[NOTE] Operator note — consensus and adjudication SKIPPED. Seat responses recorded; no verdict claimed and no DIVIDED tag issued.");
       return { text: null, divided: true, answers, note: true };
+    }
+
+    // v4.4.0 — CONFIRMATION rounds bypass adjudication for the same reason note
+    // rounds do: there is nothing to adjudicate. The operator asked the council
+    // to confirm a directive, not to contest one.
+    //
+    // divided:true is kept DELIBERATELY, matching the note-round convention: it
+    // is what makes the UI render every seat verbatim instead of manufacturing a
+    // single synthesized voice, and the seats' caveats are the point of a
+    // confirmation round. The trust literal carries the real meaning.
+    if (_confirmationRound) {
+      logError("[CONFIRMATION] " + answers.length + " seat(s) responded. Recorded verbatim, tagged " +
+        "RESOLVED-BY-OPERATOR. This is NOT VERIFIED — it records that the operator closed the " +
+        "question, not that the council independently agreed. Caveats attached by seats are preserved, " +
+        "not scored as disagreement.");
+      return { text: null, divided: true, answers, confirmation: true, trust: "resolved-by-operator" };
     }
 
     // v3.5.4 — COUNCIL HEALTH. One line per round, stated before any verdict is
@@ -9202,6 +9225,7 @@ roundData,
   // it is already public corpus and carries none of the R-P7-11 restrictions
   // that apply to predicted_own / actual_own.
   let _predRoundPrompt    = null;
+  let _confirmationRound  = false;   // v4.4.0 — set per dispatch, read at scoring
   let _predTableMissing   = false;  // session-sticky disable
   let _predStoredWatchdog = false;  // one "event never stored" line per session
   let _predVitalsMissing  = false;
@@ -9558,7 +9582,7 @@ roundData,
   // guessed — an invented divergence type is worse than an absent one.
   function headerDivergenceType(result, csVerdict) {
     if (csVerdict) return csVerdict;                       // COUNTERSTAMP arrived early
-    if (result && result.confirmation) return "CONFIRMATION";
+    if (result && result.confirmation) return "CONFIRMATION";   // RESOLVED-BY-OPERATOR
     if (result && result.note) return "NOTE";
     if (result && result.indexical) return "INDEXICAL";
     if (result && result.divided) return "DIVIDED-UNCLASSIFIED";
@@ -9785,6 +9809,125 @@ roundData,
     } catch (_) {}
   }
 
+  // ---------- Targeted full-text retrieval (rq_fulltext_retrieve, default OFF) ----------
+  // A seat writes [REQUEST_FULLTEXT: 173, 174] and the NEXT round carries those
+  // rounds verbatim into every seat's context. Explicit request only.
+  //
+  // Why this is contained and blanket injection is not: the Spine arithmetic,
+  // measured 2026-08-11 against the real 192-round snapshot, produced 19,445
+  // chars of manifest against a 6,000-char MEMORY_CONTEXT_CHAR_CAP — 324% of the
+  // entire injection budget, and only 8 of the last 20 rounds fit even after
+  // reserving nothing else. An "exempt from the budget" injection path with no
+  // ceiling of its own is exactly how a number like that happens.
+  // So this path is exempt from the SHARED budget (K3 §5) and still hard-capped.
+  const RQ_FT_MAX_ROUNDS = 3;      // TUNE-AFTER-DATA — requests beyond this are truncated, loudly
+  const RQ_FT_MAX_CHARS  = 6000;   // TUNE-AFTER-DATA — hard ceiling on the injected block
+  const RQ_FT_PER_SEAT   = 1200;   // per-seat clip inside a requested round
+  // v4.4.0 — the first version was /\[REQUEST_FULLTEXT\s*:\s*([0-9,\s]+)\]/ and
+  // it FAILED CLOSED IN THE WRONG DIRECTION: any junk token anywhere in the list
+  // ("[REQUEST_FULLTEXT: 0, -3, 7]") made the whole pattern miss, silently
+  // dropping the valid 7 with no log line — a request the seat made and never
+  // learned was ignored. Accept any body, then filter TOKEN BY TOKEN below, so
+  // a malformed entry costs its own slot and nothing else. Still digits-only at
+  // the point of use: nothing from model output reaches a read except integers.
+  const RQ_FT_RE = /\[REQUEST_FULLTEXT\s*:\s*([^\]\n]{1,200})\]/i;
+
+  let _ftPending = [];   // round ids requested last round, consumed by the next compose
+
+  function fulltextRetrieveEnabled() { return localStorage.getItem("rq_fulltext_retrieve") === "on"; }
+  function confirmationEnabled()      { return localStorage.getItem("rq_confirmation") === "on"; }
+
+  // Parse requests out of the seats' own answers. Model output is UNTRUSTED: the
+  // only thing accepted from it is digits, and every id is checked against the
+  // ledger before anything is read.
+  function ftScanRequests(answers) {
+    if (!fulltextRetrieveEnabled()) return [];
+    const ids = [];
+    try {
+      (answers || []).forEach((a) => {
+        const m = RQ_FT_RE.exec(String(a && a.text || ""));
+        if (!m) return;
+        String(m[1]).split(",").forEach((tok) => {
+          const n = parseInt(String(tok).trim(), 10);
+          if (isFinite(n) && n > 0 && ids.indexOf(n) === -1) ids.push(n);
+        });
+      });
+    } catch (_) { return []; }
+    return ids;
+  }
+
+  // Map a seat-visible round NUMBER (1-based, oldest first) to its ledger entry.
+  // Seats see ordinals in their context, not timestamps, so the mapping has to
+  // happen here — and a number outside the ledger must FAIL VISIBLY rather than
+  // silently resolving to nothing.
+  function ftEntryForOrdinal(n) {
+    try {
+      const idx = n - 1;
+      if (idx < 0 || idx >= ledger.length) return null;
+      return ledger[idx] || null;
+    } catch (_) { return null; }
+  }
+
+  // Builds the block injected into the NEXT round. Returns "" when there is
+  // nothing to inject, so the caller can concatenate unconditionally.
+  async function ftBuildBlock() {
+    if (!fulltextRetrieveEnabled() || !_ftPending.length) return "";
+    const asked = _ftPending.slice();
+    _ftPending = [];                       // consume once; a request is not standing
+    const wanted = asked.slice(0, RQ_FT_MAX_ROUNDS);
+    if (asked.length > wanted.length) {
+      logError("[FULLTEXT] " + asked.length + " round(s) requested, cap is " + RQ_FT_MAX_ROUNDS +
+        " — injecting " + wanted.join(", ") + " and DROPPING " + asked.slice(RQ_FT_MAX_ROUNDS).join(", ") +
+        ". Ask again next round for the rest.");
+    }
+    const parts = [], missing = [], noFull = [];
+    for (const n of wanted) {
+      const e = ftEntryForOrdinal(n);
+      if (!e) { missing.push(n); continue; }
+      let seats = null;
+      try { seats = await readFullText(e.t); } catch (_) { seats = null; }
+      if (!seats) {
+        // Stored verbatim only when the full-text ledger was ON at the time, and
+        // only on the device that ran it. Say which, rather than showing a gap.
+        noFull.push(n);
+        const pos = (e.positions || []).map((x) => (x.name || "?") + ": " + clip(String(x.text || ""), 200));
+        parts.push("ROUND " + n + " [" + (e.outcome || "?") + "] " + clip(String(e.prompt || ""), 300) +
+          "\n(full text unavailable on this device — clipped ledger copy only)\n" + pos.join("\n"));
+        continue;
+      }
+      const body = Object.keys(seats).map((k) => k + ": " + clip(String(seats[k] || ""), RQ_FT_PER_SEAT)).join("\n\n");
+      parts.push("ROUND " + n + " [" + (e.outcome || "?") + "] " + clip(String(e.prompt || ""), 300) + "\n" + body);
+    }
+    if (missing.length) {
+      logError("[FULLTEXT] requested round(s) " + missing.join(", ") +
+        " are not in this browser's ledger (" + ledger.length + " rounds) — nothing injected for them. " +
+        "A number outside the ledger is a miss, not an empty round.");
+    }
+    if (noFull.length) {
+      logError("[FULLTEXT] round(s) " + noFull.join(", ") + " have no verbatim copy on this device — " +
+        "injected the clipped ledger text instead and labelled it as such.");
+    }
+    if (!parts.length) return "";
+    let block = "[FULL TEXT — requested by a seat last round, verbatim]\n\n" + parts.join("\n\n---\n\n");
+    if (block.length > RQ_FT_MAX_CHARS) {
+      block = block.slice(0, RQ_FT_MAX_CHARS - 1) + "\u2026";
+      logError("[FULLTEXT] block truncated at " + RQ_FT_MAX_CHARS + " chars.");
+    }
+    logError("[FULLTEXT] injecting " + parts.length + " requested round(s) verbatim (" +
+      block.length + " chars, exempt from the shared memory budget by ruling, hard-capped at " +
+      RQ_FT_MAX_CHARS + ").");
+    return "\n\n" + block;
+  }
+
+  // The instruction that tells seats the channel exists. Only added when the
+  // flag is on, and appended after composition like the falsifier ask, so the
+  // prompt hash stays clean.
+  const RQ_FT_INSTRUCTION =
+    "If a round in your context is summarized too briefly for you to check what was actually argued, " +
+    "you may request its full text by writing [REQUEST_FULLTEXT: <round numbers>] on its own line. " +
+    "Up to " + RQ_FT_MAX_ROUNDS + " rounds; they will be supplied verbatim on the NEXT round. " +
+    "Request only when the summary is genuinely insufficient \u2014 do not request by default.";
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -9862,6 +10005,19 @@ roundData,
       // budget, and no retrieval request is made at all.
       _noteRound = isOperatorNote(query);
       _indexicalRound = isIndexicalPrompt(query);
+      // v4.4.0 — CONFIRMATION rounds (Kimi's request). The operator is asking the
+      // council to confirm acceptance of a directive, NOT to re-open a debate.
+      // Scoring it for lexical convergence is what made a round where all three
+      // seats agreed read as DIVIDED because two attached footnotes. Like note
+      // and indexical rounds it bypasses adjudication — but unlike them it gets
+      // its OWN consensus state, because "the operator closed this" must never
+      // be stored as though the council had independently verified it.
+      _confirmationRound = confirmationEnabled() && isConfirmationRound(query);
+      if (_confirmationRound) {
+        logError("[CONFIRMATION] Operator confirmation round — adjudication and consensus scoring SKIPPED. " +
+          "Seat responses are recorded verbatim and tagged RESOLVED-BY-OPERATOR, which is NOT VERIFIED: " +
+          "it records that the operator closed the question, not that the council independently agreed.");
+      }
       // P7 F3 — predictions fire CONCURRENTLY and are NEVER awaited (R-P7-3).
       // Flag off: one localStorage read and nothing else. Note/indexical rounds
       // have no adjudication to predict, so they are excluded here AND at the
@@ -9934,8 +10090,14 @@ roundData,
       // so _composedBody (what the prompt hash covers) is untouched and rounds
       // stay comparable to 1-169 at the prompt level. The seats do read it, which
       // is why it carries its own flag rather than riding the header's.
+      // v4.4.0 — requested full text and its instruction ride the same
+      // after-composition seam as the falsifier ask, so _composedBody (what the
+      // prompt hash covers) is untouched.
+      const _ftBlock = await ftBuildBlock();
       const composedQuery = _composedBody + (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "") +
-        ((falsifierAskEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FALSIFIER_ASK) : "");
+        ((falsifierAskEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FALSIFIER_ASK) : "") +
+        _ftBlock +
+        ((fulltextRetrieveEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FT_INSTRUCTION) : "");
       try {
         result = await runLiveCouncil(composedQuery);
       } catch (e) {
@@ -9954,6 +10116,19 @@ roundData,
         // v3.1.0: Temporal Consistency Validator — check the new verdict
         // against past VERIFIED conclusions before it enters memory.
         if (!divided && result.text) checkTemporalConsistency(result.text);
+        // v4.4.0 — harvest [REQUEST_FULLTEXT: ...] from the seats' own answers
+        // for the NEXT round. Consumed once by ftBuildBlock; a request is not
+        // standing, so a seat must ask again if it still needs the text.
+        if (fulltextRetrieveEnabled()) {
+          try {
+            const _ftAsk = ftScanRequests(allAnswers);
+            if (_ftAsk.length) {
+              _ftPending = _ftAsk;
+              logError("[FULLTEXT] seat(s) requested round(s) " + _ftAsk.join(", ") +
+                " — will be injected verbatim on the next round.");
+            }
+          } catch (_) {}
+        }
         // Pillar VI — build the header BEFORE storage, from state already in
         // hand. Null when the flag is off, so the spread below adds nothing.
         // csVerdict is passed as null ON PURPOSE and the parameter is kept.
@@ -10111,6 +10286,12 @@ roundData,
           trustPrefix = `◐ PROVISIONAL ${result.agreedCount}/${result.eligibleCount} (${(result.agreedNames || []).join(", ")}) — The bench agrees, but no primary voice has verified this yet. Spoken by ${result.speakerSeat} on behalf of the agreeing seats \u2014 this is one seat's wording, not a merge: `;
         } else if (result.trust === "verified") {
           trustPrefix = `✓ VERIFIED ${result.agreedCount}/${result.eligibleCount} (${(result.agreedNames || []).join(", ")}) — Everyone's on the same page for this one. Spoken by ${result.speakerSeat} on behalf of the agreeing seats \u2014 this is one seat's wording, not a merge: `;
+        } else if (result.trust === "resolved-by-operator") {
+          // v4.4.0 — deliberately NOT the "resolved" branch and deliberately not
+          // VERIFIED. This records that the OPERATOR closed the question; the
+          // council neither contested nor independently confirmed it. Every seat
+          // renders verbatim below, caveats intact.
+          trustPrefix = "\u25C7 RESOLVED BY OPERATOR — a confirmation round: the operator asked the council to accept a directive rather than debate one. Adjudication was skipped, so this is NOT a council verdict and NOT verified. Each seat's response, including any caveats, is recorded verbatim: ";
         } else if (result.trust === "resolved") {
           // v3.2: the council disagreed, then cross-examined, and every other
           // seat located a specific error in its own position and conceded to
@@ -10313,6 +10494,13 @@ roundData,
       logError(falsifierAskEnabled()
         ? "\u26A0 [HEADER] Falsifier ask ON — seats are asked what would change their mind. Rounds run with this on carry an extra instruction and are not prompt-identical to rounds without it."
         : "[HEADER] Falsifier ask OFF — seats are not asked for a falsifier.");
+      logError(fulltextRetrieveEnabled()
+        ? "\u26A0 [FULLTEXT] Targeted full-text request ON — seats may ask for up to " + RQ_FT_MAX_ROUNDS +
+          " rounds verbatim via [REQUEST_FULLTEXT: n]. Rounds run with this on carry an extra instruction and are not prompt-identical to rounds without it."
+        : "[FULLTEXT] Targeted full-text request OFF — seats see clipped ledger excerpts only.");
+      logError(confirmationEnabled()
+        ? "[CONFIRMATION] Confirmation rounds ON — \"Confirm:\" prompts bypass adjudication and tag RESOLVED-BY-OPERATOR (not VERIFIED)."
+        : "[CONFIRMATION] Confirmation rounds OFF — every prompt is adjudicated.");
       logError(claimDiffEnabled()
         ? "\u25C7 [CLAIM DIFF] ON (shadow) — scored predictions also get a restated/extended/replaced/contradicted/added breakdown beside the scalar. Zero API cost; error_score and surprise are untouched."
         : "[CLAIM DIFF] OFF — scalar only.");
