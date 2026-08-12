@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.4.0-fulltext-request";
+  const RQ_BUILD = "v4.5.0-conformity-audit";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4518,6 +4518,19 @@ roundData,
       p4e.addEventListener("click", async () => {
         const l = p4e.textContent; p4e.disabled = true; p4e.textContent = "ASSEMBLING\u2026 see Error Logs";
         try { await p4Export("markdown"); } finally { p4e.disabled = false; p4e.textContent = l; }
+      });
+
+      const cab = document.createElement("button");
+      cab.id = "conformityAudit"; cab.type = "button";
+      cab.textContent = "CONFORMITY AUDIT (path divergence)";
+      cab.className = saveSettingsBtn.className || "";
+      cab.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      p3t.parentNode.insertBefore(cab, p3t.nextSibling);
+      cab.addEventListener("click", async () => {
+        const l = cab.textContent; cab.disabled = true; cab.textContent = "AUDITING\u2026 see Error Logs";
+        try { await runConformityAudit(); }
+        catch (e) { logError("[CONFORMITY] audit failed: " + ((e && e.message) || e) + " \u2014 nothing changed."); }
+        finally { cab.disabled = false; cab.textContent = l; }
       });
 
       const p3g = document.createElement("button");
@@ -9927,6 +9940,178 @@ roundData,
     "you may request its full text by writing [REQUEST_FULLTEXT: <round numbers>] on its own line. " +
     "Up to " + RQ_FT_MAX_ROUNDS + " rounds; they will be supplied verbatim on the NEXT round. " +
     "Request only when the summary is genuinely insufficient \u2014 do not request by default.";
+
+  // ---------- The Conformity Audit (operator-invoked, zero API cost) ----------
+  // Distinguishes a round whose seats CONVERGED from one whose seats HERDED.
+  // Specified by the council itself; see the header comment in patch16 and the
+  // 2026-08-10 round. Nothing here decides anything — it reports.
+  const RQ_CA_RARE_MAX_DF   = 2;      // an n-gram in <= this many rounds is "rare"
+  const RQ_CA_NGRAM         = 3;      // trigrams
+  const RQ_CA_MIN_POS       = 2;      // rounds with fewer positions cannot be scored
+  const RQ_CA_PATH_FLOOR    = 0.35;   // TUNE-AFTER-DATA — below this, paths are suspiciously close
+  const RQ_CA_ANCHOR_FLOOR  = 3;      // TUNE-AFTER-DATA — rare n-grams carried N->N+1 above this is an echo
+
+  // Position text, preferring the verbatim copy when the full-text ledger has it.
+  function caPosText(p) {
+    try {
+      const s = (p && (p.fullText || p.text)) || "";
+      return String(s);
+    } catch (_) { return ""; }
+  }
+
+  // Strip the parts every seat was ASKED to produce. Kimi's insight is that
+  // herding shows up in the incidentals, so the scaffolding the harness itself
+  // imposes — the falsifier line, seat nameplates, the request channel — has to
+  // come out first or it will read as shared style on every round.
+  function caStrip(text) {
+    return String(text || "")
+      .replace(/^\s*FALSIFIER\s*:.*$/gim, " ")
+      .replace(/\[REQUEST_FULLTEXT[^\]]*\]/gi, " ")
+      .split("\n").filter((l) => !csIsBannerLine(l)).join(" ")
+      .replace(/\s+/g, " ").trim();
+  }
+
+  function caNgrams(text, n) {
+    const w = caStrip(text).toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter(Boolean);
+    const out = new Set();
+    for (let i = 0; i + n <= w.length; i++) out.add(w.slice(i, i + n).join(" "));
+    return out;
+  }
+
+  // Numbers and round citations are the "identical specifics" test: two seats
+  // independently reaching a conclusion rarely quote the same figures.
+  function caSpecifics(text) {
+    const s = caStrip(text);
+    const out = new Set();
+    (s.match(/\b\d+\.\d+\b/g) || []).forEach((x) => out.add("num:" + x));
+    (s.match(/\bround\s+\d+\b/gi) || []).forEach((x) => out.add("cite:" + x.toLowerCase()));
+    return out;
+  }
+
+  function caInter(a, b) { let n = 0; a.forEach((x) => { if (b.has(x)) n++; }); return n; }
+
+  // Pairwise embedding distance between the seats' INITIAL POSITIONS.
+  //
+  // REFINEMENT 1 to the council's own spec, and it is load-bearing: this must
+  // NEVER be computed on adjudication verdicts. Seats see each other's positions
+  // during cross-examination BY DESIGN, so measuring convergence there would
+  // score the adjudication layer working correctly as if it were herding — the
+  // instrument would condemn the feature it depends on. entry.positions holds
+  // the initial answers, dispatched in parallel with the seats blind to each
+  // other, which is the only place independence can honestly be measured.
+  //
+  // Returns null when the worker is unavailable — never a guessed number.
+  async function caPathDistance(positions) {
+    try {
+      const texts = positions.map((p) => caStrip(caPosText(p))).filter((t) => t.length > 40);
+      if (texts.length < RQ_CA_MIN_POS) return null;
+      const vecs = await Promise.all(texts.map((t) => embedText(t)));
+      if (vecs.some((v) => !v)) return null;
+      let sum = 0, n = 0;
+      for (let i = 0; i < vecs.length; i++) {
+        for (let j = i + 1; j < vecs.length; j++) { sum += 1 - _cosine384(vecs[i], vecs[j]); n++; }
+      }
+      return n ? Math.round((sum / n) * 1000) / 1000 : null;
+    } catch (_) { return null; }
+  }
+
+  async function runConformityAudit() {
+    const rounds = (ledger || []).filter((e) => e && (e.positions || []).length >= RQ_CA_MIN_POS);
+    if (rounds.length < 3) {
+      logError("[CONFORMITY] need at least 3 scoreable rounds; this ledger has " + rounds.length + ". Nothing to audit.");
+      return null;
+    }
+    logError("[CONFORMITY] auditing " + rounds.length + " round(s) — embedding locally, no API calls\u2026");
+
+    // Document frequency over the whole ledger, so "rare" means rare HERE.
+    const df = new Map();
+    const perRound = rounds.map((e) => {
+      const grams = new Set();
+      (e.positions || []).forEach((p) => caNgrams(caPosText(p), RQ_CA_NGRAM).forEach((g) => grams.add(g)));
+      grams.forEach((g) => df.set(g, (df.get(g) || 0) + 1));
+      return grams;
+    });
+    const isRare = (g) => (df.get(g) || 0) <= RQ_CA_RARE_MAX_DF;
+
+    const rows = [];
+    for (let i = 0; i < rounds.length; i++) {
+      const e = rounds[i];
+      const pos = e.positions || [];
+      const path = await caPathDistance(pos);
+
+      // Shared specifics ACROSS seats within the round.
+      const specs = pos.map((p) => caSpecifics(caPosText(p)));
+      let shared = 0;
+      for (let a = 0; a < specs.length; a++) {
+        for (let b = a + 1; b < specs.length; b++) shared += caInter(specs[a], specs[b]);
+      }
+
+      // REFINEMENT 2: anchoring is CROSS-ROUND, not intra-round.
+      //
+      // The spec asked for "the first-answering seat's rare n-grams appearing in
+      // later seats' outputs". That channel DOES NOT EXIST: seats dispatch in
+      // parallel on a 700ms stagger and are blind to each other until
+      // adjudication, so nothing a seat writes can reach another seat within the
+      // same round. Measuring it would return zero forever and read as a clean
+      // result.
+      //
+      // The real vector is the ledger recency block, round N -> N+1. That is the
+      // path on which every anchoring failure in this project has been logged,
+      // including two seats reasoning from a position the council had already
+      // rejected. So: rare n-grams from round i-1 reappearing in round i.
+      let echo = null;
+      if (i > 0) {
+        let n = 0;
+        perRound[i].forEach((g) => { if (isRare(g) && perRound[i - 1].has(g)) n++; });
+        echo = n;
+      }
+
+      const flags = [];
+      if (path !== null && path < RQ_CA_PATH_FLOOR && String(e.outcome || "") !== "divided") flags.push("LOW-PATH-DIVERGENCE");
+      if (echo !== null && echo > RQ_CA_ANCHOR_FLOOR) flags.push("CROSS-ROUND-ECHO");
+      if (shared > 2) flags.push("SHARED-SPECIFICS");
+      rows.push({ t: e.t, outcome: e.outcome, seats: pos.length, path, shared, echo, flags });
+    }
+
+    const scored = rows.filter((r) => r.path !== null);
+    if (!scored.length) {
+      logError("[CONFORMITY] no round could be scored — the embed worker returned nothing. " +
+        "Result is UNKNOWN, not clean: an audit that cannot embed has measured nothing.");
+      return { rows, mean: null };
+    }
+    const mean = scored.reduce((s, r) => s + r.path, 0) / scored.length;
+
+    // The trend is the actual metric. First half vs second half of the ledger:
+    // "a healthy ledger shows verdict convergence with persistent path
+    // divergence; a herding ledger shows both declining together."
+    const half = Math.floor(scored.length / 2);
+    const early = scored.slice(0, half), late = scored.slice(half);
+    const em = early.length ? early.reduce((s, r) => s + r.path, 0) / early.length : null;
+    const lm = late.length ? late.reduce((s, r) => s + r.path, 0) / late.length : null;
+
+    logError("[CONFORMITY] mean path distance " + mean.toFixed(3) + " over " + scored.length +
+      " scored round(s) (1.0 = orthogonal reasoning, 0 = identical). " +
+      (em !== null && lm !== null
+        ? "Early half " + em.toFixed(3) + " \u2192 late half " + lm.toFixed(3) + " (" +
+          (lm < em ? "DECLINING \u2014 check this against the verdict trend; both falling together is the herding signature"
+                   : "holding or rising \u2014 paths remain divergent") + ")."
+        : ""));
+    const flagged = rows.filter((r) => r.flags.length);
+    if (flagged.length) {
+      flagged.slice(0, 10).forEach((r) => {
+        logError("[CONFORMITY] \u25C7 round t=" + r.t + " [" + (r.outcome || "?") + "] \u2014 " + r.flags.join(", ") +
+          " (path " + (r.path === null ? "n/a" : r.path) + ", shared specifics " + r.shared +
+          ", cross-round echo " + (r.echo === null ? "n/a" : r.echo) + ")");
+      });
+      if (flagged.length > 10) logError("[CONFORMITY] \u2026and " + (flagged.length - 10) + " more flagged round(s).");
+    } else {
+      logError("[CONFORMITY] no round flagged. NOT a clean bill of health \u2014 the thresholds " +
+        "(path < " + RQ_CA_PATH_FLOOR + ", echo > " + RQ_CA_ANCHOR_FLOOR + ") are fitted to NOTHING and are " +
+        "TUNE-AFTER-DATA. Read the mean and the trend, not the flag count.");
+    }
+    return { rows, mean, early: em, late: lm };
+  }
+  try { window.__rqConformityAudit = runConformityAudit; } catch (_) {}
 
   // ---------- Dispatch ----------
   let busy = false;
