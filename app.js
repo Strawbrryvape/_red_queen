@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.7.4-glm-headroom";
+  const RQ_BUILD = "v4.8.0-ps-gates";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -6684,6 +6684,15 @@ roundData,
       response: _evResponse,
       consensus_status: _evStatus,
       prompt_class: _evClass,
+      // PS GATE ITEM 3 (K3) — the auto-dispatch marker must survive into the
+      // DURABLE record. dispatch_source already persists through review in the
+      // browser ledger (only review_status changes), but the ledger is the
+      // disposable copy: an audit run against Supabase could not tell an
+      // auto-dispatched round from a typed one, which makes the whole
+      // consent-relocation unverifiable after the fact. Rides in provenance,
+      // which the F2 migration already created; absent on manual rounds, so the
+      // payload is unchanged when the scheduler never fired.
+      ...(_autoThisRound ? { provenance: { dispatch_source: "auto", review_status: "unwitnessed" } } : {}),
     }).then((row) => {
       if (row && row.id) return row;
       // sbInsertReturning also returns null when Supabase simply isn't
@@ -7173,7 +7182,13 @@ roundData,
     if (!entry || !csResult) return;
     // csClassify emits singular `action`; the frozen ledger field is plural
     // `actions`. The mapping lives here and nowhere else.
-    entry.cs = { verdict: csResult.verdict, gate: csResult.gate, actions: csResult.action };
+    // v4.7.5 — `shadow` added so the chip can say whether this verdict was ACTED
+    // ON or merely observed. Without it a shadow diagnosis would render
+    // identically to a live one, which is the reporting-layer failure class this
+    // project has now found seven times. R7a freezes {verdict, gate, actions};
+    // this is an additive key and the three frozen ones are untouched.
+    entry.cs = { verdict: csResult.verdict, gate: csResult.gate, actions: csResult.action,
+                 shadow: counterstampMode() === "shadow" };
     persistLedger();
   }
 
@@ -7534,6 +7549,80 @@ roundData,
   // entry fixes both consumers — the flow animation (which would otherwise fall
   // through to amber) and the timeline dot (which would paint gray #888).
   const TRUST_COLORS = { verified: "#16a34a", provisional: "#d97706", divided: "#dc2626", sole: "#3b82f6", "resolved-by-operator": "#0f766e" };
+
+  // v4.7.5 — COUNTERSTAMP sub-verdict palette. Colour encodes the ACTION the
+  // verdict implies, not the name, because the operator's question is always
+  // "what do I do about this round". FIELD SKEW is deliberately the drabbest of
+  // the six: it is the one verdict meaning the round told you nothing about the
+  // council, and it must not look like a finding.
+  const CS_VERDICT_STYLE = {
+    "TRUE SPLIT":  { c: "#dc2626", act: "genuine disagreement — adjudicate" },
+    "FORK":        { c: "#d97706", act: "two workable proposals — choose one" },
+    "SHEAR":       { c: "#2563eb", act: "perpendicular facets of one question — synthesize" },
+    "PARALLEL":    { c: "#7c3aed", act: "different questions answered — merge or re-ask" },
+    "FIELD SKEW":  { c: "#6b7280", act: "EQUIPMENT, not disagreement — equalize and re-run" },
+    "UNRESOLVED":  { c: "#4b5563", act: "gates could not decide" },
+  };
+  // ===== PS GATE ITEM 4 (K3, 2026-08-14) — CALIBRATION QUARANTINE.
+  //
+  // v4.1.0 added the composer-appended falsifier ask, which made every seat open
+  // with a FALSIFIER: line. csFirstLine did not skip it until v4.7.1, so for that
+  // whole window Gate 1 compared CONDITIONALS instead of POSITIONS. Every Gate 1
+  // score in it is invalid, and K3's refit ruling requires >=20 real shadow
+  // rounds — none of these qualify.
+  //
+  // K3 went further than Fable proposed: a round that squeaked past the floor
+  // during the window is not merely unusable for tuning, its VERDICT is suspect,
+  // and should be downgraded to provisional until re-checked.
+  //
+  // THIS FUNCTION IDENTIFIES; IT DOES NOT REWRITE. Same doctrine as the F0 retro
+  // patch (R-PS-13): a dry run first, operator-run, keyed on content and never on
+  // an ordinal. An automatic sweep that silently re-tagged stored verdicts would
+  // be exactly the reporting-layer failure this project has now found seven times.
+  const PS_CONTAM_FROM = "v4.1.0";
+  const PS_CONTAM_TO   = "v4.7.1";
+  const PS_NEAR_FLOOR  = 0.03;   // "squeaked past" band above CS_GATE1_MIN_SIM
+  function psCalibrationQuarantine() {
+    const rows = (ledger || []).filter((e) => e && e.cs && e.cs.verdict);
+    if (!rows.length) {
+      logError("[PS-QUARANTINE] no rounds in this ledger carry a COUNTERSTAMP verdict — nothing to quarantine. " +
+        "Note this is the LOCAL ledger; the durable corpus is in Supabase and must be checked there too.");
+      return null;
+    }
+    // A round is in the window if it carries a Gate-1 score AND the falsifier ask
+    // was on. The ask is recorded per round in the Round Header, so this is read
+    // from the record rather than inferred from dates.
+    const inWindow = rows.filter((e) => e.header && e.header.falsifier_asked === true);
+    const noHeader = rows.filter((e) => !e.header);
+    const nearFloor = inWindow.filter((e) =>
+      typeof e.cs.gate1MaxSim === "number" &&
+      e.cs.gate1MaxSim >= CS_GATE1_MIN_SIM &&
+      e.cs.gate1MaxSim < CS_GATE1_MIN_SIM + PS_NEAR_FLOOR);
+    logError("[PS-QUARANTINE] " + rows.length + " round(s) with a COUNTERSTAMP verdict. " +
+      inWindow.length + " ran with the falsifier ask ON (" + PS_CONTAM_FROM + "\u2013" + PS_CONTAM_TO +
+      " window) \u2014 their Gate 1 scores compared FALSIFIERS, not positions, and are UNUSABLE for the refit." +
+      (noHeader.length ? " " + noHeader.length + " round(s) carry no Round Header, so their window membership is UNKNOWN \u2014 treat as contaminated, not as clean." : ""));
+    if (nearFloor.length) {
+      logError("[PS-QUARANTINE] \u26A0 " + nearFloor.length + " round(s) cleared the floor by less than " +
+        PS_NEAR_FLOOR + " during the window. Per K3's ruling these verdicts are SUSPECT and should be " +
+        "downgraded to provisional pending re-check: " +
+        nearFloor.map((e) => "t=" + e.t + " (" + e.cs.gate1MaxSim + ")").join(", ") +
+        ". NOT rewritten automatically \u2014 identify first, decide second.");
+    } else {
+      logError("[PS-QUARANTINE] no near-floor rounds found in the window. This is NOT a clean bill of health: " +
+        "gate1MaxSim is only stored on rounds built after it was recorded, so an absent score reads as " +
+        "'not near the floor' when it may simply be unrecorded.");
+    }
+    return { total: rows.length, inWindow: inWindow.length, unknown: noHeader.length, nearFloor: nearFloor };
+  }
+  try { window.__rqQuarantine = psCalibrationQuarantine; } catch (_) {}
+
+  function csStyleFor(cs) {
+    const label = csLabel(cs);
+    const base = String(label).split("@")[0];          // UNRESOLVED@2 -> UNRESOLVED
+    const s = CS_VERDICT_STYLE[base] || CS_VERDICT_STYLE.UNRESOLVED;
+    return { label: label, color: s.c, action: s.act };
+  }
   const tlcss = document.createElement("style");
   tlcss.textContent = [
     "#rqSessions .rq-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; flex:none; }",
@@ -8139,6 +8228,22 @@ roundData,
         badge.className = "rq-badge" + (e.outcome === "verified" ? " verified" : "");
         badge.textContent = e.outcome === "divided" ? "DIVIDED" : (e.outcome || "").toUpperCase() + (e.counts ? " " + e.counts : "");
         head.appendChild(t); head.appendChild(badge);
+        // v4.7.5 — the sub-verdict, if one was stored. Absent on rounds that ran
+        // before COUNTERSTAMP, or with it off: no chip rather than a guess.
+        if (e.outcome === "divided" && e.cs && e.cs.verdict) {
+          const st = csStyleFor(e.cs);
+          const chip = document.createElement("span");
+          chip.className = "rq-cs-chip";
+          chip.style.cssText = "margin-left:6px;padding:1px 7px;border-radius:999px;font-size:0.62em;" +
+            "letter-spacing:0.06em;white-space:nowrap;border:1px solid " + st.color +
+            ";color:" + st.color + ";background:transparent;";
+          chip.textContent = st.label + (e.cs.shadow ? " (shadow)" : "");
+          // Hover carries the action and the gate, so the chip is a pointer to a
+          // decision rather than jargon the operator has to memorise.
+          chip.title = st.label + " (gate " + (e.cs.gate == null ? "?" : e.cs.gate) + ") \u2014 " + st.action +
+            (e.cs.shadow ? "\n\nSHADOW: this verdict was logged, not acted on. COUNTERSTAMP was not live for this round." : "");
+          head.appendChild(chip);
+        }
         const body = document.createElement("div");
         body.className = "rq-sess-body";
         const del = document.createElement("button");
@@ -10164,6 +10269,26 @@ roundData,
   // vanish with no trace on either side. That is the silent-loss class this
   // project keeps finding, and it is the likeliest explanation for the Kimi
   // seat's round-22 complaint.
+  // ===== PS GATE ITEM 1 (K3, 2026-08-14) — SNAPSHOT EXCLUSION, built AHEAD of
+  // the Flight Recorder so F1 cannot be written without it.
+  //
+  // Since v4.0.2 a SURPRISE AUDIT prompt carries predicted_own and actual_own
+  // VERBATIM. That deviation from R-P7-11 was only acceptable because those
+  // rounds are excluded from the embedding corpus — read once, never
+  // retrievable. A Flight Recorder full_context_blob would persist the same text
+  // in a SECOND store the containment never reaches, silently undoing it.
+  //
+  // R-PS-11 does not cover this. K3 ruled it must, and gated her experiments on
+  // it. Any capture path MUST consult this before writing a prompt anywhere.
+  const PS_NEVER_SNAPSHOT = [/^SURPRISE AUDIT:/i];
+  function psSnapshotExcluded(prompt) {
+    try {
+      const p0 = String(prompt || "").trim();
+      return PS_NEVER_SNAPSHOT.some((re) => re.test(p0));
+    } catch (_) { return true; }   // unreadable prompt => refuse to capture; false-negative safe
+  }
+  try { window.__rqSnapshotExcluded = psSnapshotExcluded; } catch (_) {}
+
   const RQ_FT_PEND_K = "rq_ft_pending";
   function ftPendingGet() {
     try { const v = JSON.parse(localStorage.getItem(RQ_FT_PEND_K) || "[]"); return Array.isArray(v) ? v : []; }
