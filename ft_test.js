@@ -39,8 +39,13 @@ tt("a round cap exists", RQ_FT_MAX_ROUNDS === 3);
 tt("a char cap exists", RQ_FT_MAX_CHARS === 6000);
 tt("over-cap requests are truncated AND logged",
    /requested, cap is/.test(src) && /DROPPING/.test(src));
-tt("the block is hard-truncated at the char cap",
-   /block\.length > RQ_FT_MAX_CHARS/.test(src) && /block truncated at/.test(src));
+// v4.7.3 — truncation moved off the assembled block onto the BODY, so the
+// receipt header can never be the thing that gets cut. A receipt truncated
+// away would be the worst possible failure of this feature.
+tt("the body is truncated, leaving room for the receipt",
+   /const cap = RQ_FT_MAX_CHARS - 320;/.test(src) && /body\.slice\(0, cap - 1\)/.test(src));
+tt("truncation is declared IN the receipt, not just the drawer",
+   /TRUNCATED at the " \+ RQ_FT_MAX_CHARS \+ "-char cap/.test(src));
 tt("the measured Spine arithmetic is cited as the reason for the cap",
    /19,445/.test(src) && /measured 2026-08-11/.test(src) && /324% of the/.test(src));
 tt("the first regex's fail-closed defect is documented",
@@ -54,7 +59,14 @@ tt("ordinal lookup is bounds-checked",
    /if \(idx < 0 \|\| idx >= ledger\.length\) return null;/.test(src));
 
 console.log("\n--- a request is consumed once, not standing ---");
-tt("_ftPending is cleared on use", /_ftPending = \[\];\s+\/\/ consume once/.test(src));
+tt("the pending queue is cleared on use", /ftPendingSet\(\[\]\);\s+\/\/ consume once/.test(src));
+tt("v4.7.3: the queue PERSISTS, so a reload cannot silently eat a request",
+   /localStorage\.setItem\(RQ_FT_PEND_K/.test(src) && /const RQ_FT_PEND_K = "rq_ft_pending"/.test(src));
+tt("a non-delivery gets its own receipt rather than silence",
+   /NOT DELIVERED/.test(src) && /Do not infer content you were not given/.test(src));
+tt("the receipt reaches the SEAT, not only the drawer",
+   /return "\\n\\n" \+ none;/.test(src) && /receipt \+ "\\n\\n" \+ body/.test(src));
+tt("the one-round lag is stated to the seats", /lag=1 round/.test(src));
 tt("injection happens on the NEXT round, not the requesting one",
    /will be injected verbatim on the next round/.test(src));
 
