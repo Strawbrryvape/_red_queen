@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.5.0-conformity-audit";
+  const RQ_BUILD = "v4.7.1-falsifier-gate1";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -1504,6 +1504,9 @@
       case "provisional": return "PROVISIONAL";
       case "sole":        return "SOLE_VOICE";
       case "divided":     return "DIVIDED";
+      // SPEC-PS-F0 — without this case a fiat round's receipt stamps
+      // PROVISIONAL: weaker-safe, but a lie about what the row is.
+      case "resolved-by-operator": return "RESOLVED-BY-OPERATOR";
       default:            return "PROVISIONAL";
     }
   }
@@ -2470,6 +2473,11 @@ roundData,
         row = { fragility_score: 1.0, components: {}, weights_used: P4_META_W, verdict: "DIVIDED" };
       } else if (result.trust === "sole") {
         row = { fragility_score: 1.0, components: {}, weights_used: P4_META_W, verdict: "SOLE" };
+      } else if (result.fiat && result.fiat.mode === "live") {
+        // SPEC-PS-F0 — acknowledgment is not lexical convergence; there is no
+        // margin to measure and _agreed is []. Record the verdict honestly
+        // rather than computing fragility over an empty agreeing set.
+        row = { fragility_score: 0.0, components: {}, weights_used: P4_META_W, verdict: "RESOLVED-BY-OPERATOR" };
       } else {
         row = p4Fragility(result, eligible || [], agreed || []);
         if (!row) return;
@@ -2851,6 +2859,35 @@ roundData,
       // P7 F2 Phase A2 — post-filter, own bounded race (BLOCKER 2). Flag off:
       // returns the same object untouched, zero network.
       await filterConsolidatedFromRetrieval(shaped);
+      // v4.7.0 — UNWITNESSED EXCLUSION. The piece that makes auto-dispatch a
+      // relocation of consent rather than a removal of it: a round no human has
+      // read cannot become the council's evidence about itself.
+      //
+      // MATCHED ON PROMPT TEXT, NOT ON id OR t. The first draft of this matched
+      // h.t against the ledger timestamp — but shapeRetrieval emits
+      // {id, prompt, promptRaw, response, consensus_status, similarity} and
+      // carries NO ledger timestamp at all. It would have matched nothing,
+      // excluded nothing, and logged nothing: a containment that silently did
+      // not contain, which is worse than no containment because it would have
+      // been trusted. promptRaw is the full stored prompt and is the only field
+      // shared with the ledger entry.
+      //
+      // Fails open by construction: an unmatched row is simply not excluded.
+      try {
+        const unread = new Set((ledger || [])
+          .filter((e) => e && e.dispatch_source === "auto" && e.review_status !== "reviewed")
+          .map((e) => String(e.prompt || "").trim())
+          .filter((x) => x.length > 0));
+        if (unread.size && shaped) {
+          const isUnread = (h) => unread.has(String((h && (h.promptRaw || h.prompt)) || "").trim());
+          const before = (shaped.hits || []).length;
+          if (Array.isArray(shaped.hits)) shaped.hits = shaped.hits.filter((h) => !isUnread(h));
+          if (Array.isArray(shaped.candidates)) shaped.candidates = shaped.candidates.filter((h) => !isUnread(h));
+          const dropped = before - (shaped.hits || []).length;
+          if (dropped) logError("[AUTO] " + dropped + " UNWITNESSED auto round(s) excluded from injection \u2014 " +
+            "mark them reviewed to let them into memory.");
+        }
+      } catch (_) {}
       // v3.6.0 — verify before injecting. Quarantined rows are DROPPED from the
       // hits actually placed in seat context; the drop is announced, never
       // silent, because "the council stopped citing that round" is exactly the
@@ -4209,10 +4246,14 @@ roundData,
         ["fulltextRetrieveToggle", "rq_fulltext_retrieve", "P6: FULL-TEXT REQUEST",
          "\u26A0 SEATS READ THIS. A seat may write [REQUEST_FULLTEXT: 173, 174] and those rounds are injected VERBATIM on the next round. Explicit request only \u2014 never heuristic. Capped at 3 rounds / 6000 chars.",
          "Seats cannot request full text; context carries clipped ledger excerpts only."],
-        ["confirmationToggle", "rq_confirmation", "P6: CONFIRMATION ROUNDS",
-         "Prompts opening with \"Confirm:\" or \"Council, confirm\" bypass adjudication and are tagged RESOLVED-BY-OPERATOR \u2014 a state distinct from VERIFIED. Stops a directive-acceptance round scoring as a contested one.",
-         "Confirmation prompts are adjudicated like any other round."],
-
+        ["autoDispatchToggle", "rq_auto_dispatch", "AUTO-DISPATCH",
+         "\u26A0 THE COUNCIL RUNS ITSELF. Up to " + RQ_AUTO_MAX_PER_DAY + " self-generated prompts per day, jittered, in-browser only, never while busy or hidden or while the Governor reports distress. Rounds are tagged UNWITNESSED and CANNOT enter retrieval until you mark them reviewed. Pauses at " + RQ_AUTO_BACKLOG_STOP + " unreviewed.",
+         "No autonomous rounds. Self-prompts wait in the banner for you to inject."],
+        ["fiatToggle", "rq_fiat_recognition", "PS: FIAT RECOGNITION", "", "",
+         { read: () => fiatRecognitionMode(), cycle: [
+           ["off", "Directive rounds tag through the legacy pipeline. Byte-identical: one localStorage read per dispatch, nothing else."],
+           ["shadow", "DEFAULT. Directive rounds are detected and logged (\u25C7 FIAT would-tag) with full evidence; written status unchanged. Read the lines before promoting."],
+           ["live", "Acknowledged operator directives tag RESOLVED-BY-OPERATOR (terminal, never promotes). Run rq-ps-f0-operator-fiat.sql first, or inserts degrade to \"resolved\" with one drawer line."]] }],
         // ---- v3.9.10 F0 — INSTRUMENTS (tri-state). These three were console-only
         // until now, which cost the 2026-08-06 session three divided rounds of
         // COUNTERSTAMP data because localStorage is per-device and neither flag
@@ -5136,21 +5177,12 @@ roundData,
       return { text: null, divided: true, answers, note: true };
     }
 
-    // v4.4.0 — CONFIRMATION rounds bypass adjudication for the same reason note
-    // rounds do: there is nothing to adjudicate. The operator asked the council
-    // to confirm a directive, not to contest one.
-    //
-    // divided:true is kept DELIBERATELY, matching the note-round convention: it
-    // is what makes the UI render every seat verbatim instead of manufacturing a
-    // single synthesized voice, and the seats' caveats are the point of a
-    // confirmation round. The trust literal carries the real meaning.
-    if (_confirmationRound) {
-      logError("[CONFIRMATION] " + answers.length + " seat(s) responded. Recorded verbatim, tagged " +
-        "RESOLVED-BY-OPERATOR. This is NOT VERIFIED — it records that the operator closed the " +
-        "question, not that the council independently agreed. Caveats attached by seats are preserved, " +
-        "not scored as disagreement.");
-      return { text: null, divided: true, answers, confirmation: true, trust: "resolved-by-operator" };
-    }
+    // v4.6.0 — the v4.4.0 CONFIRMATION bypass that stood here has been REMOVED.
+    // It matched a prompt pattern and returned resolved-by-operator without ever
+    // reaching adjudication, which meant a seat could REFUTE the directive and
+    // the round still carried the tag. SPEC-PS-F0 replaces it: detection still
+    // happens at the dispatch seam, but the tag is decided far below, on the
+    // would-be-divided path, behind four tests. See fiatAcknowledgeTest.
 
     // v3.5.4 — COUNCIL HEALTH. One line per round, stated before any verdict is
     // computed, so "who actually rendered" is never something that has to be
@@ -5265,7 +5297,50 @@ roundData,
           resolvedUnavailable: adj.resolvedUnavailable,
         };
       }
-      // Still divided — attach any located contested claims for display.
+      // SPEC-PS-F0 — OPERATOR FIAT. Runs ONLY here: lexical consensus failed,
+    // adjudication did not resolve, and the round is about to read DIVIDED. If
+    // the operator issued a directive and every seat acknowledged it, DIVIDED is
+    // the wrong tag — the seats accepted one action and diverged on
+    // implementation detail. LIVE retags RESOLVED-BY-OPERATOR (terminal: never
+    // promotes to verified, never merges with adjudication's "resolved" above).
+    // SHADOW logs the would-tag and rides along as an additive key. OFF never
+    // reaches here — _fiatCandidate is null and this is one truthy test.
+    if (_fiatCandidate && fiatRecognitionMode() !== "off") {
+      const ack = fiatAcknowledgeTest(eligible, adj, _fiatCandidate, null);
+      if (ack.pass && fiatRecognitionMode() === "live") {
+        logError("\u25C6 FIAT — operator directive acknowledged by all " + eligible.length +
+          " seat(s); tagging RESOLVED-BY-OPERATOR (terminal, not council consensus). " +
+          ack.evidence.join(" | "));
+        return {
+          text: _fiatCandidate.directive,   // the directive IS the verdict; seat texts stay in answers
+          divided: false, answers, trust: "resolved-by-operator",
+          agreedCount: eligible.length, eligibleCount: eligible.length,
+          verdicts: adj ? adj.verdicts : null,
+          fiat: {
+            mode: "live",
+            fiat_directive: _fiatCandidate.directive,
+            pattern: _fiatCandidate.pattern,
+            fiat_evidence: ack.evidence,
+            has_implementation_notes: ack.has_implementation_notes,
+            seat_caveats: ack.seat_caveats,
+          },
+          _eligible: eligible,
+          _agreed: [],   // no lexical agreeing set exists; the tag asserts acknowledgment, not convergence
+        };
+      }
+      if (fiatRecognitionMode() === "shadow") {
+        logError("\u25C7 FIAT (shadow) — " + (ack.pass
+          ? "WOULD tag RESOLVED-BY-OPERATOR (all four acknowledgment tests pass); status stays DIVIDED until rq_fiat_recognition='live'. " + ack.evidence.join(" | ")
+          : "directive detected but acknowledgment tests FAILED — round stays divided on its own merits. " + ack.evidence.join(" | ")));
+        _fiatShadow = {
+          mode: "shadow", fiat_shadow_would_tag: ack.pass,
+          fiat_directive: _fiatCandidate.directive, pattern: _fiatCandidate.pattern,
+          fiat_evidence: ack.evidence,
+        };
+      }
+    }
+
+    // Still divided — attach any located contested claims for display.
       // v3.9.8 COUNTERSTAMP (R1) — propagate the adjudication verdict stream and
       // the shadow-partition read that runAdjudication already computed. They
       // were being dropped here; Gate 3 has no primary input without them.
@@ -5275,7 +5350,8 @@ roundData,
                shadowPartition: adj ? adj.shadowPartition : null,
                shadowPartitionDegraded: adj ? adj.shadowPartitionDegraded : null,
                shadowPartitionSeats: adj ? adj.shadowPartitionSeats : null,
-               shadowPartitionReason: adj ? adj.shadowPartitionReason : null };
+               shadowPartitionReason: adj ? adj.shadowPartitionReason : null,
+               ...(_fiatShadow ? { fiat: _fiatShadow } : {}) };   // SPEC-PS-F0 — absent unless a shadow detection fired
     }
     if (outliers.length > 0) {
       outliers.forEach((o) =>
@@ -6734,6 +6810,19 @@ roundData,
     // (b) "<name> seat" / "seat: ..." nameplate in any case, no terminator.
     if (!terminal && bare.length <= CS_BANNER_MAX &&
         /^(?:[A-Za-z0-9]+\s+)?seat\b|^\s*seat\s*[:\-\u2014\u2013]/i.test(bare)) return true;
+    // (c-0) v4.7.1 — THE FALSIFIER LINE. Added in v4.1.0 by the composer-appended
+    // falsifier ask, which made EVERY seat open with "FALSIFIER: ...". Gate 1
+    // compares first lines to measure POSITION overlap, so from that build on it
+    // was comparing conditionals about what would change a seat's mind instead
+    // of the positions themselves. Live 2026-08-13: three seats gave three
+    // substantive answers and Gate 1 scored 0.118 against a 0.12 floor —
+    // a false PARALLEL by two thousandths.
+    //
+    // A falsifier IS a proposition; it just is not the seat's POSITION, which is
+    // what Gate 1 exists to compare. Same class as the banner defect this
+    // function was written to fix, reintroduced by a later feature.
+    // caStrip (conformity audit) already stripped these; csFirstLine did not.
+    if (/^falsifier\s*:/i.test(bare)) return true;
     // (c) Bare section label: "Position Statement", "Answer:", "Verdict —".
     if (/^(position|answer|response|verdict|summary|statement|analysis|opinion|conclusion|recommendation)\s*(statement)?\s*[:\-\u2014\u2013]?\s*$/i.test(bare)) return true;
     return false;
@@ -7343,7 +7432,10 @@ roundData,
   // seat/Llama. Pure CSS+JS, ledger-fed, zero dependencies. The former
   // "PAST ROUNDS" section is upgraded into the spec's Timeline rather
   // than duplicated as a parallel tab.) ====================
-  const TRUST_COLORS = { verified: "#16a34a", provisional: "#d97706", divided: "#dc2626", sole: "#3b82f6" };
+  // SPEC-PS-F0 teal: distinct from verified green and divided red. This one
+  // entry fixes both consumers — the flow animation (which would otherwise fall
+  // through to amber) and the timeline dot (which would paint gray #888).
+  const TRUST_COLORS = { verified: "#16a34a", provisional: "#d97706", divided: "#dc2626", sole: "#3b82f6", "resolved-by-operator": "#0f766e" };
   const tlcss = document.createElement("style");
   tlcss.textContent = [
     "#rqSessions .rq-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; flex:none; }",
@@ -7866,6 +7958,11 @@ roundData,
           if (!present.has(s)) { agg[s].fail++; return; }
           if (e.outcome === "divided") agg[s].div++;
           else if (e.outcome === "sole") agg[s].sole++;
+          // SPEC-PS-F0 — the operator's call is NOT council consensus, and the
+          // else-bucket counts as consensus and paints verified-green. Excluded
+          // from all four buckets: the round still counts, it just contributes
+          // no segment.
+          else if (e.outcome === "resolved-by-operator") { /* not consensus — no bucket */ }
           else agg[s].ok++;
         });
       });
@@ -9196,6 +9293,10 @@ roundData,
   }
 
   // Post-round / idle kick. Never on the dispatch path, never awaited.
+  // v4.7.0 — scheduler heartbeat. Detached, flag-checked every tick, so
+  // toggling the flag off stops it without a reload.
+  try { setInterval(() => { autoTick(); }, RQ_AUTO_TICK_MS); } catch (_) {}
+
   window.__rqConsolidationKick = function () {
     try {
       if (!consolidationEnabled() || busy !== false) return;
@@ -9238,7 +9339,8 @@ roundData,
   // it is already public corpus and carries none of the R-P7-11 restrictions
   // that apply to predicted_own / actual_own.
   let _predRoundPrompt    = null;
-  let _confirmationRound  = false;   // v4.4.0 — set per dispatch, read at scoring
+  let _fiatCandidate      = null;    // SPEC-PS-F0 — detection record for THIS dispatch, null when off/no match
+  let _fiatShadow         = null;    // SPEC-PS-F0 — shadow evidence, additive key on the divided return
   let _predTableMissing   = false;  // session-sticky disable
   let _predStoredWatchdog = false;  // one "event never stored" line per session
   let _predVitalsMissing  = false;
@@ -9588,14 +9690,59 @@ roundData,
   // of a directive, NOT to re-open a debate. Scored for acceptance, never for
   // lexical convergence — which is what made round 175 read as DIVIDED when the
   // seats had simply attached footnotes to an agreement they all shared.
-  const RQ_CONFIRMATION_RE = /^\s*(confirm|confirmation)\s*[:\-\u2014]|^\s*council,?\s+confirm\b/i;
-  function isConfirmationRound(q) { return RQ_CONFIRMATION_RE.test(String(q || "")); }
+  // ==================== SPEC-PS-F0: OPERATOR FIAT RECOGNITION ====================
+  // The bug this exists for: an operator directive that every seat ACKNOWLEDGED
+  // was tagged DIVIDED, because the seats attached implementation notes and the
+  // lexical pipeline reads note divergence as debate. The machine had no
+  // representation for "the council acknowledged a fiat", so the only tag
+  // available was the wrong one.
+  //
+  // Detection is EXPLICIT-only: a frozen pattern list, matched at the start of
+  // the message or of a standalone line, case-insensitively. A missed directive
+  // costs one wrongly-divided round — the status quo, and safe. A false positive
+  // would HIDE REAL DISSENT, which is never acceptable. That asymmetry is frozen
+  // by R-PS-2 and is why every ambiguous branch below returns "stay divided".
+  //
+  // Tri-state flag, counterstampMode() precedent, NOT the rack "on"/"off"
+  // convention. House order off -> shadow -> live. Default SHADOW: detect, log
+  // what it WOULD tag, change nothing.
+  function fiatRecognitionMode() {
+    const v = localStorage.getItem("rq_fiat_recognition");
+    return (v === "shadow" || v === "live") ? v : (v === "off" ? "off" : "shadow");
+  }
+
+  // FROZEN pattern list (R-PS-10). Do not extend without a Foundation amendment.
+  const FIAT_DIRECTIVE_PATTERNS = [
+    "we will ", "adopt ", "adopted:", "override", "the decision is",
+    "operator fiat", "fiat:", "i am directing", "by operator directive",
+  ];
+
+  // Runs on the RAW query at the dispatch seam, before composition — by the time
+  // runLiveCouncil sees the prompt the operator's line sits deep inside the
+  // memory envelope. Returns null when off (one localStorage read, nothing
+  // else), when nothing matches, or when the round is already typed
+  // note/indexical. Detection is NOT a tag; the gate decides.
+  function fiatPreFilter(query) {
+    if (fiatRecognitionMode() === "off") return null;
+    if (_noteRound || _indexicalRound) return null;
+    const lines = String(query || "").split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i].trimStart().toLowerCase();
+      if (!l) continue;
+      for (let k = 0; k < FIAT_DIRECTIVE_PATTERNS.length; k++) {
+        if (l.indexOf(FIAT_DIRECTIVE_PATTERNS[k]) === 0) {
+          return { directive: lines[i].trim(), pattern: FIAT_DIRECTIVE_PATTERNS[k], line: i };
+        }
+      }
+    }
+    return null;
+  }
 
   // Deterministic where possible; null when it genuinely is not known. Never
   // guessed — an invented divergence type is worse than an absent one.
   function headerDivergenceType(result, csVerdict) {
     if (csVerdict) return csVerdict;                       // COUNTERSTAMP arrived early
-    if (result && result.confirmation) return "CONFIRMATION";   // RESOLVED-BY-OPERATOR
+    if (result && result.fiat && result.fiat.mode === "live") return "RESOLVED-BY-OPERATOR";   // SPEC-PS-F0
     if (result && result.note) return "NOTE";
     if (result && result.indexical) return "INDEXICAL";
     if (result && result.divided) return "DIVIDED-UNCLASSIFIED";
@@ -9710,6 +9857,74 @@ roundData,
   const RQ_CLAIM_MAX     = 12;     // per side; long answers are truncated, not sampled
 
   function claimDiffEnabled() { return localStorage.getItem("rq_claim_diff") === "on"; }
+
+  // ---- SPEC-PS-F0 — ACKNOWLEDGMENT GATE. Four tests, ALL must hold.
+  // Evaluated ONLY on the would-be-divided path, after adjudication has had its
+  // genuine chance to resolve — a round the council settled on its own is a
+  // council outcome and never wears the operator's tag. Every branch appends to
+  // `evidence`: the gate never moves silently, and a FAIL is as much of the
+  // record as a pass. False negatives are safe; false positives hide real
+  // dissent, so any doubt returns pass:false and the round stays divided.
+  function fiatAcknowledgeTest(eligible, adj, candidate, result) {
+    const evidence = [];
+    // (a) directive matched — true by construction, recorded for the record.
+    evidence.push("directive matched: pattern \"" + candidate.pattern + "\", line " +
+      (candidate.line + 1) + ": \"" + clip(candidate.directive, 80) + "\"");
+    // (b) the round actually ran as a council round.
+    if (_noteRound || _indexicalRound || (result && (result.note || result.indexical || result.narrator))) {
+      evidence.push("FAIL(b): not a council round (note/narrator/indexical) — normal pipeline");
+      return { pass: false, evidence: evidence };
+    }
+    evidence.push("council round confirmed");
+    // (c) ZERO counted refutes in the adjudication verdict stream. A counted
+    // refute is real dissent and ends the question. NO STREAM AT ALL means
+    // acknowledgment is UNVERIFIABLE, not absent — false-negative safe, no tag.
+    if (!adj || !Array.isArray(adj.verdicts)) {
+      evidence.push("FAIL(c): no adjudication verdict stream — acknowledgment UNVERIFIABLE, staying divided (false-negative safe)");
+      return { pass: false, evidence: evidence };
+    }
+    const refutes = adj.verdicts.filter((v) => v && v.counted && v.verdict === "refute");
+    if (refutes.length) {
+      evidence.push("FAIL(c): " + refutes.length + " counted refute(s): " +
+        refutes.map((v) => seatLabel(v.seat) + (v.target ? " -> " + v.target : "")).join(", ") +
+        " — real dissent, staying divided");
+      return { pass: false, evidence: evidence };
+    }
+    evidence.push("verdict stream present (" + adj.verdicts.length + " entries), ZERO counted refutes");
+    // (d) every eligible seat's first substantive line is substantive (>= 40
+    // chars, the Gate-3 test). A seat whose acknowledgment is unreadable or
+    // empty cannot be CLAIMED as an acknowledgment.
+    const firstLines = (eligible || []).map((a) => ({ seat: a.name, line: csFirstLine(a) }));
+    if (!firstLines.length) {
+      evidence.push("FAIL(d): no eligible seats — staying divided");
+      return { pass: false, evidence: evidence };
+    }
+    const thin = firstLines.filter((x) => x.line.length < 40);
+    if (thin.length) {
+      evidence.push("FAIL(d): " + thin.length + " seat(s) without a substantive first line: " +
+        thin.map((x) => seatLabel(x.seat)).join(", ") + " — acknowledgment unreadable, staying divided");
+      return { pass: false, evidence: evidence };
+    }
+    evidence.push("all " + firstLines.length + " seat(s) substantive: " +
+      firstLines.map((x) => seatLabel(x.seat) + " \"" + clip(x.line, 60) + "\"").join(" | "));
+    // HAS_IMPLEMENTATION_NOTES: the seats accepted the same directive but their
+    // texts diverge beyond it — lexical divergence on implementation detail, NOT
+    // dissent. Caveats ride as a metadata ARRAY, never as disagreement.
+    let minSim = 1;
+    for (let i = 0; i < firstLines.length; i++) {
+      for (let j = i + 1; j < firstLines.length; j++) {
+        const s = similarity(firstLines[i].line, firstLines[j].line);
+        if (s < minSim) minSim = s;
+      }
+    }
+    const hasNotes = firstLines.length >= 2 && minSim < 0.5;
+    evidence.push("first-line min pairwise similarity " + minSim.toFixed(3) +
+      " — HAS_IMPLEMENTATION_NOTES=" + hasNotes);
+    return {
+      pass: true, evidence: evidence, has_implementation_notes: hasNotes,
+      seat_caveats: hasNotes ? firstLines.map((x) => x.seat + ": " + clip(x.line, 120)) : [],
+    };
+  }
 
   // Atomic claims ≈ sentences. Markdown headers, bullets and banner lines are
   // stripped first: csIsBannerLine already knows what a non-proposition looks
@@ -9848,7 +10063,7 @@ roundData,
   let _ftPending = [];   // round ids requested last round, consumed by the next compose
 
   function fulltextRetrieveEnabled() { return localStorage.getItem("rq_fulltext_retrieve") === "on"; }
-  function confirmationEnabled()      { return localStorage.getItem("rq_confirmation") === "on"; }
+
 
   // Parse requests out of the seats' own answers. Model output is UNTRUSTED: the
   // only thing accepted from it is digits, and every id is checked against the
@@ -10113,6 +10328,179 @@ roundData,
   }
   try { window.__rqConformityAudit = runConformityAudit; } catch (_) {}
 
+  // ---------- Autonomous dispatch + queue triage (rq_auto_dispatch, default OFF) ----------
+  // See the v4.7.0 patch header for the R-P7-10 amendment this rests on. In one
+  // line: consent moves from "press send" to "review before it can influence
+  // anything", and the UNWITNESSED exclusion is what makes that a trade rather
+  // than a loosening.
+  const RQ_AUTO_MAX_PER_DAY   = 4;            // operator's stated 3-4/day
+  const RQ_AUTO_MIN_GAP_MS    = 3 * 3600000;  // never twice inside 3h
+  const RQ_AUTO_JITTER_MS     = 90 * 60000;   // +0..90min randomised, never a fixed clock
+  const RQ_AUTO_BACKLOG_STOP  = 3;            // pause at 3 unreviewed
+  const RQ_AUTO_TICK_MS       = 5 * 60000;    // scheduler wakes every 5 min
+  const RQ_AUTO_K             = "rq_auto_state";
+
+  function autoDispatchEnabled() { return localStorage.getItem("rq_auto_dispatch") === "on"; }
+
+  function autoState() {
+    try {
+      const s = JSON.parse(localStorage.getItem(RQ_AUTO_K) || "{}");
+      return { day: s.day || "", count: s.count || 0, last: s.last || 0, next: s.next || 0 };
+    } catch (_) { return { day: "", count: 0, last: 0, next: 0 }; }
+  }
+  function autoSave(s) { try { localStorage.setItem(RQ_AUTO_K, JSON.stringify(s)); } catch (_) {} }
+  function autoToday() { return new Date().toISOString().slice(0, 10); }
+
+  // Unreviewed auto rounds still sitting in the ledger. This is the backlog the
+  // pause counts — the operator's review is the rate limiter, not the clock.
+  function autoUnreviewedCount() {
+    try {
+      return (ledger || []).filter((e) => e && e.dispatch_source === "auto" &&
+        e.review_status !== "reviewed").length;
+    } catch (_) { return 0; }
+  }
+
+  // ---- TRIAGE. Runs before the scheduler ever sees the queue.
+  // A SURPRISE AUDIT whose round has already been audited, or which duplicates a
+  // seat+round already pending, is not a finding — it is the same measurement
+  // artifact re-filed. Marking them 'skipped' is NOT deletion: the rows stay,
+  // and the F3 metric ruling can revive them if K3 rules the metric sound.
+  async function autoTriageQueue() {
+    if (!sbConfigured()) { logError("[TRIAGE] Supabase not configured — nothing to triage."); return null; }
+    let rows;
+    try {
+      rows = await _consFetch("rq_self_prompt_queue?status=eq.pending&order=created_at.asc&select=id,source_round_id,prompt,created_at");
+    } catch (e) {
+      logError("[TRIAGE] queue read failed (" + ((e && e.message) || e) + ") — nothing changed.");
+      return null;
+    }
+    if (!rows || !rows.length) { logError("[TRIAGE] queue is empty."); return { skipped: 0, kept: 0 }; }
+    const seen = new Set();
+    const skip = [], keep = [];
+    rows.forEach((r) => {
+      const pr = String(r.prompt || "");
+      if (pr.indexOf("SURPRISE AUDIT:") !== 0) { keep.push(r); return; }   // reconciliation etc. always kept
+      // Dedupe key is seat + source round: one audit per seat per round is the
+      // most the metric can honestly support.
+      const m = /^SURPRISE AUDIT:\s*(\w+)/.exec(pr);
+      const key = (m ? m[1] : "?") + "|" + String(r.source_round_id || "");
+      if (seen.has(key)) { skip.push(r); return; }
+      seen.add(key);
+      keep.push(r);
+    });
+    logError("[TRIAGE] " + rows.length + " pending \u2014 " + keep.length + " kept, " + skip.length +
+      " duplicate audit(s) to skip. Skipping is NOT deletion: rows stay and can be revived if the F3 metric ruling changes.");
+    let done = 0;
+    for (const r of skip) {
+      const n = await _consPatch("rq_self_prompt_queue?id=eq." + r.id + "&status=eq.pending",
+        { status: "skipped" }).catch(() => 0);
+      if (n > 0) done++;
+    }
+    if (done) logError("[TRIAGE] " + done + " duplicate audit(s) marked skipped. " + keep.length + " remain pending.");
+    return { skipped: done, kept: keep.length };
+  }
+  try { window.__rqTriageQueue = autoTriageQueue; } catch (_) {}
+
+  // ---- SCHEDULER. In-browser only (key custody); no external cron can reach
+  // the operator's keys. Every guard below is a REFUSAL to fire, so the failure
+  // direction is always "do nothing".
+  async function autoTick() {
+    try {
+      if (!autoDispatchEnabled()) return;
+      if (busy !== false) return;                       // never contend with a live round
+      if (document.hidden) return;                      // only while the tab is actually open
+      if (!sbConfigured()) return;
+      const st = autoState();
+      if (st.day !== autoToday()) { st.day = autoToday(); st.count = 0; autoSave(st); }
+      if (st.count >= RQ_AUTO_MAX_PER_DAY) return;
+      const now = Date.now();
+      if (now - st.last < RQ_AUTO_MIN_GAP_MS) return;
+      if (!st.next) {                                    // arm a jittered target, never a fixed clock
+        st.next = now + Math.floor(Math.random() * RQ_AUTO_JITTER_MS);
+        autoSave(st);
+        return;
+      }
+      if (now < st.next) return;
+      const backlog = autoUnreviewedCount();
+      if (backlog >= RQ_AUTO_BACKLOG_STOP) {
+        logError("[AUTO] paused \u2014 " + backlog + " unreviewed auto round(s) at or over the cap of " +
+          RQ_AUTO_BACKLOG_STOP + ". Review them and the scheduler resumes on its own. " +
+          "The operator's attention is the rate limit, not the clock.");
+        return;
+      }
+      // Governor red is a hard stop: a system reporting sustained distress should
+      // not be given more work by a timer.
+      if (typeof window.__rqGovernorMode === "function" && window.__rqGovernorMode() === "distress") {
+        logError("[AUTO] paused \u2014 Governor reports distress. No auto round while the system is degraded.");
+        return;
+      }
+      let rows;
+      try {
+        rows = await _consFetch("rq_self_prompt_queue?status=eq.pending&order=created_at.asc&select=id,source_round_id,prompt&limit=1");
+      } catch (_) { return; }
+      if (!rows || !rows.length) return;
+      const item = rows[0];
+      // Claim it before dispatching, so a second tab cannot run it too.
+      const claimed = await _consPatch("rq_self_prompt_queue?id=eq." + item.id + "&status=eq.pending",
+        { status: "processed" }).catch(() => 0);
+      if (!claimed) return;
+      st.count += 1; st.last = now; st.next = 0; autoSave(st);
+      _autoThisRound = true;                             // consumed by the ledger keys below
+      logError("\u25C6 [AUTO] dispatching self-generated prompt " + st.count + "/" + RQ_AUTO_MAX_PER_DAY +
+        " today (jittered, in-browser). This round will be tagged UNWITNESSED and is EXCLUDED from " +
+        "retrieval injection until you review it. Prompt: " + clip(String(item.prompt || ""), 120));
+      // Prompt parity: the seats receive exactly what a manual injection would
+      // send. DISPATCH:AUTO exists only in the ledger.
+      //
+      // THE _rqEndogenousPrompt SEAM (swarm integration note, and it was right —
+      // the first draft of this scheduler missed it). Setting the marker makes
+      // dispatch's read-and-clear at the top of the round stamp `endogenous:true`
+      // on the ledger entry, exactly as a hand-injected self-prompt does. Without
+      // it the MOST endogenous rounds in the system — the ones no human typed —
+      // would have been the only self-prompt rounds NOT marked endogenous, and
+      // F2's provenance would have quietly disagreed with itself.
+      //
+      // Set immediately before the call so dispatch's `=== query` identity check
+      // matches, and cleared in the finally below in case dispatch returns early
+      // (the busy guard) and never consumes it.
+      _rqEndogenousPrompt = String(item.prompt || "");
+      try { await dispatch(String(item.prompt || "")); }
+      catch (e) { logError("[AUTO] dispatch threw: " + ((e && e.message) || e) + " — round unaffected, scheduler continues."); }
+      finally { _autoThisRound = false; _rqEndogenousPrompt = null; }
+    } catch (_) { /* a scheduler that throws must never take the app with it */ }
+  }
+
+  let _autoThisRound = false;
+
+  // Operator review: a TOGGLE, never a new council round (non-negotiable 4).
+  function autoMarkReviewed(t) {
+    try {
+      const e = (ledger || []).find((x) => x && String(x.t) === String(t));
+      if (!e) return false;
+      e.review_status = "reviewed";
+      persistLedger();
+      logError("[AUTO] round t=" + t + " marked REVIEWED \u2014 it may now enter retrieval injection. " +
+        autoUnreviewedCount() + " unreviewed remain.");
+      return true;
+    } catch (_) { return false; }
+  }
+  function autoMarkAllReviewed() {
+    try {
+      let n = 0;
+      (ledger || []).forEach((e) => {
+        if (e && e.dispatch_source === "auto" && e.review_status !== "reviewed") { e.review_status = "reviewed"; n++; }
+      });
+      if (n) { persistLedger(); logError("[AUTO] " + n + " auto round(s) marked REVIEWED in bulk."); }
+      else logError("[AUTO] nothing unreviewed.");
+      return n;
+    } catch (_) { return 0; }
+  }
+  try {
+    window.__rqMarkReviewed = autoMarkReviewed;
+    window.__rqMarkAllReviewed = autoMarkAllReviewed;
+    window.__rqUnreviewed = autoUnreviewedCount;
+  } catch (_) {}
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -10150,7 +10538,8 @@ roundData,
     // endogenous kinds rather than lumping them, since an audit round carries
     // injected evidence and a reconciliation round does not.
     const _endogenousKind = !_endogenous ? null
-      : (/^SURPRISE AUDIT:/.test(String(query || "").trim()) ? "OPERATOR-INJECTED-AUDIT"
+      : (_autoThisRound ? "AUTO-DISPATCHED"   // v4.7.0 — no human injected this one
+      : /^SURPRISE AUDIT:/.test(String(query || "").trim()) ? "OPERATOR-INJECTED-AUDIT"
       : (/^RECONCILIATION TARGET/.test(String(query || "").trim()) ? "OPERATOR-INJECTED-RECONCILIATION"
       : "OPERATOR-INJECTED"));
 
@@ -10190,19 +10579,11 @@ roundData,
       // budget, and no retrieval request is made at all.
       _noteRound = isOperatorNote(query);
       _indexicalRound = isIndexicalPrompt(query);
-      // v4.4.0 — CONFIRMATION rounds (Kimi's request). The operator is asking the
-      // council to confirm acceptance of a directive, NOT to re-open a debate.
-      // Scoring it for lexical convergence is what made a round where all three
-      // seats agreed read as DIVIDED because two attached footnotes. Like note
-      // and indexical rounds it bypasses adjudication — but unlike them it gets
-      // its OWN consensus state, because "the operator closed this" must never
-      // be stored as though the council had independently verified it.
-      _confirmationRound = confirmationEnabled() && isConfirmationRound(query);
-      if (_confirmationRound) {
-        logError("[CONFIRMATION] Operator confirmation round — adjudication and consensus scoring SKIPPED. " +
-          "Seat responses are recorded verbatim and tagged RESOLVED-BY-OPERATOR, which is NOT VERIFIED: " +
-          "it records that the operator closed the question, not that the council independently agreed.");
-      }
+      // SPEC-PS-F0 — one pattern scan of the raw query when armed; flag off is
+      // one localStorage read and a null. The tag is decided post-adjudication,
+      // never here. Zero awaits; runs after the governor gate, which stays first.
+      _fiatCandidate = fiatPreFilter(query);
+      _fiatShadow = null;
       // P7 F3 — predictions fire CONCURRENTLY and are NEVER awaited (R-P7-3).
       // Flag off: one localStorage read and nothing else. Note/indexical rounds
       // have no adjudication to predict, so they are excluded here AND at the
@@ -10363,6 +10744,11 @@ roundData,
           // Pillar VI — the Round Header. Additive spread: flag off => the key
           // is simply absent and the literal is byte-identical to v4.0.2.
           ...(_roundHeader ? { header: _roundHeader } : {}),
+          // v4.7.0 — additive, absent on every manual round, so the object is
+          // byte-identical when the scheduler never fired. UNWITNESSED is the
+          // consent record: this round has not been read by a human yet, and
+          // the retrieval filter enforces that.
+          ...(_autoThisRound ? { dispatch_source: "auto", review_status: "unwitnessed" } : {}),
         });
         // P7 F1 — vitals, fire-and-forget, BEFORE logInstitutionalMemory so the
         // rq:round-stored listener is registered before the event can fire.
@@ -10683,9 +11069,17 @@ roundData,
         ? "\u26A0 [FULLTEXT] Targeted full-text request ON — seats may ask for up to " + RQ_FT_MAX_ROUNDS +
           " rounds verbatim via [REQUEST_FULLTEXT: n]. Rounds run with this on carry an extra instruction and are not prompt-identical to rounds without it."
         : "[FULLTEXT] Targeted full-text request OFF — seats see clipped ledger excerpts only.");
-      logError(confirmationEnabled()
-        ? "[CONFIRMATION] Confirmation rounds ON — \"Confirm:\" prompts bypass adjudication and tag RESOLVED-BY-OPERATOR (not VERIFIED)."
-        : "[CONFIRMATION] Confirmation rounds OFF — every prompt is adjudicated.");
+      logError(autoDispatchEnabled()
+        ? "\u25C6 [AUTO] Autonomous dispatch ON — up to " + RQ_AUTO_MAX_PER_DAY + "/day, jittered, in-browser. " +
+          autoUnreviewedCount() + " unreviewed auto round(s); scheduler pauses at " + RQ_AUTO_BACKLOG_STOP + ". " +
+          "UNWITNESSED rounds are excluded from retrieval until reviewed. Amends R-P7-10 by operator instruction: consent moves from pre-dispatch to pre-influence."
+        : "[AUTO] Autonomous dispatch OFF — self-prompts wait for you to inject them.");
+      logError(fiatRecognitionMode() === "off"
+        ? "[FIAT] recognition OFF — directive rounds tag through the legacy pipeline only."
+        : "[FIAT] recognition " + fiatRecognitionMode().toUpperCase() +
+          (fiatRecognitionMode() === "shadow"
+            ? " — operator-directive rounds are detected and LOGGED (\u25C7 FIAT would-tag) with full evidence; written status unchanged. Promote to 'live' once the shadow lines check out."
+            : " — acknowledged operator-directive rounds tag RESOLVED-BY-OPERATOR (terminal). Without rq-ps-f0-operator-fiat.sql the insert degrades to \"resolved\", one drawer line, round never lost."));
       logError(claimDiffEnabled()
         ? "\u25C7 [CLAIM DIFF] ON (shadow) — scored predictions also get a restated/extended/replaced/contradicted/added breakdown beside the scalar. Zero API cost; error_score and surprise are untouched."
         : "[CLAIM DIFF] OFF — scalar only.");
