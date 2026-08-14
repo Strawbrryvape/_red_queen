@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.7.1-falsifier-gate1";
+  const RQ_BUILD = "v4.7.3-injection-receipts";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -193,6 +193,11 @@
   //   OFF : Kimi seat = OpenRouter free-tier walk, base weight 0.5, exactly as
   //         it has been running. No Moonshot request is made, so no spend.
   function kimiK3Enabled() { return localStorage.getItem("rq_kimi_k3") === "on"; }
+  // v4.7.2 — Claude spend gate, same shape as the K3 gate above. DEFAULT ON when
+  // a key is present: unlike K3 (which was added mid-project and had to opt in),
+  // a configured Anthropic key means the operator already chose to spend. The
+  // gate exists to stand the seat DOWN without deleting the key.
+  function claudePaidEnabled() { return localStorage.getItem("rq_claude_paid") !== "off"; }
 
   // The seat is occupied whenever a Moonshot key is present; this decides only
   // who answers for it.
@@ -201,7 +206,11 @@
   }
   // ---------- Understudy state (Groq filling Claude's seat, Cerebras filling Gemini's) ----------
   function groqUnderstudy() {
-    return !settings.keyClaude && !!settings.keyGroq;
+    // v4.7.2 — a paid seat stood down is understudied exactly like an absent one.
+    // This predicate feeds the seat labels and the Round Header receipts, so if
+    // it disagreed with the selection sites below the header would record a
+    // roster that never answered.
+    return (!settings.keyClaude || !claudePaidEnabled()) && !!settings.keyGroq;
   }
   function cerebrasUnderstudy() {
     return !settings.keyGemini && !!settings.keyCerebras;
@@ -4246,8 +4255,17 @@ roundData,
         ["fulltextRetrieveToggle", "rq_fulltext_retrieve", "P6: FULL-TEXT REQUEST",
          "\u26A0 SEATS READ THIS. A seat may write [REQUEST_FULLTEXT: 173, 174] and those rounds are injected VERBATIM on the next round. Explicit request only \u2014 never heuristic. Capped at 3 rounds / 6000 chars.",
          "Seats cannot request full text; context carries clipped ledger excerpts only."],
+        // v4.7.2 — LITERALS, NOT CONSTANTS. The first version interpolated
+        // RQ_AUTO_MAX_PER_DAY and RQ_AUTO_BACKLOG_STOP here. Both are `const`
+        // declared ~6,000 lines BELOW this point, and `const` is in the temporal
+        // dead zone until its declaration is evaluated — so building this array
+        // threw a ReferenceError, the rack's forEach never ran, and EVERY
+        // SETTINGS BUTTON AFTER THE SIXTH VANISHED. Function declarations hoist;
+        // const does not, which is why fiatRecognitionMode() below is safe and
+        // this was not. Keep the numbers literal here, or move the constants
+        // above the rack.
         ["autoDispatchToggle", "rq_auto_dispatch", "AUTO-DISPATCH",
-         "\u26A0 THE COUNCIL RUNS ITSELF. Up to " + RQ_AUTO_MAX_PER_DAY + " self-generated prompts per day, jittered, in-browser only, never while busy or hidden or while the Governor reports distress. Rounds are tagged UNWITNESSED and CANNOT enter retrieval until you mark them reviewed. Pauses at " + RQ_AUTO_BACKLOG_STOP + " unreviewed.",
+         "\u26A0 THE COUNCIL RUNS ITSELF. Up to 4 self-generated prompts per day, jittered, in-browser only, never while busy or hidden or while the Governor reports distress. Rounds are tagged UNWITNESSED and CANNOT enter retrieval until you mark them reviewed. Pauses at 3 unreviewed.",
          "No autonomous rounds. Self-prompts wait in the banner for you to inject."],
         ["fiatToggle", "rq_fiat_recognition", "PS: FIAT RECOGNITION", "", "",
          { read: () => fiatRecognitionMode(), cycle: [
@@ -4390,6 +4408,38 @@ roundData,
       };
       paintK3();
       f2.parentNode.insertBefore(k3, f2.nextSibling);
+      // v4.7.2 — Claude spend gate, sitting next to K3 so both metered seats are
+      // in one place with their live state on the button rather than assumed.
+      // OFF does not remove the seat: Groq understudies it, so the council stays
+      // three-wide and only the model behind the label changes.
+      const cp = document.createElement("button");
+      cp.id = "claudePaidToggle";
+      cp.type = "button";
+      cp.className = saveSettingsBtn.className || "";
+      cp.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const paintCP = () => {
+        cp.textContent = !settings.keyClaude
+          ? "CLAUDE SEAT: no key (Groq understudy)"
+          : (claudePaidEnabled()
+            ? "CLAUDE SEAT: ANTHROPIC (paid \u2014 spending credits)"
+            : "CLAUDE SEAT: FREE TIER (Groq understudy)");
+      };
+      paintCP();
+      k3.parentNode.insertBefore(cp, k3.nextSibling);
+      cp.addEventListener("click", () => {
+        if (!settings.keyClaude) {
+          logError("[CLAUDE] No Anthropic key configured — the seat is already on the Groq understudy. " +
+            "Add a key in Settings to enable the paid seat.");
+          return;
+        }
+        try {
+          localStorage.setItem("rq_claude_paid", claudePaidEnabled() ? "off" : "on");
+          paintCP();
+          logError("[CLAUDE] Claude seat \u2192 " + (claudePaidEnabled()
+            ? "ANTHROPIC (PAID — this session spends Anthropic credits). Note: with PREDICTIONS on this is +1 paid call per round on top of the answer."
+            : "FREE TIER (Groq understudy). The key is kept, the seat still answers, and only the model behind the label changes — so rounds from here are not provider-comparable to paid rounds."));
+        } catch (_) {}
+      });
       // v3.5.5 — FLOOR READOUT. The retrieval diagnostic has been writing
       // best_similarity and vector_candidates to Supabase since v3.5.3, and the
       // only way to read it was SQL on a desktop. The floor decision is the one
@@ -4982,7 +5032,7 @@ roundData,
         logError("[K3] Kimi K3 is OFF and no OpenRouter key is set — the Kimi seat has no free occupant and sits out this round. Settings \u2192 KIMI K3 to enable it, or add an OpenRouter key.");
       }
     }
-    if (settings.keyClaude) {
+    if (settings.keyClaude && claudePaidEnabled()) {
       calls.push({ name: "claude", fn: callClaude });
     } else if (settings.keyGroq) {
       calls.push({ name: "claude", fn: callGroq }); // Groq understudies Claude's seat (free tier)
@@ -9358,7 +9408,7 @@ roundData,
       if (kimiK3Enabled()) seats.push({ name: "kimi", fn: callKimi });
       else if (settings.keyOpenRouter) seats.push({ name: "kimi", fn: (q) => callOpenRouter(q, "kimi") });
     }
-    if (settings.keyClaude) seats.push({ name: "claude", fn: callClaude });
+    if (settings.keyClaude && claudePaidEnabled()) seats.push({ name: "claude", fn: callClaude });
     else if (settings.keyGroq) seats.push({ name: "claude", fn: callGroq });
     return seats;
   }
@@ -10060,7 +10110,34 @@ roundData,
   // the point of use: nothing from model output reaches a read except integers.
   const RQ_FT_RE = /\[REQUEST_FULLTEXT\s*:\s*([^\]\n]{1,200})\]/i;
 
-  let _ftPending = [];   // round ids requested last round, consumed by the next compose
+  // v4.7.3 — PERSISTED. As a bare module variable this was lost on any reload
+  // between the request and the next dispatch, and because ftBuildBlock returns
+  // "" on an empty queue, nothing was logged either: a seat's request could
+  // vanish with no trace on either side. That is the silent-loss class this
+  // project keeps finding, and it is the likeliest explanation for the Kimi
+  // seat's round-22 complaint.
+  const RQ_FT_PEND_K = "rq_ft_pending";
+  function ftPendingGet() {
+    try { const v = JSON.parse(localStorage.getItem(RQ_FT_PEND_K) || "[]"); return Array.isArray(v) ? v : []; }
+    catch (_) { return []; }
+  }
+  function ftPendingSet(ids) {
+    try {
+      if (ids && ids.length) localStorage.setItem(RQ_FT_PEND_K, JSON.stringify(ids));
+      else localStorage.removeItem(RQ_FT_PEND_K);
+    } catch (_) {}
+  }
+
+  // Cheap, dependency-free digest. NOT cryptographic — its job is to let a seat
+  // check that the block it received is the block that was sent, and to make a
+  // truncation or a substitution visible. A real hash would need the async
+  // SubtleCrypto path and this sits on the compose path.
+  function ftDigest(s) {
+    let h = 2166136261;
+    const str = String(s || "");
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return ("00000000" + (h >>> 0).toString(16)).slice(-8);
+  }
 
   function fulltextRetrieveEnabled() { return localStorage.getItem("rq_fulltext_retrieve") === "on"; }
 
@@ -10099,9 +10176,10 @@ roundData,
   // Builds the block injected into the NEXT round. Returns "" when there is
   // nothing to inject, so the caller can concatenate unconditionally.
   async function ftBuildBlock() {
-    if (!fulltextRetrieveEnabled() || !_ftPending.length) return "";
-    const asked = _ftPending.slice();
-    _ftPending = [];                       // consume once; a request is not standing
+    const pending = ftPendingGet();
+    if (!fulltextRetrieveEnabled() || !pending.length) return "";
+    const asked = pending.slice();
+    ftPendingSet([]);                      // consume once; a request is not standing
     const wanted = asked.slice(0, RQ_FT_MAX_ROUNDS);
     if (asked.length > wanted.length) {
       logError("[FULLTEXT] " + asked.length + " round(s) requested, cap is " + RQ_FT_MAX_ROUNDS +
@@ -10135,15 +10213,39 @@ roundData,
       logError("[FULLTEXT] round(s) " + noFull.join(", ") + " have no verbatim copy on this device — " +
         "injected the clipped ledger text instead and labelled it as such.");
     }
-    if (!parts.length) return "";
-    let block = "[FULL TEXT — requested by a seat last round, verbatim]\n\n" + parts.join("\n\n---\n\n");
-    if (block.length > RQ_FT_MAX_CHARS) {
-      block = block.slice(0, RQ_FT_MAX_CHARS - 1) + "\u2026";
-      logError("[FULLTEXT] block truncated at " + RQ_FT_MAX_CHARS + " chars.");
+    // v4.7.3 — NON-DELIVERY RECEIPT. Every requested round that produced nothing
+    // is named here, in the block, where the requesting seat can read it. The
+    // half of "did it arrive" that actually matters is the NO, and previously a
+    // no produced silence on both sides.
+    if (!parts.length) {
+      if (asked.length) {
+        const none = "[INJECTION RECEIPT] requested round(s) " + asked.join(", ") +
+          " \u2014 NOT DELIVERED. " +
+          (missing.length ? "Out of ledger range: " + missing.join(", ") + ". " : "") +
+          "Nothing was attached to this prompt. Do not infer content you were not given.";
+        logError("[FULLTEXT] " + none);
+        return "\n\n" + none;
+      }
+      return "";
     }
-    logError("[FULLTEXT] injecting " + parts.length + " requested round(s) verbatim (" +
-      block.length + " chars, exempt from the shared memory budget by ruling, hard-capped at " +
-      RQ_FT_MAX_CHARS + ").");
+    let body = parts.join("\n\n---\n\n");
+    let truncated = false;
+    const cap = RQ_FT_MAX_CHARS - 320;     // leave room for the receipt header
+    if (body.length > cap) { body = body.slice(0, cap - 1) + "\u2026"; truncated = true; }
+    // The receipt goes INTO the block, not only into the drawer. A
+    // machine-checkable acknowledgment the requester cannot see is not an
+    // acknowledgment — it is a note the operator can read about whether the seat
+    // got its mail. Round ids, character count and a digest, exactly as asked.
+    const receipt = "[INJECTION RECEIPT] delivered=" + wanted.join(",") +
+      (missing.length ? " | not_found=" + missing.join(",") : "") +
+      (noFull.length ? " | clipped_copy_only=" + noFull.join(",") : "") +
+      (asked.length > wanted.length ? " | deferred=" + asked.slice(RQ_FT_MAX_ROUNDS).join(",") : "") +
+      " | chars=" + body.length + " | digest=" + ftDigest(body) +
+      (truncated ? " | TRUNCATED at the " + RQ_FT_MAX_CHARS + "-char cap" : "") +
+      " | lag=1 round (requests are fulfilled on the round AFTER they are made)";
+    const block = "[FULL TEXT \u2014 requested by a seat last round, verbatim]\n" +
+      receipt + "\n\n" + body;
+    logError("[FULLTEXT] " + receipt);
     return "\n\n" + block;
   }
 
@@ -10153,7 +10255,9 @@ roundData,
   const RQ_FT_INSTRUCTION =
     "If a round in your context is summarized too briefly for you to check what was actually argued, " +
     "you may request its full text by writing [REQUEST_FULLTEXT: <round numbers>] on its own line. " +
-    "Up to " + RQ_FT_MAX_ROUNDS + " rounds; they will be supplied verbatim on the NEXT round. " +
+    "Up to " + RQ_FT_MAX_ROUNDS + " rounds; they are supplied verbatim on the NEXT round, not this one. " +
+    "Every fulfilment carries an [INJECTION RECEIPT] line with the round ids, character count and a digest \u2014 " +
+    "and a request that could not be filled gets a NOT DELIVERED receipt, so you never have to infer whether it arrived. " +
     "Request only when the summary is genuinely insufficient \u2014 do not request by default.";
 
   // ---------- The Conformity Audit (operator-invoked, zero API cost) ----------
@@ -10689,7 +10793,7 @@ roundData,
           try {
             const _ftAsk = ftScanRequests(allAnswers);
             if (_ftAsk.length) {
-              _ftPending = _ftAsk;
+              ftPendingSet(_ftAsk);
               logError("[FULLTEXT] seat(s) requested round(s) " + _ftAsk.join(", ") +
                 " — will be injected verbatim on the next round.");
             }
