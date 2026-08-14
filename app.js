@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.7.3-injection-receipts";
+  const RQ_BUILD = "v4.7.4-glm-headroom";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -155,7 +155,33 @@
   // was logged as HOLD in adjudication. That is the 2026-07-17 disappearance
   // replayed. GLM 4.7 is a reasoning model; 4000 was never headroom for one.
   // Edit 12 fixes the floor so a truncation stops being fatal either way.
-  const CEREBRAS_MAX_TOKENS = 8000;
+  // v4.7.4 (2026-08-14): 8000 -> 16000. FOURTH observed truncation, and the
+  // first since the Claude seat went primary — GLM now has to hold its own
+  // against two paid reasoners rather than one.
+  //
+  // BUT DOUBLING ALREADY FAILED ONCE (4000 -> 8000 on 07-26, truncating again
+  // now), so raising it again without a diagnostic is a guess. Two hypotheses
+  // fit the evidence equally and they need different fixes:
+  //
+  //   UNBOUNDED     — GLM expands its reasoning to fill whatever budget it is
+  //                   given. Raising the ceiling never helps; the seat has to
+  //                   be recast per the standing eviction ruling.
+  //   PROPORTIONAL  — GLM's reasoning scales with PROMPT length, and the
+  //                   composed prompt has grown from ~3,000 chars to 8,600+ as
+  //                   the falsifier ask, the full-text channel, receipts and a
+  //                   larger memory block came on. 8000 was adequate at 3k and
+  //                   is not at 8.6k. Raising helps, and so does trimming.
+  //
+  // The instrumentation below distinguishes them: if completion_tokens lands at
+  // or near the ceiling on EVERY truncation regardless of prompt size, it is
+  // unbounded. If it tracks prompt length, it is proportional. Two truncations
+  // with their numbers logged settles a question that has been guessed at three
+  // times.
+  //
+  // Cost note: Cerebras free tier is quota-limited per day, not per token, and
+  // a truncated round wastes its whole budget anyway — so a higher ceiling that
+  // produces an answer is cheaper than a lower one that produces nothing.
+  const CEREBRAS_MAX_TOKENS = 16000;
 
   // ---------- Kimi primary seat (Moonshot) ----------
   // moonshot-v1-8k is retired: unavailable to new accounts since 2026-07-17 and
@@ -3501,6 +3527,12 @@ roundData,
     if (res.status === 404) throw new Error(`Cerebras model ${CEREBRAS_MODEL} unavailable (404) — free catalog churned; swap CEREBRAS_MODEL for a current model from cloud.cerebras.ai`);
     if (!res.ok) throw new Error(`Cerebras HTTP ${res.status}${res.status === 429 ? " — free-tier rate limit; circuit breaker will manage" : ""}`);
     const data = await res.json();
+    // v4.7.4 — capture what the provider actually reports BEFORE any stripping.
+    // finish_reason and usage are the only evidence that separates "thinks past
+    // any budget" from "thinks in proportion to the prompt", and both were being
+    // discarded on every one of the four truncations so far.
+    const _cbFinish = data.choices?.[0]?.finish_reason || "unknown";
+    const _cbUsage = data.usage || {};
     let text = data.choices?.[0]?.message?.content || "";
     // Reasoning models (GLM, Qwen) may wrap chain-of-thought in <think>
     // tags — strip it so only the final answer reaches consensus scoring.
@@ -3512,7 +3544,23 @@ roundData,
     text = text.trim();
     // v2.7.2: an empty answer after stripping is a diagnosis, not a
     // mystery — fail loudly instead of returning "" ("unknown error").
-    if (!text) throw new Error(`Cerebras ${CEREBRAS_MODEL} spent its entire token budget reasoning and never produced a final answer (truncated mid-<think>). Headroom is ${CEREBRAS_MAX_TOKENS} — if this recurs, raise it or shorten prompts.`);
+    if (!text) {
+      // v4.7.4 — the diagnostic now names WHICH hypothesis the numbers support,
+      // instead of only telling the operator to raise a ceiling that has already
+      // been raised twice.
+      const used = _cbUsage.completion_tokens;
+      const promptChars = String(query || "").length;
+      const atCeiling = typeof used === "number" && used >= CEREBRAS_MAX_TOKENS * 0.95;
+      logError("[CEREBRAS] truncation diagnostic \u2014 finish_reason=" + _cbFinish +
+        " | completion_tokens=" + (used == null ? "not reported" : used) +
+        "/" + CEREBRAS_MAX_TOKENS +
+        " | prompt_tokens=" + (_cbUsage.prompt_tokens == null ? "not reported" : _cbUsage.prompt_tokens) +
+        " | prompt_chars=" + promptChars +
+        (used == null ? " \u2014 provider reported no usage; hypothesis undecidable from this round."
+          : atCeiling ? " \u2014 burned the WHOLE ceiling. Consistent with an UNBOUNDED reasoner; if this repeats at a raised ceiling regardless of prompt size, raising again will not help and the seat should be recast."
+          : " \u2014 stopped BELOW the ceiling, so the ceiling is not what bound it. Look at prompt size or the provider cutting the stream."));
+      throw new Error(`Cerebras ${CEREBRAS_MODEL} spent its entire token budget reasoning and never produced a final answer (truncated mid-<think>). Headroom is ${CEREBRAS_MAX_TOKENS}, prompt was ${promptChars} chars — see the [CEREBRAS] diagnostic line for which hypothesis the numbers support.`);
+    }
     return text;
   }
 
