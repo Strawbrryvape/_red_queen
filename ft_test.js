@@ -6,7 +6,15 @@ const fs=require("fs"),src=fs.readFileSync("app.js","utf8");
 const grab=(re)=>{const m=src.match(re);if(!m)throw new Error("lift failed "+re);return m[0];};
 eval(grab(/  const RQ_FT_MAX_ROUNDS[\s\S]*?const RQ_FT_RE = .*/) +
      "\nglobalThis.RQ_FT_RE=RQ_FT_RE;globalThis.RQ_FT_MAX_ROUNDS=RQ_FT_MAX_ROUNDS;globalThis.RQ_FT_MAX_CHARS=RQ_FT_MAX_CHARS;");
-eval(grab(/  const RQ_CONFIRMATION_RE = [\s\S]*?\n  \}/) + "\nglobalThis.isConfirmationRound=isConfirmationRound;");
+eval(grab(/  function fiatPreFilter\(query\) \{[\s\S]*?\n  \}/).replace("function fiatPreFilter","globalThis.__fpf = function fiatPreFilter") +
+     "\n" + grab(/  const FIAT_DIRECTIVE_PATTERNS = \[[\s\S]*?\];/) + "\nglobalThis.FIAT_DIRECTIVE_PATTERNS=FIAT_DIRECTIVE_PATTERNS;");
+// fiatPreFilter reads module state and localStorage; re-implement the MATCHING
+// rule alone, from the frozen pattern list lifted above, to test anchoring.
+globalThis.fiatMatch = (q) => {
+  const lines = String(q||"").split("\n");
+  for (let i=0;i<lines.length;i++){ const l=lines[i].trimStart().toLowerCase(); if(!l) continue;
+    for (const pat of FIAT_DIRECTIVE_PATTERNS) if (l.indexOf(pat)===0) return {pattern:pat,line:i};
+  } return null; };
 
 let p=0,f=0;
 const t=(n,g,w)=>{const ok=JSON.stringify(g)===JSON.stringify(w);ok?(p++,console.log("  PASS  "+n)):(f++,console.log("  FAIL  "+n+"  got "+JSON.stringify(g)+" want "+JSON.stringify(w)));};
@@ -50,26 +58,51 @@ tt("_ftPending is cleared on use", /_ftPending = \[\];\s+\/\/ consume once/.test
 tt("injection happens on the NEXT round, not the requesting one",
    /will be injected verbatim on the next round/.test(src));
 
-console.log("\n--- CONFIRMATION rounds ---");
-tt("'Confirm:' opener detected", isConfirmationRound("Confirm: we go with Kimi's build order."));
-tt("'Council, confirm' detected", isConfirmationRound("Council, confirm you accept this."));
-tt("an ordinary question is not a confirmation", !isConfirmationRound("Should we lower the floor?"));
-tt("the word confirm mid-sentence does not trigger",
-   !isConfirmationRound("Can you confirm whether fog forms at night?"));
-tt("bypasses adjudication like note rounds", /if \(_confirmationRound\) \{/.test(src));
-tt("carries its own trust literal", /trust: "resolved-by-operator"/.test(src));
-tt("that literal is NOT the 'resolved' branch",
-   src.indexOf('result.trust === "resolved-by-operator"') < src.indexOf('} else if (result.trust === "resolved")'));
-tt("the banner says plainly it is not verified",
-   /NOT a council verdict and NOT verified/.test(src));
-tt("seat caveats are preserved rather than scored as disagreement",
-   /Caveats attached by seats are preserved, /.test(src) && /not scored as disagreement/.test(src));
+console.log("\n--- SPEC-PS-F0: directive detection is LINE-ANCHORED ---");
+tt("message-initial directive matches", !!fiatMatch("We will adopt the merged pipeline."));
+tt("standalone-line directive matches", !!fiatMatch("Some preamble.\nAdopt the capture-trace-render order."));
+tt("MID-SENTENCE mention never matches",
+   !fiatMatch("The seats keep disagreeing — should we override the plan?"));
+tt("a question containing 'adopt' mid-line never matches",
+   !fiatMatch("Do you think we should adopt this?"));
+tt("leading whitespace is tolerated", !!fiatMatch("   operator fiat: proceed."));
+
+console.log("\n--- the four-test gate, and where it runs ---");
+tt("the gate exists", /function fiatAcknowledgeTest\(/.test(src));
+tt("it runs on the WOULD-BE-DIVIDED path, after adjudication",
+   src.indexOf("const adj = await runAdjudication") < src.indexOf("if (_fiatCandidate && fiatRecognitionMode()"));
+tt("a COUNTED REFUTE fails the gate",
+   /v\.counted && v\.verdict === "refute"/.test(src) && /real dissent, staying divided/.test(src));
+tt("NO verdict stream fails the gate (unverifiable != absent)",
+   /acknowledgment UNVERIFIABLE, staying divided/.test(src));
+tt("a thin first line fails the gate", /acknowledgment unreadable, staying divided/.test(src));
+tt("the asymmetry is stated in the source",
+   /False negatives are safe; false positives hide real\s+\/\/ dissent|false positives hide real/.test(src));
+
+console.log("\n--- v4.4.0's bypass is GONE (it could tag over a refute) ---");
+tt("no _confirmationRound anywhere", !/_confirmationRound/.test(src));
+tt("no rq_confirmation flag", !/rq_confirmation/.test(src));
+tt("the removal is documented, not silent", /bypass that stood here has been REMOVED/.test(src));
+
+console.log("\n--- the tag never merges with adjudication's 'resolved' ---");
+tt("separate trust literal", /trust: "resolved-by-operator"/.test(src));
+tt("separate TRUST_COLORS entry", /"resolved-by-operator": "#0f766e"/.test(src));
+tt("separate p2TrustTag case", /case "resolved-by-operator": return "RESOLVED-BY-OPERATOR"/.test(src));
+tt("P4 records it rather than scoring fragility over an empty agreeing set",
+   /verdict: "RESOLVED-BY-OPERATOR"/.test(src));
+tt("seat stats exclude it from the consensus bucket",
+   /not consensus — no bucket/.test(src));
+
+console.log("\n--- default is SHADOW, not off and not live ---");
+tt("unset key resolves to shadow", /\(v === "off" \? "off" : "shadow"\)/.test(src));
+tt("shadow logs a would-tag and changes nothing", /WOULD tag RESOLVED-BY-OPERATOR/.test(src));
+tt("shadow rides as an additive key only", /\.\.\.\(_fiatShadow \? \{ fiat: _fiatShadow \} : \{\}\)/.test(src));
 
 console.log("\n--- both flags default OFF and say so at boot ---");
 tt("rq_fulltext_retrieve defaults off",
    /localStorage\.getItem\("rq_fulltext_retrieve"\) === "on"/.test(src));
-tt("rq_confirmation defaults off",
-   /localStorage\.getItem\("rq_confirmation"\) === "on"/.test(src));
+tt("rq_fiat_recognition is tri-state, not a binary flag",
+   /localStorage\.getItem\("rq_fiat_recognition"\)/.test(src) && !/rq_fiat_recognition"\) === "on"/.test(src));
 tt("full-text flag warns it changes seat context",
    /SEATS READ THIS[\s\S]{0,200}REQUEST_FULLTEXT/.test(src));
 
