@@ -81,5 +81,22 @@ tt("v3.9.9 scored below the Gate 1 floor (false PARALLEL)", before < 0.12);
 tt("v3.9.10 clears the Gate 1 floor", after >= 0.12);
 tt("dissenting seat still compared on its real line", csFirstLine(cla).startsWith("I support option 2"));
 
+console.log("\n--- v4.7.1: the FALSIFIER line is not a position ---");
+// v4.1.0's composer-appended falsifier ask made every seat open with
+// "FALSIFIER: ...", so Gate 1 began comparing conditionals about what would
+// change a seat's mind instead of the positions themselves. Live 2026-08-13:
+// three substantive answers scored 0.118 against a 0.12 floor — a false
+// PARALLEL by two thousandths. Same class as the banner defect this function
+// was written for, reintroduced by a later feature.
+tt("a FALSIFIER opener is skipped", csIsBannerLine("FALSIFIER: If X were shown, I would concede the point entirely."));
+tt("lowercase and spaced variants too", csIsBannerLine("falsifier : if X then Y"));
+t("csFirstLine returns the POSITION, not the falsifier",
+  csFirstLine({text:"FALSIFIER: If X were demonstrated I would concede.\n\nMy position is that the floor should stay at 0.600."}),
+  "My position is that the floor should stay at 0.600.");
+tt("a position merely MENTIONING falsifiers is not skipped",
+  !csIsBannerLine("The falsifier discipline is what keeps this council honest."));
+t("falsifier-only text still falls back rather than returning nothing",
+  csFirstLine({text:"FALSIFIER: If X then Y."}), "FALSIFIER: If X then Y.");
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
