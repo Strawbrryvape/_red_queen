@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.8.1-gemini-gate";
+  const RQ_BUILD = "v4.8.2-gemini-diag";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -657,12 +657,33 @@
 
   // ---------- Live Council ----------
   async function callGemini(query) {
+    // v4.8.2 — TWO CHANGES, both prompted by a fallback nobody could diagnose.
+    //
+    // 1. KEY MOVES FROM THE QUERY STRING TO THE x-goog-api-key HEADER. The
+    //    operator's theory was a key-FORMAT mismatch; that theory is wrong —
+    //    nothing in this file validates key format, the key was only ever
+    //    encodeURIComponent'd into a URL. But the header is the right method
+    //    regardless: a key in a query string lands in server logs, proxy logs
+    //    and browser history, and it is the documented alternative. Kimi uses
+    //    Authorization: Bearer and Claude uses x-api-key; only this seat was
+    //    putting its credential in a URL.
+    //
+    // 2. THE ERROR BODY IS NO LONGER DISCARDED. This threw
+    //    `Gemini HTTP ${status}` and dropped the JSON body Google returns —
+    //    which distinguishes an invalid key from a wrong project from a
+    //    retired model from an exhausted quota. Four different fixes, one
+    //    indistinguishable number. That is why this fallback could only be
+    //    guessed at, and it is the same reporting-layer class this project has
+    //    now found eight times: the mechanism worked, the message told nobody
+    //    anything.
     const res = await fetchWithRetry(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" +
-        encodeURIComponent(settings.keyGemini),
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": String(settings.keyGemini || ""),
+        },
         body: JSON.stringify({
           contents: [{ parts: [{ text: query }] }],
           generationConfig: { maxOutputTokens: MAX_TOKENS },
@@ -670,7 +691,22 @@
       },
       "Gemini"
     );
-    if (!res.ok) throw new Error(`Gemini HTTP ${res.status}${res.status === 429 ? " — rate limit persisted after retries; check quota/tier" : ""}`);
+    if (!res.ok) {
+      let detail = "";
+      try {
+        const body = await res.text();
+        const j = (() => { try { return JSON.parse(body); } catch (_) { return null; } })();
+        const msg = (j && j.error && (j.error.message || j.error.status)) || body;
+        detail = msg ? " \u2014 " + clip(String(msg).replace(/\s+/g, " ").trim(), 300) : "";
+      } catch (_) {}
+      logError("[GEMINI] HTTP " + res.status + detail +
+        (res.status === 400 ? " | 400 usually means an invalid or malformed key, or a bad request body."
+         : res.status === 403 ? " | 403 usually means the key is valid but not authorised for this API or project \u2014 check that the Generative Language API is enabled on the key's project."
+         : res.status === 404 ? " | 404 usually means the MODEL string is wrong or retired for this key. This build requests gemini-2.0-flash."
+         : res.status === 429 ? " | 429 is quota, not credentials."
+         : ""));
+      throw new Error(`Gemini HTTP ${res.status}${detail}${res.status === 429 ? " — rate limit persisted after retries; check quota/tier" : ""}`);
+    }
     const data = await res.json();
     return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
   }
