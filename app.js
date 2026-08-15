@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.8.3-gemini-chain";
+  const RQ_BUILD = "v4.8.4-gemini-503";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -721,9 +721,30 @@
         }
         break;
       }
-      // Only a 404 means "wrong model". Anything else is the key, the quota or
-      // the request, and walking the chain would repeat one failure three times.
-      if (res.status !== 404 || i === candidates.length - 1) break;
+      // v4.8.4 — 503 ADVANCES THE CHAIN TOO. The first version advanced only on
+      // 404, on the reasoning that everything else is about the key or the
+      // quota. That is right for 401/403 (credentials) and 429 (quota), which
+      // would fail identically on every model — but WRONG for 503, which is
+      // per-model capacity. Live 2026-08-15: gemini-3.7-flash returned "this
+      // model is currently experiencing high demand" and the seat fell all the
+      // way to Cerebras while two other Gemini models sat untried in the chain.
+      // A newest-first chain makes this likelier, not rarer: the newest model is
+      // the busiest.
+      //
+      // 404 = retired. 503 = busy. Both mean "try the next model". Everything
+      // else means "trying another model changes nothing".
+      const advances = (res.status === 404 || res.status === 503);
+      if (!advances || i === candidates.length - 1) break;
+      logError("[GEMINI] " + lastModel + " returned " + res.status +
+        (res.status === 503 ? " (busy)" : " (retired)") + " \u2014 trying " + candidates[i + 1] + ".");
+    }
+    // v4.8.4 — release the session cache when the remembered model fails in a
+    // way the chain could route around. Without this, one good round would pin
+    // the seat to a model that is busy for the rest of the session.
+    if (!res.ok && _geminiModelOk && (res.status === 404 || res.status === 503)) {
+      logError("[GEMINI] releasing cached model " + _geminiModelOk + " (HTTP " + res.status +
+        ") — the chain will be re-walked on the next round.");
+      _geminiModelOk = null;
     }
     if (!res.ok) {
       let detail = "";
@@ -739,6 +760,7 @@
          : res.status === 404 ? " | 404 on EVERY model in the chain (" + GEMINI_MODELS.join(", ") +
              "). All are retired or unavailable to this key \u2014 update GEMINI_MODELS."
          : res.status === 429 ? " | 429 is quota, not credentials."
+         : res.status === 503 ? " | 503 on EVERY model in the chain \u2014 Google-side capacity, not your key. The seat is correctly falling to its understudy; retry later."
          : ""));
       throw new Error(`Gemini HTTP ${res.status}${detail}${res.status === 429 ? " — rate limit persisted after retries; check quota/tier" : ""}`);
     }
