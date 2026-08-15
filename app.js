@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.8.0-ps-gates";
+  const RQ_BUILD = "v4.8.1-gemini-gate";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -224,6 +224,11 @@
   // a configured Anthropic key means the operator already chose to spend. The
   // gate exists to stand the seat DOWN without deleting the key.
   function claudePaidEnabled() { return localStorage.getItem("rq_claude_paid") !== "off"; }
+  // v4.8.1 — Gemini spend gate, completing the set. All three seats now have a
+  // paid primary and an off-switch, so any seat can be stood down to its free
+  // understudy without deleting a key. Same default-ON rule: a configured key
+  // means the operator already chose to spend.
+  function geminiPaidEnabled() { return localStorage.getItem("rq_gemini_paid") !== "off"; }
 
   // The seat is occupied whenever a Moonshot key is present; this decides only
   // who answers for it.
@@ -239,7 +244,10 @@
     return (!settings.keyClaude || !claudePaidEnabled()) && !!settings.keyGroq;
   }
   function cerebrasUnderstudy() {
-    return !settings.keyGemini && !!settings.keyCerebras;
+    // v4.8.1 — a paid seat stood down is understudied exactly like an absent one.
+    // Feeds the seat labels and Round Header receipts; if it disagreed with the
+    // selection sites the header would record a roster that never answered.
+    return (!settings.keyGemini || !geminiPaidEnabled()) && !!settings.keyCerebras;
   }
   const seatProvider = {}; // per-dispatch: name -> "primary" | "groq" | "cerebras" | "openrouter"
 
@@ -4474,6 +4482,37 @@ roundData,
       };
       paintCP();
       k3.parentNode.insertBefore(cp, k3.nextSibling);
+
+      // v4.8.1 — Gemini spend gate. Three metered seats, three buttons, each
+      // stating its live state rather than leaving it assumed.
+      const gp = document.createElement("button");
+      gp.id = "geminiPaidToggle";
+      gp.type = "button";
+      gp.className = saveSettingsBtn.className || "";
+      gp.style.cssText = "margin-top:10px;width:100%;opacity:0.85;";
+      const paintGP = () => {
+        gp.textContent = !settings.keyGemini
+          ? "GEMINI SEAT: no key (Cerebras understudy)"
+          : (geminiPaidEnabled()
+            ? "GEMINI SEAT: GOOGLE (paid \u2014 spending credits)"
+            : "GEMINI SEAT: FREE TIER (Cerebras understudy)");
+      };
+      paintGP();
+      cp.parentNode.insertBefore(gp, cp.nextSibling);
+      gp.addEventListener("click", () => {
+        if (!settings.keyGemini) {
+          logError("[GEMINI] No Google key configured — the seat is already on the Cerebras understudy. " +
+            "Add a key in Settings to enable the paid seat.");
+          return;
+        }
+        try {
+          localStorage.setItem("rq_gemini_paid", geminiPaidEnabled() ? "off" : "on");
+          paintGP();
+          logError("[GEMINI] Gemini seat \u2192 " + (geminiPaidEnabled()
+            ? "GOOGLE (PAID — this session spends Google credits). With all three seats on primaries, FIELD SKEW should stop firing on provisioning and COUNTERSTAMP gate 3 can finally receive data for the first time."
+            : "FREE TIER (Cerebras understudy). The key is kept and the seat still answers, but rounds from here are not provider-comparable to paid rounds."));
+        } catch (_) {}
+      });
       cp.addEventListener("click", () => {
         if (!settings.keyClaude) {
           logError("[CLAUDE] No Anthropic key configured — the seat is already on the Groq understudy. " +
@@ -5064,7 +5103,7 @@ roundData,
   async function runLiveCouncil(query) {
     _govAdjUnavailable = 0;   // P7 F1 — per-round edge-error instrumentation
     const calls = [];
-    if (settings.keyGemini) {
+    if (settings.keyGemini && geminiPaidEnabled()) {
       calls.push({ name: "gemini", fn: callGemini });
     } else if (settings.keyCerebras) {
       calls.push({ name: "gemini", fn: callCerebras }); // Cerebras understudies Gemini's seat (free tier)
@@ -5153,7 +5192,9 @@ roundData,
         }
         // Cerebras as mid-chain failover for the Gemini seat (only when a
         // real Gemini key holds the seat — otherwise Cerebras IS the primary)
-        if (c.name === "gemini" && settings.keyGemini && settings.keyCerebras) {
+        // v4.8.1 — geminiPaidEnabled() added: when the seat is stood down,
+        // Cerebras IS the primary and must not also be its own failover.
+        if (c.name === "gemini" && settings.keyGemini && geminiPaidEnabled() && settings.keyCerebras) {
           chain.push({
             tag: "cerebras",
             run: callCerebras,
@@ -9168,7 +9209,7 @@ roundData,
     if (settings.keyGroq)       return { name: "groq (free tier)",   fn: callGroq };
     if (settings.keyCerebras)   return { name: "cerebras (free tier)", fn: callCerebras };
     if (settings.keyOpenRouter) return { name: "openrouter (walk)",  fn: (q) => callOpenRouterWalk(q, "claude") };
-    if (settings.keyGemini)     return { name: "gemini (PAID)",      fn: callGemini };
+    if (settings.keyGemini && geminiPaidEnabled()) return { name: "gemini (PAID)", fn: callGemini };
     if (settings.keyKimi)       return { name: "kimi (PAID)",        fn: callKimi };
     if (settings.keyClaude)     return { name: "claude (PAID)",      fn: callClaude };
     return null;
@@ -9555,7 +9596,7 @@ roundData,
   // MINUS the failover-chain wrapper. A prediction is one best-effort call.
   function predictionSeats() {
     const seats = [];
-    if (settings.keyGemini) seats.push({ name: "gemini", fn: callGemini });
+    if (settings.keyGemini && geminiPaidEnabled()) seats.push({ name: "gemini", fn: callGemini });
     else if (settings.keyCerebras) seats.push({ name: "gemini", fn: callCerebras });
     if (settings.keyKimi) {
       if (kimiK3Enabled()) seats.push({ name: "kimi", fn: callKimi });
@@ -10280,6 +10321,27 @@ roundData,
   //
   // R-PS-11 does not cover this. K3 ruled it must, and gated her experiments on
   // it. Any capture path MUST consult this before writing a prompt anywhere.
+  // ===== PS GATE ITEM 2 (K3, 2026-08-14) — STORAGE OF RECORD FOR THE PS STORES.
+  //
+  // R-PS-5 puts rq_snapshots_v1, rq_derivations_v1 and rq_graph_cache_v1 in
+  // IndexedDB. That collides with Spine Decision 1: Supabase is the
+  // write-of-record and IndexedDB is a DISPOSABLE CACHE you wipe and rehydrate.
+  // A disposable cache cannot be the home of an immutable audit record — the
+  // 2026-08-07 amnesia session is the proof, where a single unconfirmed New
+  // Session emptied a browser ledger and only Supabase still had the rounds.
+  //
+  // K3's ruling: Supabase is the record; IndexedDB is the fast local replica.
+  // Declared here as a binding constant BEFORE any of the three stores exist, so
+  // F1/F2/F3 cannot be written against the wrong assumption and then need
+  // migrating. There is no code to move yet — that is exactly why this is cheap
+  // now and expensive later.
+  //
+  // The write shape each store must follow is already proven by v4.7.0's
+  // local-first path: write local, mirror durably, never gate the round on an
+  // ACK, reconcile via a pending queue, Supabase wins on drift.
+  const PS_STORAGE_OF_RECORD = "supabase";      // IndexedDB is a replica, never the record
+  const PS_LOCAL_IS_DISPOSABLE = true;          // must survive being wiped and rehydrated
+
   const PS_NEVER_SNAPSHOT = [/^SURPRISE AUDIT:/i];
   function psSnapshotExcluded(prompt) {
     try {
