@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.8.2-gemini-diag";
+  const RQ_BUILD = "v4.8.3-gemini-chain";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -656,6 +656,24 @@
   }
 
   // ---------- Live Council ----------
+  // v4.8.3 — GEMINI MODEL CHAIN. gemini-2.0-flash was retired 2026-03-31 and
+  // this file had it hardcoded, so the seat had been silently falling to
+  // Cerebras on every round since — a paid primary that could never answer,
+  // reported only as "Gemini primary failed" with a bare status code.
+  //
+  // Swapping one hardcoded string for another repeats the mistake. Model
+  // retirement is a recurring event, not a one-off, so the seat now walks a
+  // chain exactly as the OpenRouter seats do: a 404 (retired / not available to
+  // this key) advances to the next entry; any OTHER error stops, because a 403
+  // or 429 is about the key or the quota and trying a different model would
+  // just produce the same failure three times.
+  //
+  // The working model is remembered for the session so the chain is walked once,
+  // not per round. Ordered newest-first: newer models are cheaper per token at
+  // introductory pricing and the older entries exist purely as a floor.
+  const GEMINI_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
+  let _geminiModelOk = null;   // session cache of the first entry that answered
+
   async function callGemini(query) {
     // v4.8.2 — TWO CHANGES, both prompted by a fallback nobody could diagnose.
     //
@@ -676,21 +694,37 @@
     //    guessed at, and it is the same reporting-layer class this project has
     //    now found eight times: the mechanism worked, the message told nobody
     //    anything.
-    const res = await fetchWithRetry(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": String(settings.keyGemini || ""),
+    const candidates = _geminiModelOk ? [_geminiModelOk] : GEMINI_MODELS;
+    let res = null, lastModel = null;
+    for (let i = 0; i < candidates.length; i++) {
+      lastModel = candidates[i];
+      res = await fetchWithRetry(
+        "https://generativelanguage.googleapis.com/v1beta/models/" + lastModel + ":generateContent",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": String(settings.keyGemini || ""),
+          },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: query }] }],
+            generationConfig: { maxOutputTokens: MAX_TOKENS },
+          }),
         },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: query }] }],
-          generationConfig: { maxOutputTokens: MAX_TOKENS },
-        }),
-      },
-      "Gemini"
-    );
+        "Gemini"
+      );
+      if (res.ok) {
+        if (_geminiModelOk !== lastModel) {
+          _geminiModelOk = lastModel;
+          logError("[GEMINI] using model " + lastModel +
+            (i > 0 ? " \u2014 walked past " + candidates.slice(0, i).join(", ") + " (retired or unavailable to this key)." : "."));
+        }
+        break;
+      }
+      // Only a 404 means "wrong model". Anything else is the key, the quota or
+      // the request, and walking the chain would repeat one failure three times.
+      if (res.status !== 404 || i === candidates.length - 1) break;
+    }
     if (!res.ok) {
       let detail = "";
       try {
@@ -702,7 +736,8 @@
       logError("[GEMINI] HTTP " + res.status + detail +
         (res.status === 400 ? " | 400 usually means an invalid or malformed key, or a bad request body."
          : res.status === 403 ? " | 403 usually means the key is valid but not authorised for this API or project \u2014 check that the Generative Language API is enabled on the key's project."
-         : res.status === 404 ? " | 404 usually means the MODEL string is wrong or retired for this key. This build requests gemini-2.0-flash."
+         : res.status === 404 ? " | 404 on EVERY model in the chain (" + GEMINI_MODELS.join(", ") +
+             "). All are retired or unavailable to this key \u2014 update GEMINI_MODELS."
          : res.status === 429 ? " | 429 is quota, not credentials."
          : ""));
       throw new Error(`Gemini HTTP ${res.status}${detail}${res.status === 429 ? " — rate limit persisted after retries; check quota/tier" : ""}`);
