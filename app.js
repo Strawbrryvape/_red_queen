@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.8.4-gemini-503";
+  const RQ_BUILD = "v4.8.5-gemini-chain-first";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -637,10 +637,18 @@
   }
 
   // ---------- Retry wrapper (handles HTTP 429 / transient failures) ----------
-  async function fetchWithRetry(url, options, label, maxRetries = 3) {
+  // v4.8.5 — `noRetry` lets a caller claim a status it can handle better itself.
+  // The Gemini seat walks a MODEL CHAIN, so a 503 ("this model is busy") is
+  // routable: try the next model. But this function retried every 5xx three
+  // times first, so the seat burned ~8s failing on one busy model and then fell
+  // to Cerebras with two untried Gemini models still in the chain. Retrying a
+  // busy model is the wrong response when a different model is one line away;
+  // retrying is only correct when there is nowhere else to go.
+  async function fetchWithRetry(url, options, label, maxRetries = 3, noRetry) {
     let attempt = 0;
     for (;;) {
       const res = await fetch(url, options);
+      if (noRetry && noRetry.indexOf(res.status) !== -1) return res;
       if (res.status !== 429 && res.status < 500) return res;
       if (attempt >= maxRetries) return res;
       // honor Retry-After header if the API sends one; else exponential backoff + jitter
@@ -711,7 +719,12 @@
             generationConfig: { maxOutputTokens: MAX_TOKENS },
           }),
         },
-        "Gemini"
+        "Gemini",
+        3,
+        // 503 goes STRAIGHT to the chain instead of being retried here. If every
+        // model in the chain is busy, the last one still falls through to the
+        // normal retry-and-understudy path below.
+        (i < candidates.length - 1) ? [503] : null
       );
       if (res.ok) {
         if (_geminiModelOk !== lastModel) {
