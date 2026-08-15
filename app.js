@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.8.5-gemini-chain-first";
+  const RQ_BUILD = "v4.8.6-seat-budgets";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -131,6 +131,23 @@
   // hits reasoning fluff, never the anchor. Clears free-tier limits with
   // the staggered dispatch.
   const MAX_TOKENS = 1000;
+  // v4.8.6 — PER-SEAT OUTPUT BUDGETS. MAX_TOKENS=1000 was set when every seat
+  // was a free-tier understudy answering briefly. It was never resized as seats
+  // became PAID PRIMARIES that argue at length, so Gemini and Claude were
+  // running on an eighth of Kimi's budget (8000) and a sixteenth of Cerebras's
+  // (16000). Live 2026-08-15: the Gemini seat returned its FALSIFIER line in
+  // full and then truncated before the answer — the falsifier is emitted first,
+  // so a ceiling eats exactly the part that carries the position.
+  //
+  // THIS IS A CEILING, NOT A TARGET. A model emits what it needs and stops;
+  // raising a cap costs nothing on responses that already fit. It only costs
+  // more in precisely the case where the old value was destroying the answer,
+  // which is the case worth paying for.
+  //
+  // Groq stays at the shared 1000: it is a free-tier UNDERSTUDY, and a seat
+  // standing in temporarily should not quietly become the most expensive one.
+  const GEMINI_MAX_TOKENS = 4000;
+  const CLAUDE_MAX_TOKENS = 4000;
   // v2.7.2 (2026-07-13, FLAGGED FOR KIMI REVIEW): reasoning models need
   // doubled headroom. Evidence from two live failures tonight: GLM 4.7
   // burns budget inside <think> blocks, truncates MID-THOUGHT, and the
@@ -716,7 +733,7 @@
           },
           body: JSON.stringify({
             contents: [{ parts: [{ text: query }] }],
-            generationConfig: { maxOutputTokens: MAX_TOKENS },
+            generationConfig: { maxOutputTokens: GEMINI_MAX_TOKENS },
           }),
         },
         "Gemini",
@@ -730,7 +747,12 @@
         if (_geminiModelOk !== lastModel) {
           _geminiModelOk = lastModel;
           logError("[GEMINI] using model " + lastModel +
-            (i > 0 ? " \u2014 walked past " + candidates.slice(0, i).join(", ") + " (retired or unavailable to this key)." : "."));
+            // v4.8.6 — this said "(retired or unavailable to this key)" even when
+            // the cause was a 503 (busy). Written when 404 was the only status
+            // that advanced the chain, and not updated when 503 was added forty
+            // minutes later. Ninth instance of the reporting-layer class: the
+            // routing was right, the sentence describing it was not.
+            (i > 0 ? " \u2014 walked past " + candidates.slice(0, i).join(", ") + " (404 retired, or 503 busy)." : "."));
         }
         break;
       }
@@ -778,7 +800,21 @@
       throw new Error(`Gemini HTTP ${res.status}${detail}${res.status === 429 ? " — rate limit persisted after retries; check quota/tier" : ""}`);
     }
     const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const cand = data.candidates?.[0];
+    const text = cand?.content?.parts?.[0]?.text || "";
+    // v4.8.6 — Google reports finishReason and it was being discarded, so a
+    // truncated answer arrived looking like a short one. MAX_TOKENS means the
+    // ceiling cut it; the operator should not have to infer that from a
+    // sentence stopping mid-word.
+    if (cand && cand.finishReason && cand.finishReason !== "STOP") {
+      logError("[GEMINI] finishReason=" + cand.finishReason +
+        (cand.finishReason === "MAX_TOKENS"
+          ? " \u2014 the answer was CUT at the " + GEMINI_MAX_TOKENS +
+            "-token ceiling, not merely short. Raise GEMINI_MAX_TOKENS if this repeats."
+          : " \u2014 the model stopped for its own reason; the text above may be incomplete.") +
+        " (" + text.length + " chars returned)");
+    }
+    return text;
   }
 
   async function callKimi(query) {
@@ -833,7 +869,7 @@
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: MAX_TOKENS,
+        max_tokens: CLAUDE_MAX_TOKENS,
         messages: [{ role: "user", content: query }],
       }),
     }, "Claude");
