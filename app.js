@@ -345,7 +345,7 @@
   // therefore SURFACES a degradation that already existed; it does not
   // introduce one. Task 4's only real gap is walk depth inside OpenRouter.
   const PRIMARY_MODEL_LABELS = {
-    gemini: "Gemini 2.0 Flash",
+    gemini: "Gemini 3.5 Flash",
     kimi: "Moonshot v1 8k",
     claude: "Claude Haiku 4.5",
   };
@@ -698,89 +698,88 @@
   // introductory pricing and the older entries exist purely as a floor.
   const GEMINI_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
   let _geminiModelOk = null;   // session cache of the first entry that answered
-
-  async function callGemini(query) {
-    // v4.8.2 — TWO CHANGES, both prompted by a fallback nobody could diagnose.
-    //
-    // 1. KEY MOVES FROM THE QUERY STRING TO THE x-goog-api-key HEADER. The
-    //    operator's theory was a key-FORMAT mismatch; that theory is wrong —
-    //    nothing in this file validates key format, the key was only ever
-    //    encodeURIComponent'd into a URL. But the header is the right method
-    //    regardless: a key in a query string lands in server logs, proxy logs
-    //    and browser history, and it is the documented alternative. Kimi uses
-    //    Authorization: Bearer and Claude uses x-api-key; only this seat was
-    //    putting its credential in a URL.
-    //
-    // 2. THE ERROR BODY IS NO LONGER DISCARDED. This threw
-    //    `Gemini HTTP ${status}` and dropped the JSON body Google returns —
-    //    which distinguishes an invalid key from a wrong project from a
-    //    retired model from an exhausted quota. Four different fixes, one
-    //    indistinguishable number. That is why this fallback could only be
-    //    guessed at, and it is the same reporting-layer class this project has
-    //    now found eight times: the mechanism worked, the message told nobody
-    //    anything.
+async function callGemini(query) {
     const candidates = _geminiModelOk ? [_geminiModelOk] : GEMINI_MODELS;
     let res = null, lastModel = null;
+    let fullText = "";
+
     for (let i = 0; i < candidates.length; i++) {
       lastModel = candidates[i];
-      res = await fetchWithRetry(
-        "https://generativelanguage.googleapis.com/v1beta/models/" + lastModel + ":generateContent",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": String(settings.keyGemini || ""),
+      fullText = ""; // Reset for each model in the chain
+      let historyContents = [{ role: "user", parts: [{ text: query }] }];
+      let continuationsCount = 0;
+      const MAX_CONTINUATIONS = 4; // Cap chunking so it can't loop infinitely
+
+      while (continuationsCount <= MAX_CONTINUATIONS) {
+        res = await fetchWithRetry(
+          "https://generativelanguage.googleapis.com/v1beta/models/" + lastModel + ":generateContent",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": String(settings.keyGemini || ""),
+            },
+            body: JSON.stringify({
+              contents: historyContents,
+              generationConfig: { maxOutputTokens: GEMINI_MAX_TOKENS },
+            }),
           },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: query }] }],
-            generationConfig: { maxOutputTokens: GEMINI_MAX_TOKENS },
-          }),
-        },
-        "Gemini",
-        3,
-        // 503 goes STRAIGHT to the chain instead of being retried here. If every
-        // model in the chain is busy, the last one still falls through to the
-        // normal retry-and-understudy path below.
-        (i < candidates.length - 1) ? [503] : null
-      );
-      if (res.ok) {
-        if (_geminiModelOk !== lastModel) {
+          "Gemini",
+          3,
+          // Only pass 503 to the noRetry array if we are on the very first chunk of the attempt
+          (i < candidates.length - 1 && continuationsCount === 0) ? [503] : null
+        );
+
+        if (!res.ok) {
+          break; // Break the chunking loop; let the outer logic handle the error/walk
+        }
+
+        if (_geminiModelOk !== lastModel && continuationsCount === 0) {
           _geminiModelOk = lastModel;
           logError("[GEMINI] using model " + lastModel +
-            // v4.8.6 — this said "(retired or unavailable to this key)" even when
-            // the cause was a 503 (busy). Written when 404 was the only status
-            // that advanced the chain, and not updated when 503 was added forty
-            // minutes later. Ninth instance of the reporting-layer class: the
-            // routing was right, the sentence describing it was not.
             (i > 0 ? " \u2014 walked past " + candidates.slice(0, i).join(", ") + " (404 retired, or 503 busy)." : "."));
         }
-        break;
+
+        const data = await res.json();
+        const cand = data.candidates?.[0];
+        const textChunk = cand?.content?.parts?.[0]?.text || "";
+        fullText += textChunk;
+
+        if (cand && cand.finishReason === "MAX_TOKENS") {
+          continuationsCount++;
+          if (continuationsCount <= MAX_CONTINUATIONS) {
+            logError("[GEMINI] finishReason=MAX_TOKENS \u2014 appending to history and auto-continuing (" + continuationsCount + "/" + MAX_CONTINUATIONS + ").");
+            historyContents.push({ role: "model", parts: [{ text: textChunk }] });
+            historyContents.push({ role: "user", parts: [{ text: "Continue exactly where you left off. Do not repeat previous text." }] });
+            continue; // Fire the next iteration of the while loop to get the next chunk
+          } else {
+            logError("[GEMINI] finishReason=MAX_TOKENS \u2014 max continuations reached (" + MAX_CONTINUATIONS + "); forcing STOP. (" + fullText.length + " chars returned)");
+          }
+        } else if (cand && cand.finishReason && cand.finishReason !== "STOP") {
+          logError("[GEMINI] finishReason=" + cand.finishReason +
+            " \u2014 the model stopped for its own reason; the text above may be incomplete. (" + fullText.length + " chars returned)");
+        }
+        
+        break; // Success! Break the chunking while loop
       }
-      // v4.8.4 — 503 ADVANCES THE CHAIN TOO. The first version advanced only on
-      // 404, on the reasoning that everything else is about the key or the
-      // quota. That is right for 401/403 (credentials) and 429 (quota), which
-      // would fail identically on every model — but WRONG for 503, which is
-      // per-model capacity. Live 2026-08-15: gemini-3.7-flash returned "this
-      // model is currently experiencing high demand" and the seat fell all the
-      // way to Cerebras while two other Gemini models sat untried in the chain.
-      // A newest-first chain makes this likelier, not rarer: the newest model is
-      // the busiest.
-      //
-      // 404 = retired. 503 = busy. Both mean "try the next model". Everything
-      // else means "trying another model changes nothing".
+
+      if (res && res.ok) {
+        break; // Break the outer chain-walking FOR loop if we fully succeeded
+      }
+
+      // If we reach here, res.ok is false. Handle normal error routing.
       const advances = (res.status === 404 || res.status === 503);
       if (!advances || i === candidates.length - 1) break;
       logError("[GEMINI] " + lastModel + " returned " + res.status +
         (res.status === 503 ? " (busy)" : " (retired)") + " \u2014 trying " + candidates[i + 1] + ".");
     }
-    // v4.8.4 — release the session cache when the remembered model fails in a
-    // way the chain could route around. Without this, one good round would pin
-    // the seat to a model that is busy for the rest of the session.
+
     if (!res.ok && _geminiModelOk && (res.status === 404 || res.status === 503)) {
       logError("[GEMINI] releasing cached model " + _geminiModelOk + " (HTTP " + res.status +
-        ") — the chain will be re-walked on the next round.");
+        ") \u2014 the chain will be re-walked on the next round.");
       _geminiModelOk = null;
     }
+    
     if (!res.ok) {
       let detail = "";
       try {
@@ -789,34 +788,22 @@
         const msg = (j && j.error && (j.error.message || j.error.status)) || body;
         detail = msg ? " \u2014 " + clip(String(msg).replace(/\s+/g, " ").trim(), 300) : "";
       } catch (_) {}
-      logError("[GEMINI] HTTP " + res.status + detail +
-        (res.status === 400 ? " | 400 usually means an invalid or malformed key, or a bad request body."
-         : res.status === 403 ? " | 403 usually means the key is valid but not authorised for this API or project \u2014 check that the Generative Language API is enabled on the key's project."
-         : res.status === 404 ? " | 404 on EVERY model in the chain (" + GEMINI_MODELS.join(", ") +
+      
+      const status = res ? res.status : "unknown";
+      logError("[GEMINI] HTTP " + status + detail +
+        (status === 400 ? " | 400 usually means an invalid or malformed key, or a bad request body."
+         : status === 403 ? " | 403 usually means the key is valid but not authorised for this API or project \u2014 check that the Generative Language API is enabled on the key's project."
+         : status === 404 ? " | 404 on EVERY model in the chain (" + GEMINI_MODELS.join(", ") +
              "). All are retired or unavailable to this key \u2014 update GEMINI_MODELS."
-         : res.status === 429 ? " | 429 is quota, not credentials."
-         : res.status === 503 ? " | 503 on EVERY model in the chain \u2014 Google-side capacity, not your key. The seat is correctly falling to its understudy; retry later."
+         : status === 429 ? " | 429 is quota, not credentials."
+         : status === 503 ? " | 503 on EVERY model in the chain \u2014 Google-side capacity, not your key. The seat is correctly falling to its understudy; retry later."
          : ""));
-      throw new Error(`Gemini HTTP ${res.status}${detail}${res.status === 429 ? " — rate limit persisted after retries; check quota/tier" : ""}`);
+      throw new Error(`Gemini HTTP ${status}${detail}${status === 429 ? " \u2014 rate limit persisted after retries; check quota/tier" : ""}`);
     }
-    const data = await res.json();
-    const cand = data.candidates?.[0];
-    const text = cand?.content?.parts?.[0]?.text || "";
-    // v4.8.6 — Google reports finishReason and it was being discarded, so a
-    // truncated answer arrived looking like a short one. MAX_TOKENS means the
-    // ceiling cut it; the operator should not have to infer that from a
-    // sentence stopping mid-word.
-    if (cand && cand.finishReason && cand.finishReason !== "STOP") {
-      logError("[GEMINI] finishReason=" + cand.finishReason +
-        (cand.finishReason === "MAX_TOKENS"
-          ? " \u2014 the answer was CUT at the " + GEMINI_MAX_TOKENS +
-            "-token ceiling, not merely short. Raise GEMINI_MAX_TOKENS if this repeats."
-          : " \u2014 the model stopped for its own reason; the text above may be incomplete.") +
-        " (" + text.length + " chars returned)");
-    }
-    return text;
-  }
 
+    return fullText;
+  }  
+  
   async function callKimi(query) {
     const res = await fetchWithRetry("https://api.moonshot.ai/v1/chat/completions", {
       method: "POST",
