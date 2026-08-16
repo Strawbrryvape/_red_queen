@@ -98,5 +98,28 @@ tt("a position merely MENTIONING falsifiers is not skipped",
 t("falsifier-only text still falls back rather than returning nothing",
   csFirstLine({text:"FALSIFIER: If X then Y."}), "FALSIFIER: If X then Y.");
 
+
+console.log("\n--- v4.8.7: the TWO-LINE falsifier form ---");
+// v4.7.1 covered "FALSIFIER: <text>" on one line. Seats also write the label
+// alone with the body underneath, and the body was then scored as the
+// position. Live 2026-08-15 valuation round: two of three first lines were
+// falsifier bodies, PARALLEL at 0.076.
+t("bare label + blank line + body returns the POSITION",
+  csFirstLine({text:"FALSIFIER:\n\nIf X were shown I would concede.\n\nMy position is that the floor should stay at 0.600."}),
+  "My position is that the floor should stay at 0.600.");
+t("bare label with no blank line also skips the body",
+  csFirstLine({text:"FALSIFIER:\nIf X then Y.\nMy actual position here."}),
+  "My actual position here.");
+t("the one-line form still works (v4.7.1 regression guard)",
+  csFirstLine({text:"FALSIFIER: If X then Y.\n\nMy actual position here."}),
+  "My actual position here.");
+tt("the skip is counted, so the gate can report it",
+   csFirstLineMeta({text:"FALSIFIER:\n\nIf X then Y.\n\nPosition."}).skipped === 2);
+t("only ONE line is carried — a second body line is a position",
+  csFirstLine({text:"FALSIFIER:\nIf X then Y.\nSecond line is the position.\nThird line."}),
+  "Second line is the position.");
+tt("a line merely containing the word falsifier is not a bare label",
+   !/^\s*falsifier\s*:?\s*$/i.test("The falsifier discipline keeps this honest."));
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
