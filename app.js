@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.8.8-merged";
+  const RQ_BUILD = "v4.9.0-pred-serialize";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -9761,6 +9761,32 @@ roundData,
   // a round, and nothing here is awaited by dispatch, so a longer budget costs
   // nothing but patience.
   const RQ_PRED_TIMEOUT_MS  = 45000;  // TUNE-AFTER-DATA, per-call race budget
+  // v4.9.0 — THE P7-F3 LOAD FIX.
+  //
+  // Diagnosed by the operator and the Kimi build seat, 2026-08-15: enabling
+  // predictions killed primaries and cascaded through two fallback walk-downs.
+  // Confirmed in the tree — collectPredictions used seats.forEach, so all three
+  // prediction calls launched in the SAME MILLISECOND, and it is invoked from
+  // dispatch() at the same instant the three council calls go out. Six
+  // simultaneous requests across three providers, while the answer path is
+  // deliberately staggered ~700ms precisely to avoid that burst.
+  //
+  // The predictions were competing with the answers they were meant to measure,
+  // and losing that race cost the ROUND, not just the prediction.
+  //
+  // The fix rests on one observation: PREDICTIONS ARE NOT TIME-CRITICAL. They
+  // are scored post-round on rq:round-stored, minutes later. Nothing waits on
+  // them. So they can yield the network entirely to the answer path and still
+  // arrive in time.
+  //
+  //   LEAD    — hold until the council's own staggered launches are away.
+  //   STAGGER — then one prediction at a time, sequentially, never a burst.
+  //
+  // Peak concurrency drops from 6 to 3+1, and the +1 only after the answers
+  // have their connections. If a prediction is late it is stored as
+  // NO PREDICTION, which is already handled and costs a row, not a round.
+  const RQ_PRED_LEAD_MS    = 3000;   // TUNE-AFTER-DATA — yield to the answer path first
+  const RQ_PRED_STAGGER_MS = 1500;   // TUNE-AFTER-DATA — between sequential predictions
 
   let _predRoundId        = null;   // dispatch id predictions were fired for
   // v4.0.1 — the round's RAW QUESTION, kept so a queued surprise audit can name
@@ -9906,7 +9932,21 @@ roundData,
       _predRoundId = dispatchId;
       _predRoundPrompt = String(prompt == null ? "" : prompt);
       const fullCouncil = seats.length >= 3;    // operator 2-seat rule
-      seats.forEach((seat) => {
+      // v4.9.0 — SEQUENTIAL, not forEach. The IIFE keeps collectPredictions
+      // itself synchronous and un-awaited by dispatch, so the round is still
+      // never blocked; the awaiting happens inside this detached task.
+      (async () => {
+        await sleep(RQ_PRED_LEAD_MS);
+        for (let si = 0; si < seats.length; si++) {
+          const seat = seats[si];
+          if (si > 0) await sleep(RQ_PRED_STAGGER_MS);
+          // Re-check the flag each iteration: an operator switching predictions
+          // off mid-round should stop the remaining calls, not just future ones.
+          if (!predictionsEnabled() || _predTableMissing) {
+            logError("[P7-F3] predictions disabled mid-round — " + (seats.length - si) +
+              " remaining prediction call(s) skipped.");
+            return;
+          }
         const predictionPrompt =
           "You are the " + seat.name + " seat in the Red Queen council. " +
           "Before the council answers, predict:\n" +
@@ -9918,7 +9958,7 @@ roundData,
           clip(prompt, RQ_PRED_PROMPT_CLIP) + "\"\n\n" +
           "Respond ONLY with this JSON object — no prose, no markdown fences:\n" +
           "{\"predicted_own\": \"...\", \"predicted_consensus\": \"" + (fullCouncil ? "..." : "N/A") + "\"}";
-        Promise.race([
+        const p = Promise.race([
           seat.fn(predictionPrompt),
           sleep(RQ_PRED_TIMEOUT_MS).then(() => "__timeout__"),
         ]).then((raw) => {
@@ -9939,7 +9979,13 @@ roundData,
           _predInsert({ round_id: dispatchId, seat_name: seat.name,
             predicted_own: "NO PREDICTION", predicted_consensus: fullCouncil ? "NO PREDICTION" : "N/A" });
         });
-      });
+        // AWAITED so the next seat's prediction does not launch until this one
+        // has settled. This is the whole fix: one prediction in flight at a
+        // time, never three. The .then/.catch above still handle storage, so a
+        // failure here cannot break the loop.
+        await p.catch(() => {});
+        }
+      })();
     } catch (e) {
       try { logError("[P7-F3] collectPredictions threw: " + (e.message || e) + " — round unaffected."); } catch (_) {}
     }
