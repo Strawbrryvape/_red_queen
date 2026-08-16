@@ -118,5 +118,25 @@ tt("all four P7 flags default OFF (=== \"on\" semantics)",
 tt("no supabase-js in the client", !/createClient\(/.test(src));
 tt("no service-role literal in the client", !/SERVICE_ROLE/.test(src));
 
+
+console.log("\n--- v4.9.0: the P7-F3 load fix ---");
+// Enabling predictions killed primaries and cascaded through two fallback
+// walk-downs. Cause: seats.forEach launched all three prediction calls in the
+// same millisecond, from dispatch(), while the three council calls went out —
+// six simultaneous requests against a path deliberately staggered ~700ms.
+tt("predictions are no longer fired with forEach",
+   !/seats\.forEach\(\(seat\) => \{[\s\S]{0,400}predictionPrompt/.test(src));
+tt("they run in a sequential for-loop", /for \(let si = 0; si < seats\.length; si\+\+\)/.test(src));
+tt("each call is AWAITED before the next launches", /await p\.catch\(\(\) => \{\}\);/.test(src));
+tt("a lead delay yields the network to the answer path first",
+   /await sleep\(RQ_PRED_LEAD_MS\);/.test(src) && /const RQ_PRED_LEAD_MS/.test(src));
+tt("predictions are staggered from each other", /await sleep\(RQ_PRED_STAGGER_MS\)/.test(src));
+tt("collectPredictions is still NOT awaited by dispatch",
+   !/await collectPredictions/.test(src));
+tt("the flag is re-checked mid-round so disabling stops remaining calls",
+   /predictions disabled mid-round/.test(src));
+tt("the cause is documented in source, not just fixed",
+   /Six\s+\/\/ simultaneous requests|six\s+\/\/ simultaneous/i.test(src) || /SAME MILLISECOND/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
