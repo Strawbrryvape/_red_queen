@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.8.6-seat-budgets";
+  const RQ_BUILD = "v4.8.8-merged";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -698,7 +698,38 @@
   // introductory pricing and the older entries exist purely as a floor.
   const GEMINI_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
   let _geminiModelOk = null;   // session cache of the first entry that answered
-async function callGemini(query) {
+  // ---- Gemini seat. Three layers, added in response to three separate live
+  // failures; the history is kept because each one explains a guard that would
+  // otherwise look arbitrary.
+  //
+  // 1. AUTH BY HEADER, NOT QUERY STRING (v4.8.2). The key was previously
+  //    encodeURIComponent'd into the URL, where it lands in server logs, proxy
+  //    logs and browser history. Kimi uses Authorization: Bearer and Claude
+  //    uses x-api-key; only this seat put its credential in a URL.
+  //
+  // 2. THE ERROR BODY IS NOT DISCARDED (v4.8.2). This threw a bare
+  //    `Gemini HTTP ${status}` and dropped the JSON body Google returns, which
+  //    is the only thing distinguishing an invalid key from a wrong project
+  //    from a retired model from an exhausted quota — four different fixes
+  //    behind one indistinguishable number. That is how gemini-2.0-flash stayed
+  //    configured for four months after its 2026-03-31 retirement while the
+  //    seat silently fell to Cerebras every round.
+  //
+  // 3. MODEL CHAIN + CONTINUATION (v4.8.3-4.8.6, continuation contributed by
+  //    the operator working with Gemini Pro, 2026-08-15). 404 (retired) and 503
+  //    (busy) advance the chain; everything else stops, because a 401/403/429
+  //    would fail identically on every model. On MAX_TOKENS the partial answer
+  //    is pushed back as history and continued, up to MAX_CONTINUATIONS —
+  //    which is a better fix than a bigger ceiling, because it handles answers
+  //    of arbitrary length without paying for headroom that usually goes
+  //    unused.
+  //
+  //    COST NOTE, worth knowing before raising MAX_CONTINUATIONS: each
+  //    continuation resends the whole history, so INPUT tokens grow
+  //    quadratically across chunks. Four continuations at 4000 output tokens
+  //    means the final call carries roughly 16k input tokens. The cap is what
+  //    bounds that, and it is why it is a cap rather than a loop-until-done.
+  async function callGemini(query) {
     const candidates = _geminiModelOk ? [_geminiModelOk] : GEMINI_MODELS;
     let res = null, lastModel = null;
     let fullText = "";
@@ -768,13 +799,18 @@ async function callGemini(query) {
       }
 
       // If we reach here, res.ok is false. Handle normal error routing.
-      const advances = (res.status === 404 || res.status === 503);
+      const advances = (res && (res.status === 404 || res.status === 503));
       if (!advances || i === candidates.length - 1) break;
       logError("[GEMINI] " + lastModel + " returned " + res.status +
         (res.status === 503 ? " (busy)" : " (retired)") + " \u2014 trying " + candidates[i + 1] + ".");
     }
 
-    if (!res.ok && _geminiModelOk && (res.status === 404 || res.status === 503)) {
+    // v4.8.8 — `res &&` added. The post-loop guards dereferenced res directly.
+    // candidates is never empty today so res is always assigned, but that is an
+    // invariant of GEMINI_MODELS having entries, not of this code — and a
+    // future edit that empties the chain would throw a TypeError here instead
+    // of falling back cleanly.
+    if (res && !res.ok && _geminiModelOk && (res.status === 404 || res.status === 503)) {
       logError("[GEMINI] releasing cached model " + _geminiModelOk + " (HTTP " + res.status +
         ") \u2014 the chain will be re-walked on the next round.");
       _geminiModelOk = null;
@@ -7111,9 +7147,29 @@ roundData,
     const raw = String((a && a.text) || "").split("\n");
     const first = (raw[0] || "").trim();
     let skipped = 0;
+    // v4.8.7 — TWO-LINE FALSIFIER. v4.7.1 skipped "FALSIFIER: <text>" on one
+    // line, but seats also write the label ALONE with the body underneath:
+    //
+    //     FALSIFIER:
+    //
+    //     If empirical market data demonstrates that...
+    //
+    // The bare label was correctly skipped as a banner and then the BODY was
+    // scored as the position. Live 2026-08-15 (valuation round, three
+    // primaries): Gate 1 compared two falsifier bodies against one real
+    // position and returned PARALLEL at 0.076. The v4.7.1 fix covered one of
+    // the two formattings, which is why the defect survived it.
+    //
+    // `carry` makes the skip STICKY across the blank line: once a bare
+    // FALSIFIER: label is seen, the following non-empty line is part of the
+    // falsifier and is skipped too, and the state clears the moment a real line
+    // is consumed. Re-scoring the live round: 0.076 -> 0.115.
+    let carry = false;
     for (let i = 0; i < raw.length; i++) {
       const l = (raw[i] || "").trim();
-      if (!l) { continue; }
+      if (!l) { continue; }                       // blank lines never clear the carry
+      if (carry) { carry = false; skipped++; continue; }   // this is the falsifier body
+      if (/^\s*falsifier\s*:?\s*$/i.test(l)) { carry = true; skipped++; continue; }  // bare label
       if (csIsBannerLine(l)) { skipped++; continue; }
       return { line: l, skipped: skipped };
     }
