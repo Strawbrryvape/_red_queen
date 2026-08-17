@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.9.0-pred-serialize";
+  const RQ_BUILD = "v4.9.1-delivered-digest";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -5349,6 +5349,16 @@ roundData,
         q = q.indexOf("{{SEAT_IDENTITY}}") !== -1
           ? q.replace("{{SEAT_IDENTITY}}", identityLine)
           : identityLine + "\n\n" + q;
+        // v4.9.1 — measure what THIS seat is actually being sent, at the last
+        // point before it leaves the client. Digest is taken with the identity
+        // line REMOVED, because that line differs by design (R-PS-6) and would
+        // otherwise guarantee three different digests every round and measure
+        // nothing. What remains should be byte-identical across seats; when it
+        // is not, the record now says so.
+        try {
+          const _body = q.replace(identityLine, "");
+          _seatDelivered[c.name] = { chars: q.length, digest: ftDigest(_body) };
+        } catch (_) {}
         const primaryTag = seatProvider[c.name]; // configured occupant at dispatch start
 
         const chain = [];
@@ -9794,6 +9804,26 @@ roundData,
   // it is already public corpus and carries none of the R-P7-11 restrictions
   // that apply to predicted_own / actual_own.
   let _predRoundPrompt    = null;
+  // v4.9.1 — DELIVERED-PROMPT DIGESTS. Round 84, Kimi seat, naming a failure no
+  // instrument covered: "the seats are answering different questions… receipts
+  // record which model answered, not what it was shown… If the ledger
+  // serializes differently per seat, each seat deliberates in a slightly
+  // different council. Worse than silent: the output still gets processed. It's
+  // classified into a disagreement type, decomposed into 'claims', scored.
+  // Noise gets minted into signal."
+  //
+  // The gap is real. `[CONTEXT] composed prompt N chars, identical for all 3
+  // seat(s)` asserts identity AT OUR END. Three things break it downstream: the
+  // falsifier ask and full-text instruction are appended after composition, the
+  // seat-identity line differs by design, and — the one nothing sees — each
+  // PROVIDER truncates to its own context window. A 5,335-char prompt reaching a
+  // 4k-window fallback is not the prompt reaching a 200k-window primary.
+  //
+  // R-PS-6 states the composed body is byte-identical for all seats with only
+  // {{SEAT_IDENTITY}} differing. This does not assume that — it MEASURES it, and
+  // stores the measurement per seat so a divergence is visible in the record
+  // rather than inferred from seats talking past each other.
+  const _seatDelivered = {};   // seat -> {chars, digest} for THIS dispatch
   let _fiatCandidate      = null;    // SPEC-PS-F0 — detection record for THIS dispatch, null when off/no match
   let _fiatShadow         = null;    // SPEC-PS-F0 — shadow evidence, additive key on the divided return
   let _predTableMissing   = false;  // session-sticky disable
@@ -10243,6 +10273,13 @@ roundData,
           tier: typeof a.tier === "number" ? a.tier : null,
           weight: typeof a.weightLive === "number" ? a.weightLive : null,
           bytes: String(a.text == null ? "" : a.text).length,
+          // v4.9.1 — what this seat was actually SENT, not what we composed.
+          // Absent rather than null when unrecorded, so a missing digest cannot
+          // be mistaken for a measured match.
+          ...((_seatDelivered[a.name]) ? {
+            delivered_chars: _seatDelivered[a.name].chars,
+            delivered_digest: _seatDelivered[a.name].digest,
+          } : {}),
           malformed: !!a.malformed,
           // Decision 2: the falsifier the SEAT wrote, or null. NEVER synthesised
           // — a falsifier the seat did not write is not its falsifier, which is
@@ -11230,6 +11267,9 @@ roundData,
       // after-composition seam as the falsifier ask, so _composedBody (what the
       // prompt hash covers) is untouched.
       const _ftBlock = await ftBuildBlock();
+      // Reset per dispatch so a seat absent this round cannot inherit last
+      // round's digest — an absent seat must read as absent, not as unchanged.
+      try { Object.keys(_seatDelivered).forEach((k) => delete _seatDelivered[k]); } catch (_) {}
       const composedQuery = _composedBody + (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "") +
         ((falsifierAskEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FALSIFIER_ASK) : "") +
         _ftBlock +
@@ -11265,6 +11305,24 @@ roundData,
             }
           } catch (_) {}
         }
+        // v4.9.1 — ASYMMETRIC CONTEXT CHECK. Round 84's uncovered failure: if
+        // seats received materially different prompts, every downstream
+        // instrument still processes the round as though they answered the same
+        // question — classifying the disagreement, decomposing the claims,
+        // scoring it. This says so out loud instead, once, before any of that.
+        try {
+          const _dig = Object.keys(_seatDelivered);
+          if (_dig.length >= 2) {
+            const set = new Set(_dig.map((k) => _seatDelivered[k].digest));
+            if (set.size > 1) {
+              logError("\u26A0 [CONTEXT] ASYMMETRIC PROMPT \u2014 seats did NOT receive the same body: " +
+                _dig.map((k) => k + " " + _seatDelivered[k].chars + "ch/" + _seatDelivered[k].digest).join(" | ") +
+                ". Any disagreement this round may be seats answering DIFFERENT QUESTIONS, and every " +
+                "downstream instrument (comparators, COUNTERSTAMP, claim diff) will still score it as " +
+                "though they answered the same one. Treat the verdict as unsafe.");
+            }
+          }
+        } catch (_) {}
         // Pillar VI — build the header BEFORE storage, from state already in
         // hand. Null when the flag is off, so the spread below adds nothing.
         // csVerdict is passed as null ON PURPOSE and the parameter is kept.
