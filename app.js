@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.10.0-causal-provenance";
+  const RQ_BUILD = "v4.10.1-fc-limit";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -10874,6 +10874,35 @@ roundData,
   //
   // Needs no new data: falsifiers are already parsed into the Round Header
   // receipts, and embedText is the local worker at zero API cost.
+  // ⚠ KNOWN LIMIT, named by all three seats when the directive adopting this
+  // check was put to them (round 87, unanimous acceptance WITH this caveat):
+  //
+  //   "Divergent falsifiers prove divergent RATIONALIZATIONS, not independent
+  //    errors."  — Kimi seat
+  //
+  // The failure case: three seats propose falsifiers that are far apart in
+  // embedding space — 18 months, 2-3 years, 24-36 months — while triggering on
+  // the SAME underlying signal. This detector measures textual distance. It
+  // cannot see that three differently-worded tests fire on one mechanism, so
+  // the crossed signature reads HEALTHY on precisely the round where all three
+  // are wrong together.
+  //
+  // The Gemini seat named the other half: divergent falsifiers that all leave
+  // the question's shared PREMISE untested. Each seat probes a different
+  // surface while none probes the assumption they inherited from the framing,
+  // the ledger, or common training priors.
+  //
+  // So: an ABSENT flag here is weak evidence of independence, and a PRESENT
+  // flag is the stronger reading. Treat this as a detector, never as a
+  // clearance. The Claude seat's proposed second stage — asking whether the
+  // falsifiers would trigger on the same mechanism, merely measured differently
+  // — is NOT built, and would need mechanism extraction rather than embedding
+  // distance.
+  //
+  // Kimi's falsifier for the whole check, worth running once seeded-error
+  // rounds accumulate: "if rounds with divergent stated falsifiers produced
+  // shared errors at the same rate as rounds with convergent ones, I would
+  // withdraw acceptance and rank this check no better than position divergence."
   const RQ_FC_CLOSE = 0.30;   // TUNE-AFTER-DATA — falsifier distance below this is "clustered"
   const RQ_FC_APART = 0.45;   // TUNE-AFTER-DATA — position distance above this is "divergent"
 
@@ -11002,6 +11031,13 @@ roundData,
         "them (falsifier distance < " + RQ_FC_CLOSE + "). One piece of counter-evidence would refute all of " +
         "them at once, so their errors are correlated however divergent the prose looks. This is the " +
         "shared-blindspot signature; no other instrument here would flag it.");
+    }
+    // The converse is NOT a clean bill of health, and saying so is the point.
+    if (!fconv.length && rows.some((r) => r.fdist !== null)) {
+      logError("[CONFORMITY] no falsifier convergence flagged \u2014 this is NOT evidence of independence. " +
+        "Falsifiers that are far apart in wording can still fire on the SAME underlying mechanism " +
+        "(the council named this limit itself when adopting the check). An absent flag is weak evidence; " +
+        "only a present flag is strong.");
     }
     const flagged = rows.filter((r) => r.flags.length);
     if (flagged.length) {
