@@ -108,6 +108,27 @@ console.log("\n--- zero API cost ---");
 tt("no fetch anywhere in the audit", !/async function runConformityAudit[\s\S]{0,4000}fetch\(/.test(src));
 tt("embeddings come from the local worker", /embedText\(t\)/.test(src));
 
+
+console.log("\n--- v4.9.2: falsifier convergence (Claude seat, round 85) ---");
+tt("falsifier distance is computed from the stored receipts",
+   /async function caFalsifierDistance\(entry\)/.test(src) &&
+   /entry\.header && entry\.header\.receipts/.test(src));
+tt("absent seats and empty falsifiers are excluded",
+   /!r\.absent && r\.falsifier && String\(r\.falsifier\)\.length > 30/.test(src));
+tt("fewer than two falsifiers returns null, not a score",
+   /if \(fs\.length < 2\) return null;/.test(src));
+tt("no embed worker returns null rather than a guessed number",
+   /if \(vecs\.some\(\(v\) => !v\)\) return null;/.test(src));
+tt("only the CROSSED signature flags, not high or low alone",
+   /fdist < RQ_FC_CLOSE && path > RQ_FC_APART/.test(src));
+tt("a missing measurement cannot flag",
+   /fdist !== null && path !== null &&/.test(src));
+tt("the reading explains WHY it matters, not just that it fired",
+   /would refute all of\s+\/\/|refute all of/.test(src) && /correlated/.test(src));
+tt("thresholds are marked unfitted", /TUNE-AFTER-DATA/.test(src));
+tt("the falsifier distance appears in the per-round line",
+   /falsifier dist/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
 })();
