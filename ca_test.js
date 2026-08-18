@@ -1,134 +1,149 @@
-// Conformity audit suite. Logic lifted verbatim and run against the REAL
-// 192-round snapshot — the strongest available check short of a browser.
-// embedText is stubbed (no Xenova in Node); the semantic-distance judgement is
-// therefore NOT validated here, only the mechanism, thresholds and shape.
+// Pillar VI Round Header suite. Logic lifted verbatim; the rest are shape
+// assertions, because this build's real risks are absences and orderings:
+// a header that silently omits an absent seat, an ask that leaks into the
+// composed body, a column written without a migration.
 const fs=require("fs"),src=fs.readFileSync("app.js","utf8");
 const grab=(re)=>{const m=src.match(re);if(!m)throw new Error("lift failed "+re);return m[0];};
-const _s=src.indexOf("const STOPWORDS = new Set(");
-const _e=src.indexOf("// ==================== v3.3: CONCEPT-BASED COMPARATOR");
-globalThis.ledger=[];
-globalThis.logError=()=>{};
-let EMBED_MODE="hash";
-// Deterministic pseudo-embedding: same text -> same vector, different text ->
-// different vector. Enough to exercise the pipeline, NOT enough to judge meaning.
-globalThis.embedText=async(t)=>{
-  if(EMBED_MODE==="null") return null;
-  const v=new Array(16).fill(0);
-  for(let i=0;i<t.length;i++) v[i%16]+=t.charCodeAt(i)%7;
-  const n=Math.sqrt(v.reduce((s,x)=>s+x*x,0))||1;
-  return v.map(x=>x/n);
-};
-eval([
-  src.slice(_s,_e),
-  grab(/  const CS_BANNER_MAX[\s\S]*?\n    return false;\n  \}/),
-  grab(/  function _cosine384[\s\S]*?\n  \}/),
-  grab(/  const RQ_CA_RARE_MAX_DF[\s\S]*?\n  \}\n  try \{ window\.__rqConformityAudit/).replace(/\n  try \{ window\.__rqConformityAudit$/,""),
-].join("\n") + "\nglobalThis.runConformityAudit=runConformityAudit;globalThis.caStrip=caStrip;globalThis.caNgrams=caNgrams;globalThis.caSpecifics=caSpecifics;globalThis.caPathDistance=caPathDistance;globalThis.RQ_CA_PATH_FLOOR=RQ_CA_PATH_FLOOR;");
-
+eval(grab(/  const RQ_META_RE = [\s\S]*?\n  \}/) + "\nglobalThis.classifyEpistemic=classifyEpistemic;");
+eval(grab(/  const RQ_FALSIFIER_RE = .*/) + "\nglobalThis.RQ_FALSIFIER_RE=RQ_FALSIFIER_RE;");
 let p=0,f=0;
-const t=(n,g,w)=>{const ok=JSON.stringify(g)===JSON.stringify(w);ok?(p++,console.log("  PASS  "+n)):(f++,console.log("  FAIL  "+n+"  got "+JSON.stringify(g)+" want "+JSON.stringify(w)));};
+const t=(n,g,w)=>{const ok=JSON.stringify(g)===JSON.stringify(w);ok?(p++,console.log("  PASS  "+n)):(f++,console.log("  FAIL  "+n+"  got "+JSON.stringify(g)));};
 const tt=(n,c)=>t(n,!!c,true);
 
-(async()=>{
-console.log("\n--- caStrip removes what the harness ASKED for ---");
-tt("falsifier line stripped", !/FALSIFIER/.test(caStrip("FALSIFIER: if X then Y\nMy real position is Z.")));
-tt("request channel stripped", !/REQUEST_FULLTEXT/.test(caStrip("[REQUEST_FULLTEXT: 12]\nMy position.")));
-tt("banner lines stripped", !/KIMI SEAT/.test(caStrip("**KIMI SEAT — POSITION**\nMy actual argument here.")));
-tt("the real argument survives", /actual argument/.test(caStrip("**KIMI SEAT**\nMy actual argument here.")));
+console.log("\n--- epistemic_class (Decision 3) ---");
+t("council question => META", classifyEpistemic("Should the council keep the similarity floor at 0.600?"), "META");
+t("spine question => META", classifyEpistemic("Where should the Spine live?"), "META");
+t("world question => EVIDENCE", classifyEpistemic("What causes coastal fog in summer?"), "EVIDENCE");
+t("recipe => EVIDENCE", classifyEpistemic("Best way to braise short ribs?"), "EVIDENCE");
+tt("null-safe", classifyEpistemic(null) === "EVIDENCE");
 
-console.log("\n--- specifics: identical figures are the tell ---");
-t("decimals captured", [...caSpecifics("the floor is 0.600 and error 0.679")].sort(), ["num:0.600","num:0.679"]);
-t("round citations captured", [...caSpecifics("as Round 176 showed")], ["cite:round 176"]);
-t("plain prose yields none", [...caSpecifics("we should keep it as is")], []);
+console.log("\n--- falsifier parsing (never synthesised) ---");
+const m1 = RQ_FALSIFIER_RE.exec("I hold position B.\nFALSIFIER: show me offline writes are a core workflow.");
+t("parses the seat's own sentence", m1 && m1[1].trim(), "show me offline writes are a core workflow.");
+t("absent falsifier yields no match", RQ_FALSIFIER_RE.exec("I hold position B, no more."), null);
+tt("case-insensitive", !!RQ_FALSIFIER_RE.exec("falsifier: anything"));
 
-console.log("\n--- degradation: an audit that cannot embed reports UNKNOWN, not clean ---");
-EMBED_MODE="null";
-t("path distance is null, never guessed", await caPathDistance([{text:"a".repeat(80)},{text:"b".repeat(80)}]), null);
-tt("the null case is called out in source, not silently passed",
-   /Result is UNKNOWN, not clean/.test(src));
-EMBED_MODE="hash";
+console.log("\n--- shape: the header records ABSENCE as a datum ---");
+tt("absent seats get an explicit receipt", /\[ABSENT \\u2014 no receipt\]|\[ABSENT — no receipt\]/.test(src));
+tt("expected is derived from the CONFIGURED roster, not from answers",
+   /const configured = Object\.keys\(seatProvider\)/.test(src));
+tt("seats_expected and seats_recorded are separate fields",
+   /seats_expected:/.test(src) && /seats_recorded:/.test(src));
+tt("divergence_type is null rather than guessed when unknown",
+   /function headerDivergenceType[\s\S]{0,700}return null;/.test(src));
 
-console.log("\n--- refinement 1: measured on INITIAL positions, not verdicts ---");
-tt("audit reads entry.positions", /\(e\.positions \|\| \[\]\)/.test(src));
-tt("never reads adjudication verdicts", !/runConformityAudit[\s\S]{0,2500}\.verdicts/.test(src));
-tt("the reason is documented", /working correctly as if it were herding/.test(src));
+console.log("\n--- shape: the falsifier ask does not contaminate the prompt hash ---");
+const comp = src.slice(src.indexOf("const composedQuery ="), src.indexOf("const composedQuery =") + 400);
+tt("ask is appended AFTER _composedBody", comp.indexOf("_composedBody") < comp.indexOf("RQ_FALSIFIER_ASK"));
+tt("ask is gated on its OWN flag, not the header flag", /falsifierAskEnabled\(\) && !_noteRound/.test(comp));
+tt("two independent flags exist",
+   /localStorage\.getItem\("rq_round_header"\) === "on"/.test(src) &&
+   /localStorage\.getItem\("rq_falsifier_ask"\) === "on"/.test(src));
 
-console.log("\n--- refinement 2: anchoring is CROSS-round, not intra-round ---");
-tt("compares round i against i-1", /perRound\[i - 1\]\.has\(g\)/.test(src));
-tt("the impossible intra-round version is documented in the SOURCE",
-   /That channel DOES NOT EXIST/.test(src) && /blind to each other until\s+\/\/ adjudication|blind to each other until/.test(src));
+console.log("\n--- shape: nothing unmigrated is written ---");
+tt("epistemic_class is NOT sent as an rq_events column",
+   !/epistemic_class:\s*_evEpistemic/.test(src) && !/_evEpistemic/.test(src));
+tt("header rides the ledger as an additive spread",
+   /\.\.\.\(_roundHeader \? \{ header: _roundHeader \} : \{\}\)/.test(src));
 
-console.log("\n--- end-to-end over a SYNTHETIC ledger ---");
-// HONEST LIMIT: the 192-round snapshot was cleared from uploads between
-// sessions, and Node has no Xenova worker anyway — so the semantic judgement
-// is NOT validated here under any circumstance. What follows exercises the
-// pipeline shape on a ledger built to contain a known planted echo, using
-// deterministic stub embeddings. The real acceptance test is the browser
-// button against the live ledger; see the handoff.
-const mk=(t,outcome,texts)=>({t,outcome,positions:texts.map((x,i)=>({seat:["gemini","kimi","claude"][i],text:x}))});
-globalThis.ledger=[
-  mk(1,"divided",[
-    "The similarity floor should remain at 0.600 because lowering it admits redundant entries.",
-    "Retrieval precision matters more than recall for a consensus orchestrator here.",
-    "I would keep the present threshold until we have evidence justifying a change."]),
-  mk(2,"resolved",[
-    "The similarity floor should remain at 0.600 because lowering it admits redundant entries.",
-    "The similarity floor should remain at 0.600 because lowering it admits redundant entries.",
-    "Storage durability is a separate concern from retrieval thresholds entirely."]),
-  mk(3,"resolved",[
-    "Provenance must be attested by the dispatcher rather than claimed by the model.",
-    "A model has no privileged access to its own weights and cannot certify authorship.",
-    "The harness is the only component that knows which endpoint produced the tokens."]),
-  mk(4,"divided",[
-    "Round 176 showed the context window was not the bottleneck at 0.679 error.",
-    "Round 176 showed the context window was not the bottleneck at 0.679 error.",
-    "Data topology outweighs parameter scaling when the ledger itself is lossy."]),
-];
-const res=await runConformityAudit();
-tt("returns a result", !!res && Array.isArray(res.rows));
-t("one row per scoreable round", res.rows.length, 4);
-tt("every row carries a path distance or an explicit null",
-   res.rows.every(r=>r.path===null||typeof r.path==="number"));
-tt("first round has no cross-round echo (nothing precedes it)", res.rows[0].echo===null);
-tt("later rounds carry an echo number", typeof res.rows[1].echo==="number");
-tt("the planted round-2 echo of round 1 is detected", res.rows[1].echo>0);
-tt("shared specifics detected where two seats quote the same figures",
-   res.rows[3].shared>0);
-tt("round 3, three genuinely distinct positions, shows no shared specifics",
-   res.rows[2].shared===0);
+console.log("\n--- shape: no phantom identifiers ---");
+tt("the Cyrillic typo is gone", !/isConfirmation\u0420Round/.test(src));
+// The name survives in a COMMENT documenting the near-miss, which is wanted.
+// Assert there is no CODE reference — that is the thing typeof would have hidden.
+tt("no code reference to the phantom _csLastVerdict", !/typeof _csLastVerdict/.test(src));
+tt("csVerdict is passed as an explicit null, not a hopeful lookup",
+   /buildRoundHeader\(query, result, allAnswers, dispatchId, null\)/.test(src));
+tt("buildRoundHeader returns null when the flag is off",
+   /if \(!roundHeaderEnabled\(\)\) return null;/.test(src));
 
-console.log("\n--- thresholds are honest about being unfitted ---");
-tt("flagged as TUNE-AFTER-DATA", /TUNE-AFTER-DATA/.test(src));
-tt("a zero-flag result is explicitly NOT a clean bill of health",
-   /NOT a clean bill of health/.test(src));
-tt("operator is told to read the trend, not the flag count",
-   /Read the mean and the trend, not the flag count/.test(src));
+console.log("\n--- verdict reporting accuracy (v4.2.1) ---");
+// The partition detector used to label a MIXED set of engaged verdicts with
+// the first one's noun. A record that miscounts its own verdicts is worse
+// than one that reports nothing.
+tt("engaged verdicts are tallied, not generalised from the first",
+   !/engaged\.length \+ " counted " \+ engaged\[0\]\.verdict/.test(src));
+tt("each verdict type is counted separately",
+   /engaged\.forEach\(\(v\) => \{ tally\[v\.verdict\] = \(tally\[v\.verdict\] \|\| 0\) \+ 1; \}\)/.test(src));
+tt("the live mislabelling is documented in source",
+   /silently relabelling two refutations as concessions/.test(src));
 
-console.log("\n--- zero API cost ---");
-tt("no fetch anywhere in the audit", !/async function runConformityAudit[\s\S]{0,4000}fetch\(/.test(src));
-tt("embeddings come from the local worker", /embedText\(t\)/.test(src));
+console.log("\n--- resolution honesty (v4.2.2) ---");
+// RESOLVED used to assert that "every other seat conceded" even when seats
+// were excluded as infrastructure and never spoke. The rule was right; the
+// sentence was not.
+tt("drawer line no longer asserts every other seat conceded",
+   !/survived cross-examination; every other seat located a specific error in its own position and conceded\. Won by/.test(src));
+tt("readable and unavailable counts are computed",
+   /const _readable = positions\.length - _unavail;/.test(src) &&
+   /verdicts\.filter\(\(v\) => v\.unavailable\)\.length/.test(src));
+tt("counts are carried to the operator banner",
+   /resolvedReadable: adj\.resolvedReadable/.test(src) && /result\.resolvedUnavailable/.test(src));
+tt("banner names unavailable seats when there are any",
+   /seat\(s\) were unavailable and never spoke/.test(src));
+tt("the live overstatement is documented in source",
+   /the sentence describing it was a lie/.test(src));
+
+console.log("\n--- FALSIFIER_MISSING must mirror the ask's own gate (v4.2.3) ---");
+tt("the flag is gated on whether the ask was actually SENT",
+   /const _askActuallySent = falsifierAskEnabled\(\) &&/.test(src) &&
+   /const missingFalsifier = _askActuallySent &&/.test(src));
+tt("note, indexical and narrator rounds are excluded from the flag",
+   /!\(result && \(result\.note \|\| result\.indexical \|\| result\.narrator\)\)/.test(src));
+tt("falsifier_asked records the send, not the flag state",
+   /falsifier_asked: _askActuallySent/.test(src));
+tt("the live false flag is documented in source",
+   /INDEXICAL — META — FALSIFIER_MISSING/.test(src));
+
+console.log("\n--- demo mode must not invent seat conduct (v4.3.0) ---");
+// Scope to the TEMPLATES ARRAY, not the whole file. The first version scanned
+// all of src and matched the explanatory COMMENT quoting the old strings —
+// the same mis-scoping mistake made earlier in p7_test. Assert against the
+// thing that actually ships to the operator.
+const TEMPLATES = src.slice(src.indexOf("const templates = ["),
+                            src.indexOf("];", src.indexOf("const templates = [")) + 2);
+tt("no template asserts a seat carried a vote", !/carried the vote/.test(TEMPLATES));
+tt("no template attributes conduct to named seats",
+   !/Gemini favored breadth/.test(TEMPLATES) && !/Kimi pushed for precision/.test(TEMPLATES) &&
+   !/Kimi's framing/.test(TEMPLATES));
+tt("every template declares itself simulated",
+   (TEMPLATES.match(/SIMULATED — no model was called/g) || []).length === 4);
+tt("the easter-egg reply is simulated-labelled too",
+   /SIMULATED — no model was called\. \(Demo easter egg/.test(src));
+
+console.log("\n--- fallback roster persisted (v4.3.0) ---");
+const roster = src.match(/const OR_SEAT_MODELS = \{[\s\S]*?\n  \};/)[0];
+const dead = ["inclusionai/ling-3.0-flash:free",
+              "mistralai/mistral-small-3.2-24b-instruct:free",
+              "meta-llama/llama-3.3-70b-instruct:free"];
+dead.forEach((d) => tt("dead model removed: " + d.split("/")[1], roster.indexOf(d) === -1));
+const slots = [];
+roster.split("\n").forEach((l) => {
+  const m = l.match(/^\s*(gemini|kimi|claude):\s*\[(.*)\],/);
+  if (m) m[2].split(",").forEach((x) => slots.push(x.trim().replace(/"/g, "")));
+});
+t("six slots configured", slots.length, 6);
+t("no model appears in two seats at any depth", new Set(slots).size, 6);
 
 
-console.log("\n--- v4.9.2: falsifier convergence (Claude seat, round 85) ---");
-tt("falsifier distance is computed from the stored receipts",
-   /async function caFalsifierDistance\(entry\)/.test(src) &&
-   /entry\.header && entry\.header\.receipts/.test(src));
-tt("absent seats and empty falsifiers are excluded",
-   /!r\.absent && r\.falsifier && String\(r\.falsifier\)\.length > 30/.test(src));
-tt("fewer than two falsifiers returns null, not a score",
-   /if \(fs\.length < 2\) return null;/.test(src));
-tt("no embed worker returns null rather than a guessed number",
-   /if \(vecs\.some\(\(v\) => !v\)\) return null;/.test(src));
-tt("only the CROSSED signature flags, not high or low alone",
-   /fdist < RQ_FC_CLOSE && path > RQ_FC_APART/.test(src));
-tt("a missing measurement cannot flag",
-   /fdist !== null && path !== null &&/.test(src));
-tt("the reading explains WHY it matters, not just that it fired",
-   /would refute all of\s+\/\/|refute all of/.test(src) && /correlated/.test(src));
-tt("thresholds are marked unfitted", /TUNE-AFTER-DATA/.test(src));
-tt("the falsifier distance appears in the per-round line",
-   /falsifier dist/.test(src));
+console.log("\n--- v4.9.1: delivered-prompt digests (Round 84, Kimi seat) ---");
+// "Receipts record which model answered, not what it was shown." The
+// [CONTEXT] line asserted identity at OUR end; nothing measured what each
+// PROVIDER actually received after its own truncation.
+tt("a per-seat delivered record exists", /const _seatDelivered = \{\}/.test(src));
+tt("it is captured at the last point before the call leaves the client",
+   /_seatDelivered\[c\.name\] = \{ chars: q\.length, digest: ftDigest\(_body\) \}/.test(src));
+tt("the identity line is REMOVED before digesting, or it would differ by design",
+   /const _body = q\.replace\(identityLine, ""\)/.test(src));
+tt("it resets per dispatch so an absent seat cannot inherit a stale digest",
+   /delete _seatDelivered\[k\]/.test(src));
+tt("the receipt carries chars AND digest", /delivered_chars:/.test(src) && /delivered_digest:/.test(src));
+tt("an unmeasured seat is ABSENT from the receipt, not null",
+   /\.\.\.\(\(_seatDelivered\[a\.name\]\) \? \{/.test(src));
+tt("divergence is stated out loud", /ASYMMETRIC PROMPT/.test(src));
+tt("and it warns the verdict is unsafe rather than merely noting it",
+   /Treat the verdict as unsafe/.test(src));
+tt("the check runs BEFORE the header and downstream scoring",
+   src.indexOf("ASYMMETRIC PROMPT") < src.indexOf("const _roundHeader = buildRoundHeader"));
 
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
-})();
