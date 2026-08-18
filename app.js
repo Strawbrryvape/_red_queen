@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.10.1-fc-limit";
+  const RQ_BUILD = "v4.10.2-diverge-locate";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -5360,7 +5360,7 @@ roundData,
         // is not, the record now says so.
         try {
           const _body = q.replace(identityLine, "");
-          _seatDelivered[c.name] = { chars: q.length, digest: ftDigest(_body) };
+          _seatDelivered[c.name] = { chars: q.length, digest: ftDigest(_body), body: _body };
         } catch (_) {}
         const primaryTag = seatProvider[c.name]; // configured occupant at dispatch start
         // CPL — one event per seat, parented to the round that asked for it.
@@ -5658,6 +5658,16 @@ roundData,
           _eligible: eligible,
           _agreed: [],   // no lexical agreeing set exists; the tag asserts acknowledgment, not convergence
         };
+      }
+      // v4.10.2 — a LIVE gate that FAILS was completely silent: only
+      // (pass && live) and (shadow) logged, so a live round where the four
+      // tests declined to tag produced no line at all. The operator could not
+      // distinguish "fiat considered this and correctly refused" from "fiat
+      // never ran". Eleventh instance of the reporting-layer class, and the
+      // one that most looks like an absent feature.
+      if (!ack.pass && fiatRecognitionMode() === "live") {
+        logError("\u25C7 FIAT (live) — directive detected but NOT tagged; the round stands on its own " +
+          "merits. " + ack.evidence.join(" | "));
       }
       if (fiatRecognitionMode() === "shadow") {
         logError("\u25C7 FIAT (shadow) — " + (ack.pass
@@ -11584,11 +11594,37 @@ roundData,
           if (_dig.length >= 2) {
             const set = new Set(_dig.map((k) => _seatDelivered[k].digest));
             if (set.size > 1) {
+              // v4.10.2 — LOCATE the divergence. The first version reported only
+              // that digests differed, which is a finding nobody can act on: it
+              // cannot distinguish a real per-seat difference from a defect in
+              // this check's own identity-stripping. Naming the first differing
+              // offset and the text either side turns it into something
+              // diagnosable in one read.
+              let where = "";
+              try {
+                const names = _dig.slice();
+                const a = _seatDelivered[names[0]].body || "";
+                let other = null, oName = null;
+                for (let i = 1; i < names.length; i++) {
+                  if (_seatDelivered[names[i]].digest !== _seatDelivered[names[0]].digest) {
+                    other = _seatDelivered[names[i]].body || ""; oName = names[i]; break;
+                  }
+                }
+                if (other !== null) {
+                  let k = 0; const lim = Math.min(a.length, other.length);
+                  while (k < lim && a[k] === other[k]) k++;
+                  where = " FIRST DIVERGENCE at char " + k + " of " + a.length + "/" + other.length +
+                    " \u2014 " + names[0] + ": \"" + clip(a.slice(k, k + 60), 60) + "\" vs " +
+                    oName + ": \"" + clip(other.slice(k, k + 60), 60) + "\".";
+                }
+              } catch (_) {}
               logError("\u26A0 [CONTEXT] ASYMMETRIC PROMPT \u2014 seats did NOT receive the same body: " +
                 _dig.map((k) => k + " " + _seatDelivered[k].chars + "ch/" + _seatDelivered[k].digest).join(" | ") +
-                ". Any disagreement this round may be seats answering DIFFERENT QUESTIONS, and every " +
+                "." + where +
+                " Any disagreement this round may be seats answering DIFFERENT QUESTIONS, and every " +
                 "downstream instrument (comparators, COUNTERSTAMP, claim diff) will still score it as " +
-                "though they answered the same one. Treat the verdict as unsafe.");
+                "though they answered the same one. Treat the verdict as unsafe. NOTE: if the divergence " +
+                "above is only the seat name, this check's identity-stripping is at fault, not the prompt.");
             }
           }
         } catch (_) {}
