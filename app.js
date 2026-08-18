@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.9.2-falsifier-convergence";
+  const RQ_BUILD = "v4.10.0-causal-provenance";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4485,6 +4485,9 @@ roundData,
         // const does not, which is why fiatRecognitionMode() below is safe and
         // this was not. Keep the numbers literal here, or move the constants
         // above the rack.
+        ["cplToggle", "rq_cpl", "CAUSAL PROVENANCE",
+         "Every round, seat call, fallback, ledger write and consolidation run records WHY it happened and what caused the thing that caused it. Enables the PUPPET INDEX \u2014 the share of activity whose causal root is human-authored. Client-side only, no API cost.",
+         "No causal events recorded. window.__rqPuppetIndex() reports nothing to measure."],
         ["autoDispatchToggle", "rq_auto_dispatch", "AUTO-DISPATCH",
          "\u26A0 THE COUNCIL RUNS ITSELF. Up to 4 self-generated prompts per day, jittered, in-browser only, never while busy or hidden or while the Governor reports distress. Rounds are tagged UNWITNESSED and CANNOT enter retrieval until you mark them reviewed. Pauses at 3 unreviewed.",
          "No autonomous rounds. Self-prompts wait in the banner for you to inject."],
@@ -5360,6 +5363,12 @@ roundData,
           _seatDelivered[c.name] = { chars: q.length, digest: ftDigest(_body) };
         } catch (_) {}
         const primaryTag = seatProvider[c.name]; // configured occupant at dispatch start
+        // CPL — one event per seat, parented to the round that asked for it.
+        const _cplSeatEv = cplWrite("seat_call", {
+          trigger_type: "internal_state",
+          parent_event_id: _cplRoundId,
+          detail: "council dispatch requested a position from the " + c.name + " seat (" + primaryTag + ")",
+        }, { seat: c.name, provider: primaryTag });
 
         const chain = [];
         if (!circuitOpen(c.name)) {
@@ -5412,6 +5421,14 @@ roundData,
             const next = chain[i + 1];
             if (next) {
               logError(`${seatLabel(c.name)} ${step.tag} failed (${e.message || e}) — seat falling to ${next.tag}.`);
+              // CPL — parented to the FAILED seat_call. This is the spec's own
+              // acceptance test 2: "confirm the fallback event names the failed
+              // seat_call as parent."
+              cplWrite("fallback", {
+                trigger_type: "internal_state",
+                parent_event_id: _cplSeatEv,
+                detail: c.name + " seat fell from " + step.tag + " to " + next.tag + " after: " + clip(String(e.message || e), 120),
+              }, { seat: c.name, from: step.tag, to: next.tag });
             }
           }
         }
@@ -9464,6 +9481,16 @@ roundData,
   }
 
   async function runConsolidationJobsClient() {
+    // CPL — consolidation is its OWN root: nothing the operator did caused this
+    // run, the interval rule did. Recording it as operator-rooted would be the
+    // single most misleading thing this layer could do.
+    try {
+      cplWrite("consolidation", {
+        trigger_type: "schedule",
+        parent_event_id: null,
+        detail: "consolidation client ran pending sleep-cycle jobs at load/idle (6-hourly cron seeded them)",
+      }, {});
+    } catch (_) {}
     if (!consolidationEnabled()) return;
     if (_consDisabledSession || _consRunning) return;
     if (!sbConfigured()) { _consLineOnce("cfg", "[CONS] Supabase not configured — consolidation client idle."); return; }
@@ -11167,6 +11194,138 @@ roundData,
     window.__rqUnreviewed = autoUnreviewedCount;
   } catch (_) {}
 
+  // ---------- Causal Provenance Layer (rq_cpl, default OFF) ----------
+  // Kimi seat, round 46. Every event carries WHY it happened and WHAT caused
+  // the thing that caused it, so "did the system act on its own?" becomes a
+  // query rather than an argument.
+  //
+  // The measurement it exists for is the PUPPET INDEX: the share of activity
+  // whose causal root is human-authored. The spec's own note on the baseline is
+  // the reason this is honest rather than flattering — "starts at ~100%
+  // operator-rooted. That honest 100% is the correct starting measurement, not
+  // an embarrassment." With auto-dispatch shipped it is already not 100%, which
+  // is precisely what makes it worth reading.
+  const RQ_CPL_KEY   = "rq_cpl_events_v1";
+  const RQ_CPL_MAX   = 2000;   // hard cap; trims oldest-first and says so
+  const RQ_CPL_KINDS = ["round_invoke", "seat_call", "fallback", "memory_write", "consolidation", "ui_action"];
+  const RQ_CPL_TRIGGERS = ["operator", "schedule", "internal_state"];
+
+  function cplEnabled() { return localStorage.getItem("rq_cpl") === "on"; }
+
+  let _cplRootId = null;    // root of the causal chain currently running
+  let _cplRoundId = null;   // the round_invoke event of the current dispatch
+
+  function cplLoad() {
+    try { const v = JSON.parse(localStorage.getItem(RQ_CPL_KEY) || "[]"); return Array.isArray(v) ? v : []; }
+    catch (_) { return []; }
+  }
+  function cplSave(rows) {
+    try { localStorage.setItem(RQ_CPL_KEY, JSON.stringify(rows)); }
+    catch (e) { logError("[CPL] persist failed (" + ((e && e.message) || e) + ") — events this session are in memory only."); }
+  }
+  function cplId() {
+    try { return (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random().toString(16).slice(2); }
+    catch (_) { return String(Date.now()) + "-" + Math.random().toString(16).slice(2); }
+  }
+
+  // THE WRITE API. It REFUSES rather than defaulting. A layer that silently
+  // supplies "operator" for an uninstrumented call site would report a clean
+  // puppet index built on a guess — the failure this whole project keeps
+  // finding, in the one place it would be least visible.
+  function cplWrite(kind, causation, extra) {
+    if (!cplEnabled()) return null;
+    try {
+      if (RQ_CPL_KINDS.indexOf(kind) === -1) {
+        logError("[CPL] REFUSED — unknown kind \"" + kind + "\". Nothing written."); return null;
+      }
+      if (!causation || typeof causation !== "object") {
+        logError("[CPL] REFUSED — " + kind + " had no causation object. Nothing written. " +
+          "An event without a cause is exactly what this layer exists to make impossible."); return null;
+      }
+      if (RQ_CPL_TRIGGERS.indexOf(causation.trigger_type) === -1) {
+        logError("[CPL] REFUSED — " + kind + " had trigger_type \"" + causation.trigger_type +
+          "\"; must be one of " + RQ_CPL_TRIGGERS.join("/") + ". Nothing written."); return null;
+      }
+      if (!causation.detail || !String(causation.detail).trim()) {
+        logError("[CPL] REFUSED — " + kind + " had no causation.detail. A trigger type without a reason " +
+          "is not provenance. Nothing written."); return null;
+      }
+      const id = cplId();
+      const parent = causation.parent_event_id || null;
+      // root: inherit from the parent's chain when there is one, else this event
+      // IS the root. Denormalised per spec so the rollup is a scan, not a walk.
+      let root = causation.root_event_id || null;
+      if (!root) {
+        if (parent) {
+          const rows = cplLoad();
+          const pe = rows.find((r) => r && r.id === parent);
+          root = (pe && pe.causation && pe.causation.root_event_id) || parent;
+        } else { root = id; }
+      }
+      const ev = {
+        id: id, ts: new Date().toISOString(), kind: kind,
+        causation: {
+          trigger_type: causation.trigger_type,
+          parent_event_id: parent,
+          root_event_id: root,
+          detail: String(causation.detail).slice(0, 300),
+        },
+        // D-B: a digest, named as a digest. Pillar 2 owns real hash chaining
+        // with an HMAC; calling this a hash chain would overstate it.
+        payload_digest: ftDigest(JSON.stringify(extra || {})),
+        ...(extra ? { extra: extra } : {}),
+      };
+      const rows = cplLoad();
+      rows.push(ev);
+      if (rows.length > RQ_CPL_MAX) {
+        const dropped = rows.length - RQ_CPL_MAX;
+        rows.splice(0, dropped);
+        logError("[CPL] event cap " + RQ_CPL_MAX + " reached — " + dropped + " oldest event(s) dropped. " +
+          "The puppet index from here covers only the retained window, not all history.");
+      }
+      cplSave(rows);
+      return id;
+    } catch (_) { return null; }
+  }
+
+  // THE PUPPET INDEX. Roots only — every non-root event inherits its root's
+  // classification by construction, so counting all events would weight a round
+  // by how many seats happened to answer.
+  function cplPuppetIndex() {
+    const rows = cplLoad();
+    if (!rows.length) {
+      logError("[CPL] no events recorded. Turn on CAUSAL PROVENANCE and run a round.");
+      return null;
+    }
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const counts = { operator: 0, schedule: 0, internal_state: 0, unresolved: 0 };
+    const seenRoots = new Set();
+    rows.forEach((r) => {
+      const rootId = r.causation.root_event_id;
+      if (seenRoots.has(rootId)) return;
+      seenRoots.add(rootId);
+      const rootEv = byId.get(rootId);
+      // A root outside the retained window is UNRESOLVED, never assumed
+      // operator. Guessing here would inflate the human-rooted share, which is
+      // the one direction this measurement must never fail in.
+      if (!rootEv) { counts.unresolved++; return; }
+      counts[rootEv.causation.trigger_type] = (counts[rootEv.causation.trigger_type] || 0) + 1;
+    });
+    const total = seenRoots.size || 1;
+    const pct = (n) => Math.round((n / total) * 1000) / 10;
+    logError("[CPL] ACTIVITY PROVENANCE over " + rows.length + " event(s) in " + total + " causal chain(s) — " +
+      "operator-rooted: " + pct(counts.operator) + "% \u00b7 scheduled: " + pct(counts.schedule) + "% \u00b7 " +
+      "internal: " + pct(counts.internal_state) + "%" +
+      (counts.unresolved ? " \u00b7 unresolved: " + pct(counts.unresolved) + "% (root outside the retained window)" : "") +
+      ". A high operator share is the CORRECT reading for a reactive system; it is a baseline, not a failing.");
+    return { counts: counts, chains: total, events: rows.length };
+  }
+  try {
+    window.__rqPuppetIndex = cplPuppetIndex;
+    window.__rqCplEvents = () => cplLoad();
+    window.__rqCplClear = () => { try { localStorage.removeItem(RQ_CPL_KEY); logError("[CPL] event store cleared by operator."); } catch (_) {} };
+  } catch (_) {}
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -11250,6 +11409,21 @@ roundData,
       // never here. Zero awaits; runs after the governor gate, which stays first.
       _fiatCandidate = fiatPreFilter(query);
       _fiatShadow = null;
+      // CPL — the root event for this dispatch. trigger_type is DERIVED from how
+      // the round actually started, never assumed: the auto scheduler sets
+      // _autoThisRound, the banner sets _rqEndogenousPrompt, and anything else
+      // is the operator typing. Getting this wrong would misclassify an entire
+      // causal chain, which is the one error the puppet index cannot survive.
+      _cplRoundId = cplWrite("round_invoke", {
+        trigger_type: _autoThisRound ? "schedule" : "operator",
+        parent_event_id: null,
+        detail: _autoThisRound
+          ? "autonomous dispatch scheduler fired (jittered interval, in-browser)"
+          : (_rqEndogenousPrompt !== null && _rqEndogenousPrompt === query)
+            ? "operator injected a self-generated prompt from the queue banner"
+            : "operator submitted a prompt",
+      }, { chars: String(query || "").length });
+      _cplRootId = _cplRoundId;
       // P7 F3 — predictions fire CONCURRENTLY and are NEVER awaited (R-P7-3).
       // Flag off: one localStorage read and nothing else. Note/indexical rounds
       // have no adjudication to predict, so they are excluded here AND at the
@@ -11393,6 +11567,11 @@ roundData,
         // the deterministic computation, which is honest; wiring the real
         // verdict needs the header to be built after COUNTERSTAMP, or the
         // header to be patched once it lands. Neither is tonight's job.
+        cplWrite("memory_write", {
+          trigger_type: "internal_state",
+          parent_event_id: _cplRoundId,
+          detail: "round outcome written to the ledger (" + (divided ? "divided" : (result.trust || "unknown")) + ")",
+        }, { outcome: divided ? "divided" : (result.trust || "unknown") });
         const _roundHeader = buildRoundHeader(query, result, allAnswers, dispatchId, null);
         logRoundHeader(_roundHeader);
         recordLedger({
@@ -11756,6 +11935,9 @@ roundData,
         ? "\u26A0 [FULLTEXT] Targeted full-text request ON — seats may ask for up to " + RQ_FT_MAX_ROUNDS +
           " rounds verbatim via [REQUEST_FULLTEXT: n]. Rounds run with this on carry an extra instruction and are not prompt-identical to rounds without it."
         : "[FULLTEXT] Targeted full-text request OFF — seats see clipped ledger excerpts only.");
+      logError(cplEnabled()
+        ? "[CPL] Causal provenance ON — rounds, seat calls, fallbacks, ledger writes and consolidation runs record their cause and parent. Run window.__rqPuppetIndex() for the breakdown. The write API REFUSES any event lacking a causation object."
+        : "[CPL] Causal provenance OFF — no causal events recorded.");
       logError(autoDispatchEnabled()
         ? "\u25C6 [AUTO] Autonomous dispatch ON — up to " + RQ_AUTO_MAX_PER_DAY + "/day, jittered, in-browser. " +
           autoUnreviewedCount() + " unreviewed auto round(s); scheduler pauses at " + RQ_AUTO_BACKLOG_STOP + ". " +
