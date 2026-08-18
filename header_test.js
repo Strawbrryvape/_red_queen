@@ -131,7 +131,13 @@ console.log("\n--- v4.9.1: delivered-prompt digests (Round 84, Kimi seat) ---");
 // PROVIDER actually received after its own truncation.
 tt("a per-seat delivered record exists", /const _seatDelivered = \{\}/.test(src));
 tt("it is captured at the last point before the call leaves the client",
-   /_seatDelivered\[c\.name\] = \{ chars: q\.length, digest: ftDigest\(_body\) \}/.test(src));
+   /_seatDelivered\[c\.name\] = \{ chars: q\.length, digest: ftDigest\(_body\)/.test(src));
+tt("v4.10.2: the stripped body is retained so divergence can be LOCATED",
+   /digest: ftDigest\(_body\), body: _body/.test(src));
+tt("the first differing offset is reported, not just that one exists",
+   /FIRST DIVERGENCE at char/.test(src));
+tt("it warns that the check itself may be at fault",
+   /this check's identity-stripping is at fault, not the prompt/.test(src));
 tt("the identity line is REMOVED before digesting, or it would differ by design",
    /const _body = q\.replace\(identityLine, ""\)/.test(src));
 tt("it resets per dispatch so an absent seat cannot inherit a stale digest",
