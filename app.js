@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.9.1-delivered-digest";
+  const RQ_BUILD = "v4.9.2-falsifier-convergence";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -10823,6 +10823,49 @@ roundData,
   // other, which is the only place independence can honestly be measured.
   //
   // Returns null when the worker is unavailable — never a guessed number.
+  // ===== v4.9.2 — FALSIFIER CONVERGENCE. The Claude seat, round 85, naming the
+  // one check for shared-blindspot failure that no instrument covers:
+  //
+  //   "Per-seat independence score — how much each seat's falsifier overlaps
+  //    with the others' on the same question. If three seats produce falsifiers
+  //    that cluster tightly in embedding space despite apparent disagreement in
+  //    language, that's the flag."
+  //
+  // THE INSIGHT, and it is the reason this is worth building: a shared blindspot
+  // does not present as similar ANSWERS. It presents as similar CONDITIONS FOR
+  // BEING WRONG. Three seats can argue three different positions while agreeing
+  // entirely about what evidence would overturn them — and if one piece of
+  // counter-evidence refutes all three, their errors are correlated no matter
+  // how divergent the prose looks. That is Condorcet's failure case, and every
+  // existing instrument here measures POSITION divergence, so all of them read
+  // this round as healthy.
+  //
+  // The discriminating signature is a DIVERGENCE, not a level:
+  //     positions far apart  +  falsifiers close together  =  suspect
+  // Both close is ordinary agreement (the conformity audit already sees it).
+  // Both far apart is a healthy contested round. Only the crossed case is new.
+  //
+  // Needs no new data: falsifiers are already parsed into the Round Header
+  // receipts, and embedText is the local worker at zero API cost.
+  const RQ_FC_CLOSE = 0.30;   // TUNE-AFTER-DATA — falsifier distance below this is "clustered"
+  const RQ_FC_APART = 0.45;   // TUNE-AFTER-DATA — position distance above this is "divergent"
+
+  async function caFalsifierDistance(entry) {
+    try {
+      const rec = (entry && entry.header && entry.header.receipts) || [];
+      const fs = rec.filter((r) => r && !r.absent && r.falsifier && String(r.falsifier).length > 30)
+                    .map((r) => String(r.falsifier));
+      if (fs.length < 2) return null;          // one falsifier cannot cluster with anything
+      const vecs = await Promise.all(fs.map((t) => embedText(t)));
+      if (vecs.some((v) => !v)) return null;   // no worker => UNKNOWN, never a guessed number
+      let sum = 0, n = 0;
+      for (let i = 0; i < vecs.length; i++) {
+        for (let j = i + 1; j < vecs.length; j++) { sum += 1 - _cosine384(vecs[i], vecs[j]); n++; }
+      }
+      return n ? Math.round((sum / n) * 1000) / 1000 : null;
+    } catch (_) { return null; }
+  }
+
   async function caPathDistance(positions) {
     try {
       const texts = positions.map((p) => caStrip(caPosText(p))).filter((t) => t.length > 40);
@@ -10860,6 +10903,8 @@ roundData,
       const e = rounds[i];
       const pos = e.positions || [];
       const path = await caPathDistance(pos);
+      // v4.9.2 — the crossed case: positions apart, falsifiers together.
+      const fdist = await caFalsifierDistance(e);
 
       // Shared specifics ACROSS seats within the round.
       const specs = pos.map((p) => caSpecifics(caPosText(p)));
@@ -10892,7 +10937,12 @@ roundData,
       if (path !== null && path < RQ_CA_PATH_FLOOR && String(e.outcome || "") !== "divided") flags.push("LOW-PATH-DIVERGENCE");
       if (echo !== null && echo > RQ_CA_ANCHOR_FLOOR) flags.push("CROSS-ROUND-ECHO");
       if (shared > 2) flags.push("SHARED-SPECIFICS");
-      rows.push({ t: e.t, outcome: e.outcome, seats: pos.length, path, shared, echo, flags });
+      // Only the CROSSED signature flags. Requires both measurements present —
+      // a missing falsifier distance means unmeasured, not clean.
+      if (fdist !== null && path !== null && fdist < RQ_FC_CLOSE && path > RQ_FC_APART) {
+        flags.push("FALSIFIER-CONVERGENCE");
+      }
+      rows.push({ t: e.t, outcome: e.outcome, seats: pos.length, path, shared, echo, fdist, flags });
     }
 
     const scored = rows.filter((r) => r.path !== null);
@@ -10918,11 +10968,20 @@ roundData,
           (lm < em ? "DECLINING \u2014 check this against the verdict trend; both falling together is the herding signature"
                    : "holding or rising \u2014 paths remain divergent") + ")."
         : ""));
+    const fconv = rows.filter((r) => r.flags.indexOf("FALSIFIER-CONVERGENCE") !== -1);
+    if (fconv.length) {
+      logError("[CONFORMITY] \u26A0 " + fconv.length + " round(s) show FALSIFIER CONVERGENCE \u2014 the seats " +
+        "argued DIFFERENT positions (path > " + RQ_FC_APART + ") while agreeing about what would OVERTURN " +
+        "them (falsifier distance < " + RQ_FC_CLOSE + "). One piece of counter-evidence would refute all of " +
+        "them at once, so their errors are correlated however divergent the prose looks. This is the " +
+        "shared-blindspot signature; no other instrument here would flag it.");
+    }
     const flagged = rows.filter((r) => r.flags.length);
     if (flagged.length) {
       flagged.slice(0, 10).forEach((r) => {
         logError("[CONFORMITY] \u25C7 round t=" + r.t + " [" + (r.outcome || "?") + "] \u2014 " + r.flags.join(", ") +
-          " (path " + (r.path === null ? "n/a" : r.path) + ", shared specifics " + r.shared +
+          " (path " + (r.path === null ? "n/a" : r.path) +
+          ", falsifier dist " + (r.fdist === null ? "n/a" : r.fdist) + ", shared specifics " + r.shared +
           ", cross-round echo " + (r.echo === null ? "n/a" : r.echo) + ")");
       });
       if (flagged.length > 10) logError("[CONFORMITY] \u2026and " + (flagged.length - 10) + " more flagged round(s).");
