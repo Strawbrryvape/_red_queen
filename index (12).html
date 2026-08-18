@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://generativelanguage.googleapis.com https://api.anthropic.com https://api.moonshot.ai https://api.moonshot.cn https://api.groq.com https://api.cerebras.ai https://openrouter.ai https://ykkafntuuxiauokmcozz.supabase.co https://cdn.jsdelivr.net https://huggingface.co https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.hf.co https://us.aws.cdn.hf.co; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; worker-src blob:;"><link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- DEMO badge -->
+<div id="demoBadge" class="demo-badge hidden">DEMO</div>
+
+<!-- HEADER -->
+<header class="topbar">
+  <span class="wordmark">Red Queen</span>
+  <div class="header-actions">
+    <button id="copyBtn" class="icon-btn hidden" aria-label="Copy council response" title="Copy response">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+      </svg>
+    </button>
+    <button id="menuBtn" class="menu-btn" aria-label="Open menu">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</header>
+
+<!-- MAIN CANVAS -->
+<main class="canvas">
+
+  <!-- Constellation -->
+  <section class="constellation" aria-label="Council agents">
+    <div class="agent" id="agent-gemini">
+      <div class="ring ring-gemini"></div>
+      <span class="agent-name">Gemini</span>
+    </div>
+    <div class="agent" id="agent-kimi">
+      <div class="ring ring-kimi"></div>
+      <span class="agent-name">Kimi</span>
+    </div>
+    <div class="agent" id="agent-claude">
+      <div class="ring ring-claude"></div>
+      <span class="agent-name">Claude</span>
+    </div>
+  </section>
+
+  <!-- Consensus Bar -->
+  <section class="consensus-wrap">
+    <div id="consensusBar" class="consensus-bar is-empty">
+      <span id="consensusText">Awaiting Council Input...</span>
+    </div>
+  </section>
+
+  <!-- Summon -->
+  <section class="summon-wrap">
+    <button id="summonBtn" class="summon-btn" aria-label="Summon Council">
+      <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 2v6"/><path d="M12 16v6"/><path d="M4.9 4.9l4.2 4.2"/><path d="M14.9 14.9l4.2 4.2"/><path d="M2 12h6"/><path d="M16 12h6"/><path d="M4.9 19.1l4.2-4.2"/><path d="M14.9 9.1l4.2-4.2"/>
+      </svg>
+    </button>
+  </section>
+
+</main>
+
+<!-- BOTTOM SHEET -->
+<div id="sheetScrim" class="scrim hidden"></div>
+<div id="bottomSheet" class="bottom-sheet" aria-hidden="true">
+  <div class="sheet-handle"></div>
+  <label class="sheet-label" for="queryInput">Ask the Council</label>
+  <textarea id="queryInput" rows="6" placeholder="What should we solve?"></textarea>
+  <div class="input-meta">
+    <span class="input-hint">Enter to send · Shift+Enter for new line</span>
+    <span id="charCount" class="char-count">0 chars</span>
+  </div>
+  <button id="sendBtn" class="send-btn">Send to Council</button>
+
+  <!-- Document Upload -->
+  <div id="dropZone" class="drop-zone" role="button" tabindex="0" aria-label="Attach documents">
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/>
+    </svg>
+    <span id="dropZoneLabel">Attach documents — tap or drop .txt / .md / .log / .csv</span>
+    <input type="file" id="fileInput" accept=".txt,.md,.log,.csv,.json" multiple hidden>
+  </div>
+  <ul id="attachmentList" class="attachment-list hidden"></ul>
+</div>
+
+<!-- RIGHT DRAWER -->
+<div id="drawerScrim" class="scrim hidden"></div>
+<aside id="drawer" class="drawer" aria-hidden="true">
+  <div class="drawer-header">
+    <span class="drawer-title">Red Queen</span>
+    <button id="drawerClose" class="drawer-close" aria-label="Close menu">&times;</button>
+  </div>
+
+  <button id="newSessionBtn" class="drawer-action">New Session</button>
+
+  <details open>
+    <summary>Session History</summary>
+    <ul id="historyList" class="history-list">
+      <li class="empty-note">No queries yet this session.</li>
+    </ul>
+  </details>
+
+  <details>
+    <summary>Error Logs</summary>
+    <ul id="errorList" class="error-list">
+      <li class="empty-note">No errors logged.</li>
+    </ul>
+  </details>
+
+  <details>
+    <summary>Settings</summary>
+    <div class="settings">
+      <label>Gemini API Key
+        <input type="password" id="keyGemini" autocomplete="off" placeholder="AIza...">
+      </label>
+      <label>Kimi API Key
+        <input type="password" id="keyKimi" autocomplete="off" placeholder="sk-...">
+      </label>
+      <label>Claude API Key
+        <input type="password" id="keyClaude" autocomplete="off" placeholder="sk-ant-...">
+      </label>
+      <label>Groq API Key (free tier — fills Claude's seat when no Claude key)
+        <input type="password" id="keyGroq" autocomplete="off" placeholder="gsk_...">
+      </label>
+      <label>Cerebras API Key (free tier — fills Gemini's seat when no Gemini key)
+        <input type="password" id="keyCerebras" autocomplete="off" placeholder="csk-...">
+      </label>
+      <label>OpenRouter API Key (free tier — universal fallback for any failed seat)
+        <input type="password" id="keyOpenRouter" autocomplete="off" placeholder="sk-or-...">
+      </label>
+      <label class="toggle-row">
+        <span>Demo Mode</span>
+        <input type="checkbox" id="demoToggle">
+      </label>
+      <button id="saveSettings" class="drawer-action subtle">Save settings</button>
+    </div>
+  </details>
+
+<details>
+    <summary>About Red Queen</summary>
+    <div class="about-text">
+      <p>The Red Queen is a browser-based council of AI models built for multi-model consensus and collaborative truth-seeking. It runs entirely as a static site in your browser with no backend, orchestrating independent frontier models &mdash; Gemini, Claude and Kimi &mdash; that deliberate over a prompt in real time. Instead of trusting a single, unchecked AI, you watch three seats reason separately and answer only for themselves.</p>
+
+      <p>You supply your own API keys, and nothing leaves your browser except the calls you pay for.</p>
+
+      <p>Every round is recorded to a shared ledger (&ldquo;Council Memory&rdquo;) under a trust tag:</p>
+      <ul style="margin:8px 0;padding-left:20px;list-style-type:disc;">
+        <li style="margin-bottom:4px;"><strong>VERIFIED</strong> &mdash; the council agreed.</li>
+        <li style="margin-bottom:4px;"><strong>PROVISIONAL</strong> &mdash; a subset agreed; unconfirmed by the rest.</li>
+        <li style="margin-bottom:4px;"><strong>SOLE VOICE</strong> &mdash; only one seat could answer. An infrastructure state, not a consensus.</li>
+        <li style="margin-bottom:4px;"><strong>DIVIDED</strong> &mdash; no consensus, with the conflicting positions preserved openly rather than averaged away.</li>
+      </ul>
+
+      <p>Every seat works under a strict <em>falsifier-first</em> discipline: before making its argument, it must state what would prove it wrong.</p>
+
+      <p>Disagreement is not the end of a round. Seats cross-examine each other&rsquo;s positions, and they do change their minds &mdash; conceding specific errors when another seat locates one. By exposing both the reliability of agreement and the irreducibility of genuine disagreement, the Red Queen turns AI orchestration into a transparent, self-correcting deliberative process.</p>
+    </div>
+  </details>
+</aside>
+
+<!-- Toast -->
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+<script src="app.js"></script>
+<script src="ui-plus.js"></script>
+</body>
+</html>
