@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.10.2-diverge-locate";
+  const RQ_BUILD = "v4.11.0-ledger-diff";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -5135,7 +5135,38 @@ roundData,
   // Run the adjudication round. Returns a resolution object or null.
   async function runAdjudication(originalQuery, rawAnswers, wrappedCalls) {
     if (!adjudicationEnabled()) return null;
-    const answering = rawAnswers.filter((a) => a.text && !a.malformed);
+    // v4.11.0 — NON-ANSWER CONTAMINATION. Kimi seat, round 97, diagnosing one of
+    // three distinct causes the flat DIVIDED tag conflates: "Round 94 went
+    // DIVIDED partly because one seat issued a fulltext request instead of a
+    // position. An abstention scored as a dissent manufactures division where
+    // none was argued."
+    //
+    // Verified: nothing guarded this. A seat returning only [REQUEST_FULLTEXT: n]
+    // entered the answering set and was compared against real positions, which
+    // can only fail — so the seat's SILENCE was recorded as DISAGREEMENT.
+    //
+    // The guard is deliberately narrow: a seat is excluded only when, with the
+    // request markers removed, essentially nothing is left. A seat that asks for
+    // context AND states a position is a normal answer and stays.
+    const _isNonAnswer = (a) => {
+      try {
+        const bare = String((a && a.text) || "")
+          .replace(/\[REQUEST_FULLTEXT[^\]]*\]/gi, " ")
+          .replace(/^\s*FALSIFIER\s*:.*$/gim, " ")
+          .replace(/\s+/g, " ").trim();
+        return bare.length < 40;
+      } catch (_) { return false; }
+    };
+    rawAnswers.forEach((a) => {
+      if (a && a.text && !a.malformed && _isNonAnswer(a)) {
+        a.nonAnswer = true;
+        logError("[ABSTENTION] " + seatLabel(a.name) + " returned a request or scaffolding with no " +
+          "position (" + String(a.text || "").length + " chars). EXCLUDED from consensus scoring — an " +
+          "abstention is not a dissent, and scoring it as one manufactures division that was never " +
+          "argued. The text is still recorded and rendered.");
+      }
+    });
+    const answering = rawAnswers.filter((a) => a.text && !a.malformed && !a.nonAnswer);
     if (answering.length < 2) return null;
 
     // Anonymize. Letter assignment is stable within this round only.
@@ -7845,6 +7876,195 @@ roundData,
   const PS_CONTAM_FROM = "v4.1.0";
   const PS_CONTAM_TO   = "v4.7.1";
   const PS_NEAR_FLOOR  = 0.03;   // "squeaked past" band above CS_GATE1_MIN_SIM
+  // ---------- Ledger Diff Engine (operator-invoked, zero API cost) ----------
+  // Kimi seat, round 91. Extends the trust-tag system "from a static label into
+  // an audited claim: tags currently assert; LDE checks whether the assertion
+  // was ever honored."
+  //
+  // Deterministic, no network, no model calls. Reports candidates only — the
+  // council adjudicates. Per the spec's non-goals, an engine that DECLARED
+  // findings "would itself become a false-consensus pressure instrument."
+  // NOT BUILT, deliberately: DIGEST_VERIFY. Pillar 2 already hash-chains rows
+  // with a real HMAC; a second ledger-body digest would be WEAKER while looking
+  // STRONGER, which is the same reasoning that kept a hash chain out of CPL.
+  // POSITION_REVERSAL and RECEIPT_CHECK are deferred, not rejected — the
+  // reversal heuristic (token overlap + negation flip) is the one most likely
+  // to produce false candidates, and it deserves its own calibration.
+  // NOT BUILT, deliberately: DIGEST_VERIFY. Pillar 2 already hash-chains rows
+  // with a real HMAC; a second ledger-body digest would be WEAKER while looking
+  // STRONGER — the same reasoning that kept a hash chain out of CPL.
+  // POSITION_REVERSAL and RECEIPT_CHECK are deferred, not rejected: the reversal
+  // heuristic (token overlap + negation flip) is the one most likely to produce
+  // false candidates, and deserves its own calibration before it ships.
+  const RQ_LDE_STALE_ROUNDS = 10;   // TUNE-AFTER-DATA — falsifiers older than this are "aging"
+  const RQ_LDE_ECHO_MIN     = 12;   // min chars of a shared phrase to count as an echo
+  const RQ_LDE_ECHO_GRAMS   = 6;    // word n-gram length for the tag audit
+
+  // Every FALSIFIER: ever stated, with the round that stated it. Reads the
+  // Round Header receipts first (parsed at write time, authoritative) and falls
+  // back to scanning position text for rounds recorded before headers existed.
+  function ldeFalsifiers() {
+    const out = [];
+    (ledger || []).forEach((e, idx) => {
+      if (!e) return;
+      const rec = (e.header && e.header.receipts) || null;
+      if (rec) {
+        rec.forEach((r) => {
+          if (r && !r.absent && r.falsifier) {
+            out.push({ round: idx + 1, t: e.t, seat: r.seat, text: String(r.falsifier) });
+          }
+        });
+        return;
+      }
+      (e.positions || []).forEach((pos) => {
+        try {
+          const m = RQ_FALSIFIER_RE.exec(String(pos.text || ""));
+          if (m) out.push({ round: idx + 1, t: e.t, seat: pos.seat, text: clip(m[1].trim(), 300) });
+        } catch (_) {}
+      });
+    });
+    return out;
+  }
+
+  // Content words only — the shared scaffolding every seat emits would
+  // otherwise make every falsifier look "addressed" by every later round.
+  // v4.11.0 — NOTE: tokenize() returns a SET, not an array. The first draft
+  // called .filter() on it directly; that threw inside the try/catch and
+  // returned an empty set, so every falsifier scored UNSCOREABLE and the tag
+  // audit found nothing — a permanent silent all-clear from an instrument whose
+  // whole job is to find things. Caught by the suite, which is the reason these
+  // are exercised against synthetic ledgers rather than shape-asserted.
+  function ldeKeyTerms(text) {
+    try {
+      return new Set([...tokenize(String(text || ""))].filter((w) => w.length > 3));
+    } catch (_) { return new Set(); }
+  }
+
+  // n-grams need ORDERED words, so they cannot come from tokenize() — a Set is
+  // unordered and deduplicated, and a "phrase" built from one is meaningless.
+  // Light normalisation only: lowercase, strip punctuation, keep order.
+  function ldeWords(text) {
+    try {
+      return String(text || "").toLowerCase().replace(/[^a-z0-9\s]+/g, " ")
+        .split(/\s+/).filter(Boolean);
+    } catch (_) { return []; }
+  }
+
+  // A falsifier counts as ADDRESSED when a LATER round's prompt or positions
+  // carry most of its distinctive terms. Heuristic and deliberately generous:
+  // the finding that matters is a falsifier NEVER revisited, and a false
+  // "addressed" is the safer error than a false "untested".
+  function ldeAuditFalsifiers() {
+    const fs = ldeFalsifiers();
+    if (!fs.length) {
+      logError("[LDE] no falsifiers found in this ledger. If the falsifier ask has been on, " +
+        "this means they were stated but not parsed into receipts — check a round's header before " +
+        "concluding the council has not been stating them.");
+      return null;
+    }
+    const rounds = (ledger || []).map((e, i) => ({
+      idx: i + 1,
+      terms: ldeKeyTerms(String((e && e.prompt) || "") + " " +
+        ((e && e.positions) || []).map((x) => x.text || "").join(" ")),
+    }));
+    const results = fs.map((f) => {
+      const key = [...ldeKeyTerms(f.text)].filter((w) => w.length > 4);
+      if (key.length < 3) return { ...f, status: "UNSCOREABLE", hits: [] };
+      const hits = [];
+      rounds.forEach((r) => {
+        if (r.idx <= f.round) return;                      // only LATER rounds can test it
+        const overlap = key.filter((w) => r.terms.has(w)).length / key.length;
+        if (overlap >= 0.6) hits.push(r.idx);
+      });
+      return { ...f, status: hits.length ? "ADDRESSED" : "UNTESTED", hits: hits };
+    });
+    const untested = results.filter((r) => r.status === "UNTESTED");
+    const latest = (ledger || []).length;
+    const stale = untested.filter((r) => (latest - r.round) >= RQ_LDE_STALE_ROUNDS);
+    logError("[LDE] FALSIFIER LEDGER — " + fs.length + " falsifier(s) across " + latest + " round(s): " +
+      results.filter((r) => r.status === "ADDRESSED").length + " addressed by a later round, " +
+      untested.length + " untested" +
+      (results.filter((r) => r.status === "UNSCOREABLE").length
+        ? ", " + results.filter((r) => r.status === "UNSCOREABLE").length + " too short to score" : "") + ".");
+    if (stale.length) {
+      logError("[LDE] \u26A0 " + stale.length + " falsifier(s) untested for " + RQ_LDE_STALE_ROUNDS +
+        "+ rounds. This is the seat's own round-87 test: \"if none ever gets executed, that's evidence " +
+        "the council generates falsifiers as ritual rather than instruments.\" Oldest: " +
+        stale.slice(0, 5).map((r) => "R" + r.round + " " + r.seat + " \"" + clip(r.text, 70) + "\"").join(" | "));
+    } else {
+      logError("[LDE] no falsifier is stale past " + RQ_LDE_STALE_ROUNDS + " rounds. NOTE: \"addressed\" " +
+        "here means a later round shared most of its distinctive terms \u2014 topical overlap, NOT proof the " +
+        "condition was actually tested. Treat it as a pointer, never as a pass.");
+    }
+    return results;
+  }
+
+  // Text from a DIVIDED or SOLE VOICE round reappearing later. This is the
+  // anchoring failure made mechanical: three logged instances of seats
+  // reasoning from a rejected position, and in every one vector retrieval had
+  // injected NOTHING — the anchoring travelled on plain ledger recency.
+  function ldeAuditTags() {
+    const rows = (ledger || []);
+    if (rows.length < 2) { logError("[LDE] fewer than 2 rounds — nothing to audit."); return null; }
+    const grams = (txt) => {
+      const w = ldeWords(txt);
+      const s = new Set();
+      for (let i = 0; i + RQ_LDE_ECHO_GRAMS <= w.length; i++) {
+        const g = w.slice(i, i + RQ_LDE_ECHO_GRAMS).join(" ");
+        if (g.length >= RQ_LDE_ECHO_MIN) s.add(g);
+      }
+      return s;
+    };
+    // Document frequency so boilerplate the seats emit every round cannot
+    // masquerade as an echo of one unsettled position.
+    const df = new Map();
+    const perRound = rows.map((e) => {
+      const g = grams(((e.positions || []).map((x) => x.text || "").join(" ")));
+      g.forEach((x) => df.set(x, (df.get(x) || 0) + 1));
+      return g;
+    });
+    const findings = [];
+    rows.forEach((e, i) => {
+      const tag = String((e && e.outcome) || "");
+      if (tag !== "divided" && tag !== "sole") return;      // only UNSETTLED rounds can be miscited
+      const src = perRound[i];
+      for (let j = i + 1; j < rows.length; j++) {
+        const shared = [...perRound[j]].filter((g) => src.has(g) && (df.get(g) || 0) <= 2);
+        if (shared.length) {
+          findings.push({ from: i + 1, fromTag: tag.toUpperCase(), to: j + 1,
+                          phrases: shared.slice(0, 3) });
+          break;   // first echo only; a chain of them is one finding, not many
+        }
+      }
+    });
+    if (!findings.length) {
+      logError("[LDE] TAG AUDIT — no unsettled round's distinctive phrasing reappeared in a later " +
+        "round. NOT a clean bill of health: this reads WORDING, so a position carried forward in " +
+        "different words is invisible to it.");
+      return [];
+    }
+    logError("[LDE] \u26A0 TAG AUDIT — " + findings.length + " case(s) where a DIVIDED or SOLE VOICE " +
+      "round's distinctive phrasing reappears in a later round. The council never settled these, so " +
+      "any later round treating them as settled is reasoning from a rejected position \u2014 the " +
+      "anchoring failure, made mechanical. CANDIDATES ONLY; the council adjudicates: " +
+      findings.slice(0, 6).map((f) => "R" + f.from + "(" + f.fromTag + ")\u2192R" + f.to +
+        " \"" + clip(f.phrases[0], 50) + "\"").join(" | "));
+    return findings;
+  }
+
+  function ldeRunAll() {
+    logError("[LDE] Ledger Diff Engine \u2014 auditing " + ((ledger || []).length) +
+      " round(s). Deterministic, no API calls. Findings are CANDIDATES; nothing here adjudicates.");
+    const f = ldeAuditFalsifiers();
+    const t = ldeAuditTags();
+    return { falsifiers: f, tags: t };
+  }
+  try {
+    window.__rqLedgerDiff = ldeRunAll;
+    window.__rqAuditFalsifiers = ldeAuditFalsifiers;
+    window.__rqAuditTags = ldeAuditTags;
+  } catch (_) {}
+
   function psCalibrationQuarantine() {
     const rows = (ledger || []).filter((e) => e && e.cs && e.cs.verdict);
     if (!rows.length) {
