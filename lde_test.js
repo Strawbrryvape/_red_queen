@@ -101,5 +101,26 @@ tt("DIGEST_VERIFY deliberately not built (Pillar 2 owns hashing)",
 tt("the non-adjudication non-goal is documented",
    /false-consensus pressure instrument/.test(src));
 
+
+console.log("\n--- v4.12.0: autonomous falsifier testing ---");
+tt("test rounds are queued into the EXISTING self-prompt queue",
+   /sbInsert\("rq_self_prompt_queue"/.test(src) && /RQ_FT_PREFIX/.test(src));
+tt("THE anti-treadmill gate: a test round does not append the falsifier ask",
+   /!isFalsifierTestRound\(query\)/.test(src));
+tt("batched, because one per round would need ~110 rounds",
+   /RQ_FT_BATCH   = 3/.test(src));
+tt("oldest stale falsifiers are selected first",
+   /\.sort\(\(a, b\) => a\.round - b\.round\)/.test(src));
+tt("only falsifiers stale past the threshold are queued",
+   /r\.status === "UNTESTED" && \(latest - r\.round\) >= RQ_LDE_STALE_ROUNDS/.test(src));
+tt("UNTESTABLE is a first-class verdict, not a failure",
+   /This is a legitimate verdict, not a failure/.test(src));
+tt("the prompt forbids raising new questions", /Do not raise new questions/.test(src));
+tt("duplicate test rounds are not stacked", /status=eq\.pending&prompt=eq\./.test(src));
+tt("queueing is OPERATOR-invoked; the scheduler only drains",
+   /window\.__rqQueueFalsifierTests/.test(src));
+tt("test rounds get their own provenance kind",
+   /isFalsifierTestRound\(query\) \? "FALSIFIER-TEST"/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
