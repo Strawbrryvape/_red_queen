@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.11.0-ledger-diff";
+  const RQ_BUILD = "v4.12.0-falsifier-tests";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -8065,6 +8065,83 @@ roundData,
     window.__rqAuditTags = ldeAuditTags;
   } catch (_) {}
 
+  // ---------- Autonomous falsifier testing (operator-queued, scheduler-run) ----------
+  const RQ_FT_BATCH   = 3;    // falsifiers per test round — 1/round would need 110 rounds
+  const RQ_FT_QUEUE_MAX = 5;  // test rounds queued per invocation; the scheduler drains 4/day
+
+  // The marker that identifies a test round everywhere downstream. Frozen: the
+  // falsifier-ask suppression, the provenance kind and the dedupe all key on it.
+  const RQ_FT_PREFIX = "FALSIFIER TEST:";
+
+  function ldeQueueFalsifierTests() {
+    if (!sbConfigured()) {
+      logError("[LDE] Supabase not configured — falsifier tests are queued in rq_self_prompt_queue, " +
+        "so there is nowhere to write them.");
+      return null;
+    }
+    const audit = ldeAuditFalsifiers();
+    if (!audit) return null;
+    const latest = (ledger || []).length;
+    // Oldest first: a falsifier stale for 40 rounds is more likely to be
+    // unanswerable-in-principle than one stale for 11, and finding those is
+    // worth more than clearing recent backlog.
+    const untested = audit
+      .filter((r) => r.status === "UNTESTED" && (latest - r.round) >= RQ_LDE_STALE_ROUNDS)
+      .sort((a, b) => a.round - b.round);
+    if (!untested.length) {
+      logError("[LDE] no falsifier is untested past " + RQ_LDE_STALE_ROUNDS + " rounds. Nothing to queue.");
+      return null;
+    }
+    const batches = [];
+    for (let i = 0; i < untested.length && batches.length < RQ_FT_QUEUE_MAX; i += RQ_FT_BATCH) {
+      batches.push(untested.slice(i, i + RQ_FT_BATCH));
+    }
+    logError("[LDE] " + untested.length + " stale falsifier(s); queueing " + batches.length +
+      " test round(s) of up to " + RQ_FT_BATCH + " each. The scheduler will run them at its own " +
+      "cadence and each round stays UNWITNESSED until you review it.");
+
+    let queued = 0;
+    batches.forEach((batch) => {
+      const body = batch.map((f, i) =>
+        (i + 1) + ". [Round " + f.round + ", " + f.seat + " seat] \"" + clip(f.text, 400) + "\""
+      ).join("\n\n");
+      const qPrompt = RQ_FT_PREFIX + " the council stated the falsifiers below and has not revisited " +
+        "them since. For EACH, return exactly one verdict:\n\n" +
+        "TESTED — the condition can be checked against the ledger or the system's own logs now. " +
+        "State the check and the result.\n" +
+        "UNTESTABLE — the condition cannot be checked even in principle from inside this system. " +
+        "State why. This is a legitimate verdict, not a failure.\n" +
+        "RETRACTED — the seat no longer holds the position, or the falsifier was malformed. State which.\n\n" +
+        body + "\n\n" +
+        "Answer only these. Do not raise new questions and do not state a new falsifier — this round " +
+        "exists to close open ones, not to open more.";
+      // Dedupe on the exact prompt, same guard F3 uses, so re-running this does
+      // not stack identical rounds.
+      _consFetch("rq_self_prompt_queue?status=eq.pending&prompt=eq." +
+        encodeURIComponent(qPrompt) + "&select=id&limit=1")
+        .then((dupe) => {
+          if (dupe && dupe.length) return;
+          if (!dupe) return;
+          sbInsert("rq_self_prompt_queue", {
+            source_round_id: null,
+            prompt: qPrompt,
+            status: "pending",
+          });
+          queued++;
+        })
+        .catch(() => {});
+    });
+    logError("[LDE] queued. Turn on AUTO-DISPATCH to have them run unattended, or use the " +
+      "self-prompt banner to inject one by hand. Either way they are recorded as test rounds and " +
+      "excluded from retrieval until reviewed.");
+    return { stale: untested.length, batches: batches.length };
+  }
+  try { window.__rqQueueFalsifierTests = ldeQueueFalsifierTests; } catch (_) {}
+
+  function isFalsifierTestRound(q) {
+    try { return String(q || "").trim().indexOf(RQ_FT_PREFIX) === 0; } catch (_) { return false; }
+  }
+
   function psCalibrationQuarantine() {
     const rows = (ledger || []).filter((e) => e && e.cs && e.cs.verdict);
     if (!rows.length) {
@@ -11630,6 +11707,7 @@ roundData,
     // injected evidence and a reconciliation round does not.
     const _endogenousKind = !_endogenous ? null
       : (_autoThisRound ? "AUTO-DISPATCHED"   // v4.7.0 — no human injected this one
+      : isFalsifierTestRound(query) ? "FALSIFIER-TEST"
       : /^SURPRISE AUDIT:/.test(String(query || "").trim()) ? "OPERATOR-INJECTED-AUDIT"
       : (/^RECONCILIATION TARGET/.test(String(query || "").trim()) ? "OPERATOR-INJECTED-RECONCILIATION"
       : "OPERATOR-INJECTED"));
@@ -11770,7 +11848,12 @@ roundData,
       // round's digest — an absent seat must read as absent, not as unchanged.
       try { Object.keys(_seatDelivered).forEach((k) => delete _seatDelivered[k]); } catch (_) {}
       const composedQuery = _composedBody + (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "") +
-        ((falsifierAskEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FALSIFIER_ASK) : "") +
+        // v4.12.0 — a FALSIFIER TEST round does NOT append the ask. Without this
+        // gate, every test round mints three new falsifiers while retiring at
+        // most three, so the backlog would grow under automation rather than
+        // drain. This one condition is what makes autonomous testing converge.
+        ((falsifierAskEnabled() && !_noteRound && !_indexicalRound && !isFalsifierTestRound(query))
+          ? ("\n\n" + RQ_FALSIFIER_ASK) : "") +
         _ftBlock +
         ((fulltextRetrieveEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FT_INSTRUCTION) : "");
       try {
