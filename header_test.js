@@ -33,9 +33,13 @@ tt("divergence_type is null rather than guessed when unknown",
    /function headerDivergenceType[\s\S]{0,700}return null;/.test(src));
 
 console.log("\n--- shape: the falsifier ask does not contaminate the prompt hash ---");
-const comp = src.slice(src.indexOf("const composedQuery ="), src.indexOf("const composedQuery =") + 400);
+const comp = src.slice(src.indexOf("const composedQuery ="), src.indexOf("const composedQuery =") + 1400);
 tt("ask is appended AFTER _composedBody", comp.indexOf("_composedBody") < comp.indexOf("RQ_FALSIFIER_ASK"));
 tt("ask is gated on its OWN flag, not the header flag", /falsifierAskEnabled\(\) && !_noteRound/.test(comp));
+tt("v4.12.0: a FALSIFIER TEST round does not append the ask",
+   /!isFalsifierTestRound\(query\)/.test(comp));
+tt("and the anti-treadmill reason is documented",
+   /mints three new falsifiers while retiring at/.test(src));
 tt("two independent flags exist",
    /localStorage\.getItem\("rq_round_header"\) === "on"/.test(src) &&
    /localStorage\.getItem\("rq_falsifier_ask"\) === "on"/.test(src));
