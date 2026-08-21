@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.12.0-falsifier-tests";
+  const RQ_BUILD = "v4.13.0-seat-transparency";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -5389,10 +5389,29 @@ roundData,
         // otherwise guarantee three different digests every round and measure
         // nothing. What remains should be byte-identical across seats; when it
         // is not, the record now says so.
-        try {
-          const _body = q.replace(identityLine, "");
-          _seatDelivered[c.name] = { chars: q.length, digest: ftDigest(_body), body: _body };
-        } catch (_) {}
+        // v4.12.1 — CAPTURE ONLY THE DISPATCH PASS.
+        //
+        // FIRST FALSE POSITIVE, 2026-08-20, and the locator built two days ago
+        // is what diagnosed it: the reported divergence was "Position A." vs
+        // "Position B." at char 8463 — the ADJUDICATION prompt, where each seat
+        // is deliberately told which position it submitted.
+        //
+        // Cause: this capture lives inside the wrapped seat function, and
+        // runAdjudication reuses those same wrappers. So it fired a SECOND time
+        // per round and overwrote the dispatch capture with adjudication
+        // prompts that differ per seat BY DESIGN. Same overwrite class as the
+        // round-78 seat-metadata defect: the last call wins and the record
+        // describes the wrong thing.
+        //
+        // The asymmetry check is about whether seats were asked the SAME
+        // QUESTION, which is a property of dispatch alone. Adjudication prompts
+        // are supposed to differ and must never be compared.
+        if (!_seatDelivered.__locked) {
+          try {
+            const _body = q.replace(identityLine, "");
+            _seatDelivered[c.name] = { chars: q.length, digest: ftDigest(_body), body: _body };
+          } catch (_) {}
+        }
         const primaryTag = seatProvider[c.name]; // configured occupant at dispatch start
         // CPL — one event per seat, parented to the round that asked for it.
         const _cplSeatEv = cplWrite("seat_call", {
@@ -5605,6 +5624,9 @@ roundData,
       return { text: eligible[0].text.trim(), divided: false, answers: eligible, trust: "sole" };
     }
 
+    // v4.12.1 — dispatch is complete; freeze the delivered-prompt record before
+    // adjudication reuses the same seat wrappers and overwrites it.
+    try { Object.defineProperty(_seatDelivered, "__locked", { value: true, configurable: true }); } catch (_) {}
     const { agreed, outliers } = checkConsensus(eligible);
 
     // PROVISIONAL rule (Kimi amendment, 2026-07-12): consensus is verified
@@ -6612,21 +6634,95 @@ roundData,
 
   // One ledger entry -> one text line. Trust state ALWAYS travels with
   // the memory — doctrine applies to the past as much as the present.
+  // v4.13.0 — the five fields the council ranked in round 112. Each is
+  // CONDITIONAL: a healthy round on primaries with retrieval hits renders
+  // exactly as before, because the memory block competes for a 6000-char cap.
+  //
+  // Per-seat state, and the distinction Kimi asked for: ABSENT (configured but
+  // never answered) is not the same as ABSTAINED (answered with a request or
+  // scaffolding and no position). "VERIFIED 2/3 means full agreement if the
+  // third seat was absent; it means abstention-as-dissent if the seat was
+  // present and silent."
+  function ledgerSeatBits(e, p, posCap) {
+    let tag = "";
+    try {
+      const rec = ((e.header && e.header.receipts) || []).find((r) => r && r.seat === p.seat);
+      if (rec) {
+        // Model identity ONLY when the seat ran below its configured provider.
+        // On a primary it adds nothing and costs budget.
+        if (rec.provider && rec.provider !== "primary" && rec.model) {
+          tag = `[${clip(String(rec.model), 24)}]`;
+        }
+      }
+    } catch (_) {}
+    return `${p.seat}${tag}: "${clip(p.text, posCap)}"`;
+  }
+
+  function ledgerAbsentBits(e) {
+    try {
+      const rec = (e.header && e.header.receipts) || [];
+      const named = (e.positions || []).map((p) => p.seat);
+      const out = [];
+      rec.forEach((r) => {
+        if (!r) return;
+        if (r.absent) out.push(`${r.seat}[ABSENT — configured but never answered]`);
+        else if (named.indexOf(r.seat) === -1) out.push(`${r.seat}[ABSTAINED — answered with no position]`);
+      });
+      return out.length ? " | " + out.join(" | ") : "";
+    } catch (_) { return ""; }
+  }
+
+  // Round-level context: retrieval and dispatch. Both conditional.
+  function ledgerRoundBits(e) {
+    const bits = [];
+    // Only when injection was armed and delivered NOTHING. Kimi: "if retrieval
+    // returned nothing, ledger citations were confabulation risk."
+    if (e.retrieval_hit === false) bits.push("no retrieval — seats had recency only");
+    // Only when a timer started it. Kimi: "106-108 read as live distress; if
+    // timer-fired they were synthetic probes and I would have answered as
+    // diagnostics."
+    if (e.dispatch_source === "auto") bits.push("timer-dispatched, not operator-typed");
+    return bits.length ? ` {${bits.join("; ")}}` : "";
+  }
+
   function ledgerLine(e, verbatim) {
     const q = clip(e.prompt, verbatim ? 200 : 100);
     if (e.outcome === "divided") {
       const posCap = verbatim ? 200 : 60;
       const positions = (e.positions || [])
-        .map((p) => `${p.seat}: "${clip(p.text, posCap)}"`)
-        .join(" | ");
-      return `Q: "${q}" → DIVIDED (no consensus) — ${positions}`;
+        .map((p) => ledgerSeatBits(e, p, posCap))
+        .join(" | ") + ledgerAbsentBits(e);
+      const ctx = ledgerRoundBits(e);
+      // A SKIPPED round is not a FAILED round. Shown first because it changes
+      // what the round IS, not merely why it split.
+      if (e.round_type === "indexical") {
+        return `Q: "${q}" → ROLL-CALL (consensus and adjudication SKIPPED by design — three ` +
+          `correct answers about three different subjects; never scored for agreement, ` +
+          `NOT a disagreement)${ctx} — ${positions}`;
+      }
+      if (e.round_type === "note") {
+        return `Q: "${q}" → OPERATOR NOTE (not adjudicated; no verdict claimed)${ctx} — ${positions}`;
+      }
+      if (e.round_type === "narrator") {
+        return `Q: "${q}" → NARRATOR PASS (arc writing; consensus not scored)${ctx} — ${positions}`;
+      }
+      // Sub-verdict ONLY when COUNTERSTAMP is live. A shadow diagnosis reaching
+      // a seat as though settled would defeat the point of shadow mode.
+      let why = "";
+      try {
+        if (e.cs && e.cs.verdict && !e.cs.shadow && counterstampMode() === "live") {
+          const st = csStyleFor(e.cs);
+          why = ` [${st.label} — ${st.action}]`;
+        }
+      } catch (_) {}
+      return `Q: "${q}" → DIVIDED (no consensus)${why}${ctx} — ${positions}`;
     }
     const tag =
       e.outcome === "verified" ? `VERIFIED ${e.counts || ""}`.trim() :
       e.outcome === "provisional" ? `PROVISIONAL ${e.counts || ""} (bench only, unconfirmed)`.trim() :
       e.outcome === "sole" ? "SOLE VOICE (single model, unverified)" :
       e.outcome.toUpperCase();
-    return `Q: "${q}" → ${tag}: "${clip(e.verdict, verbatim ? 400 : 120)}"`;
+    return `Q: "${q}" → ${tag}${ledgerRoundBits(e)}: "${clip(e.verdict, verbatim ? 400 : 120)}"`;
   }
 
   const MEMORY_HEADER =
@@ -11846,7 +11942,10 @@ roundData,
       const _ftBlock = await ftBuildBlock();
       // Reset per dispatch so a seat absent this round cannot inherit last
       // round's digest — an absent seat must read as absent, not as unchanged.
-      try { Object.keys(_seatDelivered).forEach((k) => delete _seatDelivered[k]); } catch (_) {}
+      try {
+        Object.keys(_seatDelivered).forEach((k) => delete _seatDelivered[k]);
+        delete _seatDelivered.__locked;   // without this, capture would fire once and never again
+      } catch (_) {}
       const composedQuery = _composedBody + (jsonEnvelopeEnabled() ? ENVELOPE_INSTRUCTION : "") +
         // v4.12.0 — a FALSIFIER TEST round does NOT append the ask. Without this
         // gate, every test round mints three new falsifiers while retiring at
@@ -11893,7 +11992,7 @@ roundData,
         // question — classifying the disagreement, decomposing the claims,
         // scoring it. This says so out loud instead, once, before any of that.
         try {
-          const _dig = Object.keys(_seatDelivered);
+          const _dig = Object.keys(_seatDelivered).filter((k) => k !== "__locked");
           if (_dig.length >= 2) {
             const set = new Set(_dig.map((k) => _seatDelivered[k].digest));
             if (set.size > 1) {
@@ -11990,6 +12089,18 @@ roundData,
           // consent record: this round has not been read by a human yet, and
           // the retrieval filter enforces that.
           ...(_autoThisRound ? { dispatch_source: "auto", review_status: "unwitnessed" } : {}),
+          // v4.13.0 — ROUND TYPE. An indexical/note/narrator round returns
+          // divided:true so every seat renders verbatim, but stores
+          // outcome:"divided" — so seats have been reading "DIVIDED (no
+          // consensus)" for rounds where consensus was DELIBERATELY NEVER
+          // SCORED, and counting deliberate skips as failures.
+          ...(result && result.indexical ? { round_type: "indexical" }
+            : result && result.note ? { round_type: "note" }
+            : result && result.narrator ? { round_type: "narrator" }
+            : {}),
+          // v4.13.0 — RETRIEVAL STATE (council rank 3). Recorded only when
+          // injection was ARMED, so its absence is never mistaken for a miss.
+          ...(injectionEnabled() ? { retrieval_hit: !!_injectedThisRound } : {}),
         });
         // P7 F1 — vitals, fire-and-forget, BEFORE logInstitutionalMemory so the
         // rq:round-stored listener is registered before the event can fire.
