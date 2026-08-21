@@ -155,5 +155,53 @@ tt("and it warns the verdict is unsafe rather than merely noting it",
 tt("the check runs BEFORE the header and downstream scoring",
    src.indexOf("ASYMMETRIC PROMPT") < src.indexOf("const _roundHeader = buildRoundHeader"));
 
+
+console.log("\n--- v4.12.1: the detector's FIRST FALSE POSITIVE ---");
+// 2026-08-20: reported divergence was "Position A." vs "Position B." at char
+// 8463 — the ADJUDICATION prompt, which differs per seat BY DESIGN. The capture
+// lives inside the wrapped seat fn and runAdjudication reuses those wrappers,
+// so it fired twice and the second write won. Same class as the round-78
+// metadata overwrite.
+tt("capture is gated so adjudication cannot overwrite dispatch",
+   /if \(!_seatDelivered\.__locked\) \{/.test(src));
+tt("the record is frozen when dispatch completes",
+   /Object\.defineProperty\(_seatDelivered, "__locked"/.test(src));
+tt("the lock is cleared per round, or capture would fire once and never again",
+   /delete _seatDelivered\.__locked;/.test(src));
+tt("the lock key is excluded from the digest comparison",
+   /\.filter\(\(k\) => k !== "__locked"\)/.test(src));
+tt("the false positive is documented, not quietly fixed",
+   /FIRST FALSE POSITIVE/.test(src));
+tt("and it names WHY adjudication prompts must never be compared",
+   /Adjudication prompts\s+\/\/ are supposed to differ|are supposed to differ and must never be compared/.test(src));
+
+
+console.log("\n--- v4.13.0: seat transparency (council rankings, round 112) ---");
+// All three seats ranked the sub-type #1 and named the conclusion each field
+// would have changed. Built with budget discipline: every field CONDITIONAL,
+// because the memory block competes for a 6000-char cap.
+tt("1. sub-verdict reaches the seats", /csStyleFor\(e\.cs\)/.test(src) && /why = ` \[\$\{st\.label\}/.test(src));
+tt("1. but ONLY when live — a shadow verdict must not read as settled",
+   /!e\.cs\.shadow && counterstampMode\(\) === "live"/.test(src));
+tt("2. ABSENT and ABSTAINED are distinguished, not merged",
+   /ABSENT — configured but never answered/.test(src) && /ABSTAINED — answered with no position/.test(src));
+tt("3. retrieval state is recorded only when injection was ARMED",
+   /injectionEnabled\(\) \? \{ retrieval_hit: !!_injectedThisRound \}/.test(src));
+tt("3. and surfaces only when it delivered NOTHING",
+   /e\.retrieval_hit === false/.test(src) && /seats had recency only/.test(src));
+tt("4. model identity shows only on a fallback, never on a primary",
+   /rec\.provider !== "primary" && rec\.model/.test(src));
+tt("5. dispatch source surfaces only when timer-fired",
+   /e\.dispatch_source === "auto"/.test(src) && /timer-dispatched, not operator-typed/.test(src));
+tt("a SKIPPED round no longer reads as a FAILED one",
+   /ROLL-CALL \(consensus and adjudication SKIPPED by design/.test(src) &&
+   /NOT a disagreement/.test(src));
+tt("note and narrator rounds are distinguished too",
+   /OPERATOR NOTE \(not adjudicated/.test(src) && /NARRATOR PASS \(arc writing/.test(src));
+tt("round_type is an additive key, absent on ordinary rounds",
+   /result && result\.indexical \? \{ round_type: "indexical" \}/.test(src));
+tt("the budget rationale is documented",
+   /competes for a 6000-char cap|competes with vector hits and arcs/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
