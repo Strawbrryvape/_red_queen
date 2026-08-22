@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.13.0-seat-transparency";
+  const RQ_BUILD = "v4.14.0-ercl";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4485,6 +4485,9 @@ roundData,
         // const does not, which is why fiatRecognitionMode() below is safe and
         // this was not. Keep the numbers literal here, or move the constants
         // above the rack.
+        ["erclToggle", "rq_ercl", "EXTERNAL CONSULTATION",
+         "\u26A0 SEATS READ THIS. A seat may emit [EXTERNAL_CONSULTATION_REQUEST] when stuck; you relay it BY HAND and paste replies back as [EXTERNAL_INPUT: model]. Testimony ranks BELOW SOLE VOICE and can never count toward VERIFIED. No automatic fetch, no keys, no spend.",
+         "No consultation requests surfaced and no external testimony recognised."],
         ["cplToggle", "rq_cpl", "CAUSAL PROVENANCE",
          "Every round, seat call, fallback, ledger write and consolidation run records WHY it happened and what caused the thing that caused it. Enables the PUPPET INDEX \u2014 the share of activity whose causal root is human-authored. Client-side only, no API cost.",
          "No causal events recorded. window.__rqPuppetIndex() reports nothing to measure."],
@@ -6678,6 +6681,12 @@ roundData,
     // Only when injection was armed and delivered NOTHING. Kimi: "if retrieval
     // returned nothing, ledger citations were confabulation risk."
     if (e.retrieval_hit === false) bits.push("no retrieval — seats had recency only");
+    // ERCL — a past round carrying external testimony must say so, or a seat
+    // reading it back will treat outside testimony as council reasoning.
+    if (e.external_input && e.external_input.model) {
+      bits.push("EXTERNAL TESTIMONY from " + clip(String(e.external_input.model), 24) +
+        " — ranks below SOLE VOICE, never counted toward consensus");
+    }
     // Only when a timer started it. Kimi: "106-108 read as live distress; if
     // timer-fired they were synthetic probes and I would have answered as
     // diagnostics."
@@ -11765,6 +11774,96 @@ roundData,
     window.__rqCplClear = () => { try { localStorage.removeItem(RQ_CPL_KEY); logError("[CPL] event store cleared by operator."); } catch (_) {} };
   } catch (_) {}
 
+  // ---------- External Reasoning Consultation Loop (rq_ercl, default OFF) ----------
+  // Council spec, round 134, VERIFIED 3/3. Two directions, both operator-gated:
+  //
+  //   OUT — a seat emits [EXTERNAL_CONSULTATION_REQUEST] when it hits a crux it
+  //         cannot resolve internally. The request is surfaced to the operator.
+  //         Nothing dispatches. The operator relays it by hand or ignores it.
+  //
+  //   IN  — the operator pastes a reply as [EXTERNAL_INPUT: <model>]. It is
+  //         logged with provenance, tagged in the ledger, and ranked BELOW SOLE
+  //         VOICE. It can never count toward VERIFIED.
+  //
+  // The council's own argument for why this is not a capability grab, and it is
+  // the Condorcet point again: external models have DIFFERENTLY SHAPED ERRORS.
+  // Three seats sharing training priors can be wrong together; a fourth voice
+  // from outside that distribution is the one thing that breaks the symmetry.
+  //
+  // Its own risk, also council-named: without the gates it becomes "an
+  // echo-injection vector that manufactures false consensus."
+  // ⚠ DEVIATION FROM THE SPEC, and it is the whole shape of this build.
+  //
+  // The round-134 spec contains two incompatible designs. §4.3 has the browser
+  // executing an external fetch with an operator-held key. §5.1 has the operator
+  // pasting the reply manually. Both cannot be the feature.
+  //
+  //     BUILT:     the MANUAL RELAY (§5.1).
+  //     NOT BUILT: client-side auto-fetch (§4.3).
+  //
+  // Reasons, in order:
+  //   1. It is 90% of the value at a fraction of the risk — no new key custody,
+  //      no new network path, no unbounded spend.
+  //   2. It is already what the operator does daily, relaying between the
+  //      council, the build seat and the architect. This makes an existing
+  //      informal practice AUDITABLE rather than adding a new capability.
+  //   3. Auto-fetch can be added later against data this produces. The reverse
+  //      is not true: shipping the fetch first tests the gates under load rather
+  //      than before it.
+  const RQ_ERCL_REQ_RE   = /\[EXTERNAL_CONSULTATION_REQUEST\]([\s\S]{0,2000}?)(?:\n\s*\n|$)/i;
+  const RQ_ERCL_INPUT_RE = /\[EXTERNAL_INPUT\s*:\s*([^\]\n]{1,60})\]/i;
+
+  function erclEnabled() { return localStorage.getItem("rq_ercl") === "on"; }
+
+  // Told to the seats whenever external testimony is present. Deliberately
+  // blunt: the spec requires EXPLICIT ENGAGEMENT, and unengaged external content
+  // is treated as absent. A seat that quietly absorbs it has done the thing the
+  // council warned about.
+  const RQ_ERCL_STANDING =
+    "An [EXTERNAL_INPUT] block appears in this round. It is TESTIMONY FROM A MODEL OUTSIDE THIS " +
+    "COUNCIL, relayed by the operator. It ranks BELOW SOLE VOICE and can never count toward " +
+    "VERIFIED consensus. You must either cite it explicitly with your own independent verification, " +
+    "or explicitly refute it. If you neither engage nor refute it, it is treated as absent \u2014 do " +
+    "not let it shape your position silently, and do not defer to it because it came from elsewhere.";
+
+  // Seat asks to consult outward. Surfaced, never dispatched.
+  function erclScanRequest(answers) {
+    if (!erclEnabled()) return null;
+    try {
+      for (const a of (answers || [])) {
+        const m = RQ_ERCL_REQ_RE.exec(String((a && a.text) || ""));
+        if (m) {
+          const body = String(m[1] || "").replace(/\s+/g, " ").trim();
+          logError("\u25C7 [ERCL] " + seatLabel(a.name) + " requested an EXTERNAL CONSULTATION. " +
+            "NOTHING WAS DISPATCHED \u2014 this build relays by hand. Copy the brief to a model of your " +
+            "choosing and paste the reply into a later round as [EXTERNAL_INPUT: <model>]. Brief: " +
+            clip(body, 400));
+          return { seat: a.name, brief: clip(body, 1200), digest: ftDigest(body) };
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // Operator relays a reply in. Provenance recorded; ranking enforced.
+  function erclScanInput(query) {
+    if (!erclEnabled()) return null;
+    try {
+      const m = RQ_ERCL_INPUT_RE.exec(String(query || ""));
+      if (!m) return null;
+      const model = String(m[1] || "unknown").trim();
+      const body = String(query || "").slice(m.index);
+      logError("\u25C6 [ERCL] EXTERNAL TESTIMONY present in this round \u2014 source: " + model +
+        ", " + body.length + " chars, digest " + ftDigest(body) + ". Ranked BELOW SOLE VOICE; it " +
+        "CANNOT contribute to VERIFIED. Seats are instructed to cite-and-verify or refute it; " +
+        "unengaged external content is treated as absent.");
+      return { model: model, chars: body.length, digest: ftDigest(body) };
+    } catch (_) { return null; }
+  }
+
+  let _erclInput = null;     // testimony present in THIS round, or null
+  let _erclRequest = null;   // a seat's outward request from THIS round, or null
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -11849,6 +11948,10 @@ roundData,
       // never here. Zero awaits; runs after the governor gate, which stays first.
       _fiatCandidate = fiatPreFilter(query);
       _fiatShadow = null;
+      // ERCL — inbound testimony is detected on the RAW query, before composition,
+      // so its provenance is recorded even if the round later fails.
+      _erclInput = erclScanInput(query);
+      _erclRequest = null;
       // CPL — the root event for this dispatch. trigger_type is DERIVED from how
       // the round actually started, never assumed: the auto scheduler sets
       // _autoThisRound, the banner sets _rqEndogenousPrompt, and anything else
@@ -11953,6 +12056,10 @@ roundData,
         // drain. This one condition is what makes autonomous testing converge.
         ((falsifierAskEnabled() && !_noteRound && !_indexicalRound && !isFalsifierTestRound(query))
           ? ("\n\n" + RQ_FALSIFIER_ASK) : "") +
+        // ERCL — appended only when testimony is actually present, so an ordinary
+        // round is byte-identical. Seats must be TOLD the ranking; leaving them to
+        // infer it from a bracket tag is how deference creeps in.
+        (_erclInput ? ("\n\n" + RQ_ERCL_STANDING) : "") +
         _ftBlock +
         ((fulltextRetrieveEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FT_INSTRUCTION) : "");
       try {
@@ -11973,6 +12080,9 @@ roundData,
         // v3.1.0: Temporal Consistency Validator — check the new verdict
         // against past VERIFIED conclusions before it enters memory.
         if (!divided && result.text) checkTemporalConsistency(result.text);
+        // ERCL — a seat may ask to consult outward. Surfaced to the operator,
+        // never dispatched: this build has no external fetch by design.
+        try { _erclRequest = erclScanRequest(allAnswers); } catch (_) {}
         // v4.4.0 — harvest [REQUEST_FULLTEXT: ...] from the seats' own answers
         // for the NEXT round. Consumed once by ftBuildBlock; a request is not
         // standing, so a seat must ask again if it still needs the text.
@@ -12101,6 +12211,10 @@ roundData,
           // v4.13.0 — RETRIEVAL STATE (council rank 3). Recorded only when
           // injection was ARMED, so its absence is never mistaken for a miss.
           ...(injectionEnabled() ? { retrieval_hit: !!_injectedThisRound } : {}),
+          // ERCL — provenance for both directions. Additive: an ordinary round
+          // carries neither key and the entry is byte-identical.
+          ...(_erclInput ? { external_input: _erclInput } : {}),
+          ...(_erclRequest ? { external_request: _erclRequest } : {}),
         });
         // P7 F1 — vitals, fire-and-forget, BEFORE logInstitutionalMemory so the
         // rq:round-stored listener is registered before the event can fire.
@@ -12421,6 +12535,9 @@ roundData,
         ? "\u26A0 [FULLTEXT] Targeted full-text request ON — seats may ask for up to " + RQ_FT_MAX_ROUNDS +
           " rounds verbatim via [REQUEST_FULLTEXT: n]. Rounds run with this on carry an extra instruction and are not prompt-identical to rounds without it."
         : "[FULLTEXT] Targeted full-text request OFF — seats see clipped ledger excerpts only.");
+      logError(erclEnabled()
+        ? "\u25C6 [ERCL] External consultation ON \u2014 seats may request an outside opinion and you relay it BY HAND. There is no automatic fetch in this build. Testimony ranks below SOLE VOICE and can never count toward VERIFIED; seats are told to cite-and-verify or refute, and unengaged testimony is treated as absent."
+        : "[ERCL] External consultation OFF.");
       logError(cplEnabled()
         ? "[CPL] Causal provenance ON — rounds, seat calls, fallbacks, ledger writes and consolidation runs record their cause and parent. Run window.__rqPuppetIndex() for the breakdown. The write API REFUSES any event lacking a causation object."
         : "[CPL] Causal provenance OFF — no causal events recorded.");
