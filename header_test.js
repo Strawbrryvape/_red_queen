@@ -183,8 +183,13 @@ console.log("\n--- v4.13.0: seat transparency (council rankings, round 112) ---"
 tt("1. sub-verdict reaches the seats", /csStyleFor\(e\.cs\)/.test(src) && /why = ` \[\$\{st\.label\}/.test(src));
 tt("1. but ONLY when live — a shadow verdict must not read as settled",
    /!e\.cs\.shadow && counterstampMode\(\) === "live"/.test(src));
-tt("2. ABSENT and ABSTAINED are distinguished, not merged",
-   /ABSENT — configured but never answered/.test(src) && /ABSTAINED — answered with no position/.test(src));
+// v4.15.0 superseded the two-way split with a three-way one.
+tt("2. ABSENT, ABSTAIN-EMPTY and ABSTAIN-WITH-CONTENT are all distinct",
+   /ABSENT — configured, never answered/.test(src) &&
+   /ABSTAIN-EMPTY — returned nothing/.test(src) &&
+   /ABSTAIN-WITH-CONTENT — wrote /.test(src));
+tt("2. a seat that wrote text is never reported as silent",
+   /text is in the round, excluded from consensus/.test(src));
 tt("3. retrieval state is recorded only when injection was ARMED",
    /injectionEnabled\(\) \? \{ retrieval_hit: !!_injectedThisRound \}/.test(src));
 tt("3. and surfaces only when it delivered NOTHING",
