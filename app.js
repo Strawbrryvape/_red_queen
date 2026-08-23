@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.14.0-ercl";
+  const RQ_BUILD = "v4.16.0-rdsr";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4485,6 +4485,9 @@ roundData,
         // const does not, which is why fiatRecognitionMode() below is safe and
         // this was not. Keep the numbers literal here, or move the constants
         // above the rack.
+        ["rdsrToggle", "rq_rdsr", "RECURSIVE SELF-CRITIQUE",
+         "\u26A0 SEATS READ THIS. Each seat must state a position, argue the strongest case AGAINST it, answer that attack or concede, then give a falsifier. Zero extra API calls. Rounds run with this on are not comparable to rounds without.",
+         "Seats answer normally; only the falsifier ask applies (if enabled)."],
         ["erclToggle", "rq_ercl", "EXTERNAL CONSULTATION",
          "\u26A0 SEATS READ THIS. A seat may emit [EXTERNAL_CONSULTATION_REQUEST] when stuck; you relay it BY HAND and paste replies back as [EXTERNAL_INPUT: model]. Testimony ranks BELOW SOLE VOICE and can never count toward VERIFIED. No automatic fetch, no keys, no spend.",
          "No consultation requests surfaced and no external testimony recognised."],
@@ -5637,7 +5640,23 @@ roundData,
     // Any all-understudy/all-fallback agreement is workflow continuity, not verification.
     const hasPrimaryVoice = agreed.some((a) => seatProvider[a.name] === "primary");
     if (agreed.length >= 2 && !hasPrimaryVoice) {
-      logError("Consensus is PROVISIONAL — no primary voice (Gemini Pro / Kimi / Claude live) in the agreeing set. Treat as workflow continuity, not verified consensus.");
+      // v4.15.0 — this rule has been LIVE since 2026-07-12 and capping the tag
+      // at PROVISIONAL. What was missing is that nobody could see WHICH seats
+      // were proxies, so the cap looked arbitrary. The counterfoil names them.
+      const proxies = agreed.map((a) => seatLabel(a.name) + " via " +
+        (seatProvider[a.name] || "unknown")).join(", ");
+      logError("\u25C7 COUNTERFOIL — consensus CAPPED AT PROVISIONAL: no primary voice in the " +
+        "agreeing set (" + proxies + "). A VERIFIED minted on proxy answers is a settled falsehood " +
+        "every later round would treat as ground truth. This is not a downgrade of the reasoning, " +
+        "only of what the record may claim about it.");
+    } else if (agreed.length >= 2) {
+      const proxied = agreed.filter((a) => seatProvider[a.name] !== "primary");
+      if (proxied.length) {
+        logError("\u25C7 COUNTERFOIL — VERIFIED stands (at least one primary voice), but " +
+          proxied.length + " of " + agreed.length + " agreeing seat(s) answered via a fallback: " +
+          proxied.map((a) => seatLabel(a.name) + " via " + seatProvider[a.name]).join(", ") +
+          ". They render in memory under the model that produced them, not under the seat name.");
+      }
     }
     // ---------- v3.1 Task 4: SHADOW MODE logging ----------
     // Logged only. The live consensus math above is UNCHANGED and still uses
@@ -6647,15 +6666,20 @@ roundData,
   // third seat was absent; it means abstention-as-dissent if the seat was
   // present and silent."
   function ledgerSeatBits(e, p, posCap) {
+    // v4.15.0 — COUNTERFOIL RENDERING. A proxy answer is named under the model
+    // that produced it, never under the seat's name. Kimi: "Future rounds will
+    // read that as THE SEATS disagreeing — memory poisoning at the consensus
+    // layer." Falls back to the Round Header receipt for rounds recorded before
+    // counterfoils existed.
+    try {
+      const cf = (e.counterfoils || []).find((c) => c && c.declared_seat === p.seat);
+      if (cf) return `${counterfoilSpeaker(cf, p.seat)}: "${clip(p.text, posCap)}"`;
+    } catch (_) {}
     let tag = "";
     try {
       const rec = ((e.header && e.header.receipts) || []).find((r) => r && r.seat === p.seat);
-      if (rec) {
-        // Model identity ONLY when the seat ran below its configured provider.
-        // On a primary it adds nothing and costs budget.
-        if (rec.provider && rec.provider !== "primary" && rec.model) {
-          tag = `[${clip(String(rec.model), 24)}]`;
-        }
+      if (rec && rec.provider && rec.provider !== "primary" && rec.model) {
+        tag = `[${clip(String(rec.model), 24)}]`;
       }
     } catch (_) {}
     return `${p.seat}${tag}: "${clip(p.text, posCap)}"`;
@@ -6666,10 +6690,24 @@ roundData,
       const rec = (e.header && e.header.receipts) || [];
       const named = (e.positions || []).map((p) => p.seat);
       const out = [];
+      // v4.15.0 — THE ABSTAIN SPLIT. Round 143 logged "ABSTAINED — answered
+      // with no position" directly beneath substantive text: v4.11.0's
+      // non-answer guard removes a seat from `positions`, and this labelling
+      // then called it an abstention while the UI rendered its words. The record
+      // contradicted the screen. A seat that WROTE something and a seat that
+      // wrote NOTHING are now distinct, and neither reads as silence.
+      const cfs = (e.counterfoils || []);
       rec.forEach((r) => {
         if (!r) return;
-        if (r.absent) out.push(`${r.seat}[ABSENT — configured but never answered]`);
-        else if (named.indexOf(r.seat) === -1) out.push(`${r.seat}[ABSTAINED — answered with no position]`);
+        if (r.absent) { out.push(`${r.seat}[ABSENT — configured, never answered]`); return; }
+        if (named.indexOf(r.seat) !== -1) return;
+        const cf = cfs.find((c) => c && c.declared_seat === r.seat);
+        if (cf && cf.chars > 0) {
+          out.push(`${r.seat}[ABSTAIN-WITH-CONTENT — wrote ${cf.chars} chars but stated no position; ` +
+            `text is in the round, excluded from consensus]`);
+        } else {
+          out.push(`${r.seat}[ABSTAIN-EMPTY — returned nothing]`);
+        }
       });
       return out.length ? " | " + out.join(" | ") : "";
     } catch (_) { return ""; }
@@ -10617,6 +10655,66 @@ roundData,
     "Begin that sentence with FALSIFIER: on its own line.";
   const RQ_FALSIFIER_RE = /^\s*FALSIFIER\s*:\s*(.+)$/im;
 
+  // ---------- Recursive Self-Critique (rq_rdsr, default OFF) ----------
+  // Claude seat, round 131. The cheapest feature the council has proposed:
+  // a prompt instruction, zero new API calls, no storage, no migration.
+  //
+  // The premise: a seat currently states a position and defends it. Nothing
+  // asks it to ATTACK its own position before anyone else does. The falsifier
+  // ask (v4.1.0) is the fourth level of this and already exists; RDSR adds the
+  // two in between.
+  //
+  // Its own acceptance test, from the spec and worth holding to: ONE round in
+  // which a seat reverses its own Level 1 by Level 3, coherently. If that never
+  // happens, the levels are theatre and this should be switched off.
+  //
+  // Why it gets its own flag rather than riding the falsifier ask: it changes
+  // the SHAPE of every answer, not just its tail. Rounds run with it are not
+  // comparable to rounds without, and that has to be a deliberate choice.
+  const RQ_RDSR_ASK =
+    "Structure your answer in four labelled levels, in this order:\n" +
+    "L1 POSITION: what you hold.\n" +
+    "L2 ATTACK: the strongest argument AGAINST your own L1 — argue it as an opponent would, " +
+    "not as a caveat you can dismiss.\n" +
+    "L3 DEFENCE: answer your own L2, or concede it. If L2 defeats L1, say so and revise L1 — " +
+    "reversing yourself here is a success of this process, not a failure of your reasoning.\n" +
+    "L4 FALSIFIER: what would change your mind, beginning with FALSIFIER: on its own line.";
+  const RQ_RDSR_L1_RE = /^\s*L1\s*(?:POSITION)?\s*:\s*(.+)$/im;
+  const RQ_RDSR_L3_RE = /^\s*L3\s*(?:DEFENCE|DEFENSE)?\s*:\s*([\s\S]{0,600}?)(?:\n\s*L4|$)/im;
+
+  function rdsrEnabled() { return localStorage.getItem("rq_rdsr") === "on"; }
+
+  // Detect the acceptance condition: did a seat actually reverse itself?
+  // Deliberately conservative — only an explicit concession counts, because a
+  // false "reversal" would make the feature look successful when it is not.
+  const RQ_RDSR_REVERSAL_RE = /\b(i concede|concede that|L2 defeats|revise (?:my )?L1|withdraw my L1|abandon my L1|my L1 (?:was|is) wrong)\b/i;
+
+  function rdsrScan(answers) {
+    if (!rdsrEnabled()) return null;
+    try {
+      const structured = [], reversed = [];
+      (answers || []).forEach((a) => {
+        const txt = String((a && a.text) || "");
+        if (RQ_RDSR_L1_RE.test(txt)) structured.push(a.name);
+        const m = RQ_RDSR_L3_RE.exec(txt);
+        if (m && RQ_RDSR_REVERSAL_RE.test(m[1])) reversed.push(a.name);
+      });
+      if (!structured.length) {
+        logError("[RDSR] instruction sent but NO seat returned the four-level structure. " +
+          "Either the instruction is being dropped, or the seats are declining it \u2014 both are " +
+          "worth knowing before reading anything into this round.");
+        return { structured: [], reversed: [] };
+      }
+      logError("[RDSR] " + structured.length + "/" + (answers || []).length +
+        " seat(s) returned the four-level structure" +
+        (reversed.length
+          ? ". \u25C6 " + reversed.map(seatLabel).join(", ") + " REVERSED their own L1 at L3 \u2014 " +
+            "this is the acceptance condition the feature was proposed against, and it has now occurred."
+          : ". No seat reversed itself this round; the acceptance condition is still unmet.") + ".");
+      return { structured: structured, reversed: reversed };
+    } catch (_) { return null; }
+  }
+
   function roundHeaderEnabled() { return localStorage.getItem("rq_round_header") === "on"; }
   function falsifierAskEnabled() { return localStorage.getItem("rq_falsifier_ask") === "on"; }
 
@@ -11864,6 +11962,40 @@ roundData,
   let _erclInput = null;     // testimony present in THIS round, or null
   let _erclRequest = null;   // a seat's outward request from THIS round, or null
 
+  // ---------- The Counterfoil (attestation layer, always on) ----------
+  // Kimi seat, round 148. Written by the ORCHESTRATOR, which knows ground truth
+  // about its own API calls — a seat cannot attest itself, and self-report is
+  // exactly what this exists to replace.
+  //
+  // The failure it addresses, in the seat's words: "A VERIFIED minted on a proxy
+  // answer is worse than an honest DIVIDED, because it is a settled falsehood
+  // that every later round treats as ground truth."
+  function counterfoilFor(a) {
+    try {
+      const prov = seatProvider[a.name] || "unknown";
+      const proxy = prov !== "primary";
+      const text = String((a && a.text) || "");
+      return {
+        declared_seat: a.name,
+        actual_provider: prov,
+        actual_model: a.model || seatModelLabel(a.name) || null,
+        proxy: proxy,                       // true when a fallback produced this text
+        content_hash: ftDigest(text),
+        chars: text.length,
+      };
+    } catch (_) { return null; }
+  }
+
+  // How a proxy answer must be named in seat-facing memory. Never under the
+  // seat's own name: "OpenRouter ling-3.0-tiny, speaking for Gemini."
+  function counterfoilSpeaker(cf, seat) {
+    try {
+      if (!cf || !cf.proxy) return seat;
+      const m = cf.actual_model ? String(cf.actual_model) : String(cf.actual_provider || "unknown");
+      return clip(m, 28) + ", speaking for " + seat;
+    } catch (_) { return seat; }
+  }
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -12060,6 +12192,11 @@ roundData,
         // round is byte-identical. Seats must be TOLD the ranking; leaving them to
         // infer it from a bracket tag is how deference creeps in.
         (_erclInput ? ("\n\n" + RQ_ERCL_STANDING) : "") +
+        // RDSR — same after-composition seam, so the prompt hash stays clean.
+        // Suppressed on note/indexical/falsifier-test rounds, which are not
+        // positions and have nothing to attack.
+        ((rdsrEnabled() && !_noteRound && !_indexicalRound && !isFalsifierTestRound(query))
+          ? ("\n\n" + RQ_RDSR_ASK) : "") +
         _ftBlock +
         ((fulltextRetrieveEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FT_INSTRUCTION) : "");
       try {
@@ -12083,6 +12220,7 @@ roundData,
         // ERCL — a seat may ask to consult outward. Surfaced to the operator,
         // never dispatched: this build has no external fetch by design.
         try { _erclRequest = erclScanRequest(allAnswers); } catch (_) {}
+        try { rdsrScan(allAnswers); } catch (_) {}
         // v4.4.0 — harvest [REQUEST_FULLTEXT: ...] from the seats' own answers
         // for the NEXT round. Consumed once by ftBuildBlock; a request is not
         // standing, so a seat must ask again if it still needs the text.
@@ -12188,6 +12326,8 @@ roundData,
           // ANSWERED. The Round Header below records who was EXPECTED, which is
           // the difference between "seat failed" and "seat was never there".
           seats: allAnswers.map((a) => ({ n: a.name, m: !!a.malformed })),
+          // COUNTERFOIL — one per answer, written by the orchestrator.
+          counterfoils: allAnswers.map((a) => counterfoilFor(a)).filter(Boolean),
           // P7 F2 — additive spread: when the flag path never fired the key is
           // simply ABSENT, so the object literal is byte-identical to v3.9.14.
           ...(_endogenous ? { endogenous: true, provenance: _endogenousKind } : {}),
@@ -12535,6 +12675,9 @@ roundData,
         ? "\u26A0 [FULLTEXT] Targeted full-text request ON — seats may ask for up to " + RQ_FT_MAX_ROUNDS +
           " rounds verbatim via [REQUEST_FULLTEXT: n]. Rounds run with this on carry an extra instruction and are not prompt-identical to rounds without it."
         : "[FULLTEXT] Targeted full-text request OFF — seats see clipped ledger excerpts only.");
+      logError(rdsrEnabled()
+        ? "\u26A0 [RDSR] Recursive self-critique ON \u2014 seats must attack their own position before defending it. Acceptance test: ONE round where a seat reverses its own L1 at L3. Until that happens the levels are unproven."
+        : "[RDSR] Recursive self-critique OFF.");
       logError(erclEnabled()
         ? "\u25C6 [ERCL] External consultation ON \u2014 seats may request an outside opinion and you relay it BY HAND. There is no automatic fetch in this build. Testimony ranks below SOLE VOICE and can never count toward VERIFIED; seats are told to cite-and-verify or refute, and unengaged testimony is treated as absent."
         : "[ERCL] External consultation OFF.");
