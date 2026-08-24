@@ -121,5 +121,24 @@ t("only ONE line is carried — a second body line is a position",
 tt("a line merely containing the word falsifier is not a bare label",
    !/^\s*falsifier\s*:?\s*$/i.test("The falsifier discipline keeps this honest."));
 
+
+console.log("\n--- v4.17.2: RDSR headers are scaffolding, not positions ---");
+// Third time a later feature put scaffolding where Gate 1 looks for a position.
+// Live 2026-08-24: scored lines were "L1 POSITION: what you hold." (a seat
+// echoing the instruction) vs "**L1 POSITION: Decoupling Sessions..." — 0.111
+// against a 0.12 floor. Gate 1 was comparing LABELS.
+tt("a bare RDSR label is skipped", csIsBannerLine("L1 POSITION:"));
+tt("a bolded bare label is skipped", csIsBannerLine("**L2 ATTACK:**"));
+tt("a label echoing the instruction verbatim is skipped",
+   csIsBannerLine("L1 POSITION: what you hold."));
+t("a label WITH content scores the content, not the label",
+  csFirstLine({text:"**L1 POSITION: Decoupling sessions from reasoning entirely**"}),
+  "Decoupling sessions from reasoning entirely**");
+t("the falsifier fix still holds (v4.7.1 regression guard)",
+  csFirstLine({text:"FALSIFIER: If X.\n\nMy position is Y and it is long enough."}),
+  "My position is Y and it is long enough.");
+tt("prose mentioning a level is not treated as a label",
+   !csIsBannerLine("My L1 was too strong and I have revised it since."));
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
