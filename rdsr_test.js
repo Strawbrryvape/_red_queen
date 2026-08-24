@@ -9,9 +9,11 @@ globalThis.logError=(m)=>LOGS.push(String(m));
 globalThis.localStorage={getItem:(k)=>k==="rq_rdsr"?"on":null};
 globalThis.seatLabel=(n)=>n;
 eval([grab(/  const RQ_RDSR_ASK =[\s\S]*?on its own line\.";/),
-      grab(/  const RQ_RDSR_L1_RE = .*/), grab(/  const RQ_RDSR_L3_RE = .*/),
-      grab(/  function rdsrEnabled\(\) \{.*\}/),
-      grab(/  const RQ_RDSR_REVERSAL_RE = .*/),
+      grab(/  const RQ_RDSR_DECOR = .*/),
+      grab(/  const RQ_RDSR_L1_RE = .*/),
+      grab(/  const RQ_RDSR_L3_RE = new RegExp\([\s\S]*?"im"\);/),
+      "function rdsrEnabled(){ return true; }",
+      grab(/  const RQ_RDSR_REVERSAL_RE = new RegExp\(\[[\s\S]*?"i"\);/),
       grab(/  function rdsrScan\(answers\) \{[\s\S]*?\n  \}/)].join("\n") +
      "\nglobalThis.rdsrScan=rdsrScan;globalThis.RQ_RDSR_ASK=RQ_RDSR_ASK;");
 
@@ -55,6 +57,38 @@ tt("L2 demands a real attack, not a dismissible caveat",
 tt("L3 makes reversing a SUCCESS, removing the incentive to defend badly",
    /reversing yourself here is a success of this process/.test(RQ_RDSR_ASK));
 tt("L4 reuses the existing falsifier convention", /beginning with FALSIFIER:/.test(RQ_RDSR_ASK));
+
+console.log("\n--- v4.17.1: markdown decoration must not defeat detection ---");
+// Live 2026-08-23: a textbook four-level answer was reported as "NO seat
+// returned the four-level structure" because seats bold their headers.
+[["bold whole line","**L1 POSITION: x**"],["bold label","**L1 POSITION:** x"],
+ ["heading","## L1 POSITION: x"],["bullet","- L1 POSITION: x"],
+ ["bullet+bold","- **L1 POSITION:** x"],["bare label","L1: x"]].forEach(([n,txt])=>{
+  tt("detected: "+n, rdsrScan([{name:"k",text:txt+"\nL2: a\nL3: b\nL4: c"}]).structured.length===1);
+});
+tt("prose mentioning L1 mid-sentence is NOT detected",
+   rdsrScan([{name:"k",text:"I revise my L1 position: it was wrong."}]).structured.length===0);
+tt("a bolded L3 reversal is still caught",
+   rdsrScan([{name:"k",text:"**L1:** x\n**L3 DEFENCE:** I concede that, L2 defeats L1.\n**L4:** z"}]).reversed.length===1);
+
+console.log("\n--- v4.17.2: the round-150 reversal the first detector missed ---");
+// "your L2 attack proves I should not have made the causal claim... I should
+// concede L2 ... Revised L1:" — a textbook reversal reported as none, because
+// the regex wanted exact phrasing. Word forms and modals are how people
+// actually concede; requiring exact wording measured my vocabulary.
+const R=(t)=>rdsrScan([{name:"k",text:"L1: x\nL3 DEFENCE: "+t+"\nL4: z"}]).reversed.length===1;
+tt("the actual round-150 wording is detected",
+   R("I should concede L2 on the assertion while holding a narrower position: Revised L1: the narrower claim."));
+tt("past-tense 'Revised L1' is detected", R("Revised L1: the cap should hold."));
+tt("'I was wrong' is detected", R("I was wrong to assert that."));
+tt("'I should not have made the claim' is detected", R("I should not have made the causal claim."));
+tt("holding a position is NOT a reversal", !R("That is a fair point but I hold my position."));
+tt("DESCRIBING someone else conceding is NOT a reversal",
+   !R("My opponent might concede nothing here.") && !R("A weaker model would concede immediately."));
+tt("a hypothetical concession is NOT a reversal",
+   !R("One could concede the point without abandoning it."));
+tt("the false-positive risk is documented",
+   /A false reversal makes the feature look successful when it\s+\/\/ is not|false reversal makes the feature look successful/.test(src));
 
 console.log("\n--- shape ---");
 tt("zero new API calls", !/rdsrScan[\s\S]{0,800}fetch\(/.test(src));
