@@ -93,7 +93,8 @@ tt("the false-positive risk is documented",
 console.log("\n--- shape ---");
 tt("zero new API calls", !/rdsrScan[\s\S]{0,800}fetch\(/.test(src));
 tt("appended on the post-composition seam, so the prompt hash stays clean",
-   /\(rdsrEnabled\(\) && !_noteRound && !_indexicalRound && !isFalsifierTestRound\(query\)\)/.test(src));
+   /rdsrEnabled\(\) \|\| \(_rdsrArm && _rdsrArm\.armed\)/.test(src) &&
+   /!_noteRound && !_indexicalRound && !isFalsifierTestRound\(query\)/.test(src));
 tt("suppressed on rounds that are not positions", /have nothing to attack/.test(src));
 tt("its own acceptance test is documented in source",
    /ONE round in\s+\/\/ which a seat reverses its own Level 1 by Level 3|reverses its own Level 1 by Level 3/.test(src));
