@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.16.0-rdsr";
+  const RQ_BUILD = "v4.17.2-scaffolding";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -219,7 +219,15 @@
   // seat starts truncating, raise this first — the diagnostic in callKimi names
   // it explicitly. If cost matters more than depth, lower it and watch for
   // finish_reason: length.
-  const KIMI_MAX_TOKENS = 8000;
+  // v4.17.2 — 8000 -> 16000. Live 2026-08-24: "kimi-k3 returned no answer —
+  // finish_reason: length, reasoning present but truncated before the answer."
+  // K3 is a reasoning model and RDSR asks for four sections; 8000 covered the
+  // reasoning trace and left nothing for the answer, so the seat went ABSENT and
+  // the round ran on two voices. Matches the Cerebras ceiling, and the same
+  // logic applies: a truncated round wastes its whole budget and returns
+  // nothing, so a higher ceiling that produces an answer is cheaper than a lower
+  // one that does not.
+  const KIMI_MAX_TOKENS = 16000;
 
   // ---------- K3 spend gate ----------
   // K3 is metered and billed per token including its reasoning trace, and those
@@ -7347,6 +7355,21 @@ roundData,
     // function was written to fix, reintroduced by a later feature.
     // caStrip (conformity audit) already stripped these; csFirstLine did not.
     if (/^falsifier\s*:/i.test(bare)) return true;
+    // (c-1) v4.17.2 — RDSR SECTION HEADERS. Third time a later feature has put
+    // scaffolding where Gate 1 looks for a position. v4.7.1 fixed the one-line
+    // falsifier, v4.8.7 the two-line form, and now RDSR's L1/L2/L3/L4 labels
+    // occupy the first line of every answer.
+    //
+    // Live 2026-08-24: the scored first lines were "L1 POSITION: what you hold."
+    // (a seat echoing the instruction verbatim) against "**L1 POSITION:
+    // Decoupling Sessions From Reasoning..." — 0.111 against a 0.12 floor. Gate 1
+    // was comparing LABELS, not positions.
+    //
+    // A bare label is skipped entirely. A label WITH content on the same line has
+    // the label stripped, because the content after it IS the position — see
+    // csFirstLineMeta, which applies this before scoring.
+    if (/^[*#>\-\u2022\s]*L[1-4]\b[^\n:]{0,20}:\s*$/i.test(bare)) return true;
+    if (/^[*#>\-\u2022\s]*L[1-4]\b[^\n:]{0,20}:\s*(?:what you hold|the strongest argument|answer your own|what would change)/i.test(bare)) return true;
     // (c) Bare section label: "Position Statement", "Answer:", "Verdict —".
     if (/^(position|answer|response|verdict|summary|statement|analysis|opinion|conclusion|recommendation)\s*(statement)?\s*[:\-\u2014\u2013]?\s*$/i.test(bare)) return true;
     return false;
@@ -7380,6 +7403,14 @@ roundData,
       const l = (raw[i] || "").trim();
       if (!l) { continue; }                       // blank lines never clear the carry
       if (carry) { carry = false; skipped++; continue; }   // this is the falsifier body
+      // v4.17.2 — strip an RDSR label that PRECEDES real content on the same
+      // line: "L1 POSITION: Decoupling sessions..." scores as "Decoupling
+      // sessions...". Without this, every seat's first line begins with the
+      // same three words and Gate 1 measures the instruction, not the answer.
+      const _rdsrStrip = l.replace(/^[*#>\-\u2022\s]*L[1-4]\b[^\n:]{0,20}:\s*/i, "").trim();
+      if (_rdsrStrip && _rdsrStrip !== l && _rdsrStrip.length >= 20) {
+        return { line: _rdsrStrip, skipped: skipped };
+      }
       if (/^\s*falsifier\s*:?\s*$/i.test(l)) { carry = true; skipped++; continue; }  // bare label
       if (csIsBannerLine(l)) { skipped++; continue; }
       return { line: l, skipped: skipped };
@@ -10679,15 +10710,53 @@ roundData,
     "L3 DEFENCE: answer your own L2, or concede it. If L2 defeats L1, say so and revise L1 — " +
     "reversing yourself here is a success of this process, not a failure of your reasoning.\n" +
     "L4 FALSIFIER: what would change your mind, beginning with FALSIFIER: on its own line.";
-  const RQ_RDSR_L1_RE = /^\s*L1\s*(?:POSITION)?\s*:\s*(.+)$/im;
-  const RQ_RDSR_L3_RE = /^\s*L3\s*(?:DEFENCE|DEFENSE)?\s*:\s*([\s\S]{0,600}?)(?:\n\s*L4|$)/im;
+  // v4.17.1 — MARKDOWN-TOLERANT. The first version anchored on ^L1 with no
+  // allowance for decoration, and seats bold their section headers by default.
+  // Live 2026-08-23: a round returned a textbook four-level answer and the
+  // detector reported "NO seat returned the four-level structure" — a FALSE
+  // NEGATIVE that made a working feature look broken. Four of six realistic
+  // formats missed: **L1 POSITION: x**, **L1 POSITION:** x, ## L1 POSITION: x,
+  // and - L1 POSITION: x.
+  //
+  // `\W{0,4}` absorbs the usual openers (**, ##, -, >, spaces) without letting
+  // the label float mid-sentence: it is still anchored to line start, so prose
+  // mentioning "my L1 position" cannot match.
+  const RQ_RDSR_DECOR = "^(?:[ \\t]*[*#>\\-\\u2022]{1,4})*[ \\t]*";
+  const RQ_RDSR_L1_RE = new RegExp(RQ_RDSR_DECOR + "L1\\b[^\\n:]{0,20}:", "im");
+  const RQ_RDSR_L3_RE = new RegExp(
+    RQ_RDSR_DECOR + "L3\\b[^\\n:]{0,20}:([\\s\\S]{0,600}?)(?:\\n[ \\t]*[*#>\\-]{0,4}[ \\t]*L4\\b|$)", "im");
 
   function rdsrEnabled() { return localStorage.getItem("rq_rdsr") === "on"; }
 
   // Detect the acceptance condition: did a seat actually reverse itself?
   // Deliberately conservative — only an explicit concession counts, because a
   // false "reversal" would make the feature look successful when it is not.
-  const RQ_RDSR_REVERSAL_RE = /\b(i concede|concede that|L2 defeats|revise (?:my )?L1|withdraw my L1|abandon my L1|my L1 (?:was|is) wrong)\b/i;
+  // v4.17.2 — SECOND FALSE NEGATIVE, one build after the first.
+  // Round 150: the Claude seat wrote "your L2 attack proves I should not have
+  // made the causal claim in the first place... I should concede L2 on the
+  // assertion of pressure while holding a narrower position: Revised L1:" —
+  // a textbook reversal, reported as "no seat reversed itself."
+  //
+  // Two misses: "Revised L1" (past tense) did not match `revise ...L1`, and
+  // "I should concede" did not match `i concede` because a modal intervened.
+  // Word forms and modals are the normal way people concede; requiring exact
+  // phrasing measured my vocabulary, not their reasoning.
+  const RQ_RDSR_REVERSAL_RE = new RegExp([
+    "\\brevis(?:e|ed|ing)\\b[^.\\n]{0,20}\\bL1\\b",     // revise / revised / revising ... L1
+    "\\bL1\\b[^.\\n]{0,20}\\brevis(?:e|ed|ing)\\b",     // ...L1 revised
+    // Bare "concede" is too loose — "my opponent might concede nothing here"
+    // would match. A false reversal makes the feature look successful when it
+    // is not, which is the one direction this must never fail in. Require the
+    // concession to be FIRST-PERSON or explicitly attached to a level.
+    "\\b(?:I|we)\\b[^.\\n]{0,24}\\bconced(?:e|ed|ing)\\b",
+    "\\bconced(?:e|ed|ing)\\b[^.\\n]{0,24}\\bL[12]\\b",
+    "\\bL2\\s+defeats\\b",
+    "\\bwithdraw\\b[^.\\n]{0,20}\\bL1\\b",
+    "\\babandon\\b[^.\\n]{0,20}\\bL1\\b",
+    "\\bmy L1\\b[^.\\n]{0,20}\\b(?:was|is)\\s+wrong\\b",
+    "\\bI was wrong\\b",
+    "\\bshould not have\\b[^.\\n]{0,40}\\b(?:claim|position|asserted|made)\\b",
+  ].join("|"), "i");
 
   function rdsrScan(answers) {
     if (!rdsrEnabled()) return null;
@@ -11996,6 +12065,158 @@ roundData,
     } catch (_) { return seat; }
   }
 
+  // ---------- The Operator Brief (operator-invoked, zero cost) ----------
+  //
+  // WHY THIS EXISTS, and it is a correction rather than a feature. Every
+  // instrument built in the preceding fortnight serves the COUNCIL's epistemics.
+  // The operator noticed: "we're designing features and tools for the red queen
+  // to use for herself and not for the operator."
+  //
+  // He is right, and the cause belongs in the source. The build seat OPTIMISES
+  // FOR WHAT IT CAN VERIFY — internal consistency, which is measurable — rather
+  // than for what the operator experiences, which is not. That bias produced
+  // fifteen instruments legible only to someone who already knows what FIELD
+  // SKEW means.
+  //
+  // Two rules govern this module:
+  //   1. NO JARGON REACHES THE OPERATOR. Every tag, sub-verdict and provenance
+  //      flag is translated. A term that cannot be translated does not belong.
+  //   2. THE BRIEF MUST NEVER SOUND MORE CONFIDENT THAN THE ROUND WAS. A round
+  //      with a stand-in seat, no retrieval and untested falsifiers is a weak
+  //      round and says so — a readable summary that flatters is worse than a
+  //      log nobody reads.
+  const RQ_BRIEF_TRUST = {
+    verified:    "The council agreed.",
+    provisional: "Some seats agreed, but not enough to call it settled.",
+    divided:     "The council did not agree.",
+    sole:        "Only one seat could answer, so there was nobody to check it.",
+    resolved:    "The council disagreed at first, then one position survived cross-examination and the others conceded specific errors.",
+    "resolved-by-operator": "You closed this one; the council did not independently verify it.",
+  };
+  const RQ_BRIEF_CS = {
+    "TRUE SPLIT":  "They genuinely disagree — this one needs a decision from you.",
+    "FORK":        "Two workable answers. Pick one; neither is wrong.",
+    "SHEAR":       "They answered different facets of the same question. The full picture is all of them together.",
+    "PARALLEL":    "They answered different questions. Worth re-asking more narrowly.",
+    "FIELD SKEW":  "This wasn't a disagreement — the equipment was degraded. Re-run it when the roster is healthy.",
+    "UNRESOLVED":  "The classifier couldn't tell what kind of disagreement this was.",
+  };
+
+  function briefFor(e, idx) {
+    if (!e) return "No round found.";
+    const L = [];
+    const n = (typeof idx === "number") ? ("Round " + idx) : "Round";
+    L.push(n + ' — "' + clip(String(e.prompt || ""), 110) + '"');
+
+    // 1. WHAT HAPPENED. Round type first: a skipped round is not a failed one.
+    if (e.round_type === "indexical") {
+      L.push("  This was a roll-call. Each seat answered about itself, so agreement was never scored. Not a disagreement.");
+    } else if (e.round_type === "note") {
+      L.push("  This was a note to the council, not a question. No verdict was claimed.");
+    } else if (e.round_type === "narrator") {
+      L.push("  This was the narrator writing a summary of earlier rounds, not a council decision.");
+    } else {
+      L.push("  " + (RQ_BRIEF_TRUST[String(e.outcome || "")] || "Outcome not recorded.") +
+        (e.counts ? " (" + e.counts + ")" : ""));
+      // Sub-verdict, translated. Only when it was acted on.
+      try {
+        if (e.outcome === "divided" && e.cs && e.cs.verdict && !e.cs.shadow) {
+          const base = String(csLabel(e.cs)).split("@")[0];
+          if (RQ_BRIEF_CS[base]) L.push("  Why: " + RQ_BRIEF_CS[base]);
+        }
+      } catch (_) {}
+    }
+
+    // 2. HOW MUCH TO TRUST IT. Every caveat that would make a careful reader
+    // discount this round, stated as a caveat rather than a code.
+    const doubts = [];
+    try {
+      const cfs = e.counterfoils || [];
+      const proxies = cfs.filter((c) => c && c.proxy);
+      if (proxies.length) {
+        doubts.push(proxies.length + " of " + cfs.length + " seat(s) were answered by a stand-in model, " +
+          "not the one named — " +
+          proxies.map((c) => clip(String(c.actual_model || c.actual_provider), 22) + " for " + c.declared_seat).join(", "));
+      }
+      const rec = (e.header && e.header.receipts) || [];
+      const absent = rec.filter((r) => r && r.absent).map((r) => r.seat);
+      if (absent.length) doubts.push(absent.join(", ") + " never answered at all");
+      if (e.retrieval_hit === false) {
+        doubts.push("memory search found nothing, so the seats were working from recent rounds only — " +
+          "treat any claim about older rounds with suspicion");
+      }
+      if (e.dispatch_source === "auto") doubts.push("a timer started this round, not you");
+      if (e.external_input) {
+        doubts.push("an outside model's opinion was in this round; it does not count toward agreement");
+      }
+    } catch (_) {}
+    if (doubts.length) {
+      L.push("  Take it with a pinch of salt: " + doubts.join("; ") + ".");
+    } else if (e.outcome === "verified" || e.outcome === "resolved") {
+      L.push("  Nothing undercuts this one — full roster, own models, memory working.");
+    }
+
+    // 3. WHAT IS STILL OPEN.
+    try {
+      const fs = ((e.header && e.header.receipts) || [])
+        .filter((r) => r && r.falsifier).map((r) => r.seat);
+      if (fs.length) {
+        L.push("  Open conditions: " + fs.length + " seat(s) said what would change their mind. " +
+          "Nothing has tested those yet — run window.__rqAuditFalsifiers() to see which are going stale.");
+      }
+    } catch (_) {}
+    return L.join("\n");
+  }
+
+  // Last N rounds, newest first. Default 1 — the operator usually wants "what
+  // just happened", not a report.
+  function rqBrief(count) {
+    const rows = (ledger || []);
+    if (!rows.length) { logError("[BRIEF] no rounds recorded yet."); return null; }
+    const k = Math.max(1, Math.min(Number(count) || 1, rows.length));
+    const out = [];
+    for (let i = rows.length - 1; i >= rows.length - k; i--) out.push(briefFor(rows[i], i + 1));
+    logError("[BRIEF]\n" + out.join("\n\n"));
+    return out.join("\n\n");
+  }
+
+  // State of the council: the standing picture, not a single round. Deliberately
+  // reports what is UNSETTLED rather than a score, because a score would invite
+  // exactly the "80% divided means broken" misreading the council itself
+  // corrected in round 111.
+  function rqState() {
+    const rows = (ledger || []);
+    if (!rows.length) { logError("[STATE] no rounds recorded yet."); return null; }
+    let settled = 0, open = 0, skipped = 0, degraded = 0, proxied = 0;
+    rows.forEach((e) => {
+      if (!e) return;
+      if (e.round_type) { skipped++; return; }
+      const o = String(e.outcome || "");
+      if (o === "verified" || o === "resolved") settled++;
+      else if (o === "divided") {
+        open++;
+        try { if (e.cs && !e.cs.shadow && /FIELD SKEW/.test(csLabel(e.cs))) degraded++; } catch (_) {}
+      } else open++;
+      try { if ((e.counterfoils || []).some((c) => c && c.proxy)) proxied++; } catch (_) {}
+    });
+    const scored = settled + open;
+    logError("[STATE] " + rows.length + " round(s) on this device.\n" +
+      "  Settled: " + settled + " — the council agreed, or one position survived cross-examination.\n" +
+      "  Still open: " + open + (degraded ? " (of which " + degraded +
+        " were equipment failures, not real disagreements)" : "") + ".\n" +
+      "  Not scored: " + skipped + " — roll-calls, notes and narrator passes, which were never meant to reach agreement.\n" +
+      (proxied ? "  " + proxied + " round(s) had at least one seat answered by a stand-in model.\n" : "") +
+      "  NOTE: open rounds are not failures. This council is built to preserve disagreement rather than " +
+      "dissolve it, and a high open count on hard questions is the design working. What matters is " +
+      "whether the open ones are real disagreements or equipment noise \u2014 the figure above splits them.");
+    return { rounds: rows.length, settled, open, degraded, skipped, proxied };
+  }
+
+  try {
+    window.__rqBrief = rqBrief;
+    window.__rqState = rqState;
+  } catch (_) {}
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -12675,6 +12896,9 @@ roundData,
         ? "\u26A0 [FULLTEXT] Targeted full-text request ON — seats may ask for up to " + RQ_FT_MAX_ROUNDS +
           " rounds verbatim via [REQUEST_FULLTEXT: n]. Rounds run with this on carry an extra instruction and are not prompt-identical to rounds without it."
         : "[FULLTEXT] Targeted full-text request OFF — seats see clipped ledger excerpts only.");
+      logError("[BRIEF] window.__rqBrief() for a plain-English read of the last round, " +
+        "window.__rqBrief(5) for the last five, window.__rqState() for where the council stands. " +
+        "No jargon, no API calls.");
       logError(rdsrEnabled()
         ? "\u26A0 [RDSR] Recursive self-critique ON \u2014 seats must attack their own position before defending it. Acceptance test: ONE round where a seat reverses its own L1 at L3. Until that happens the levels are unproven."
         : "[RDSR] Recursive self-critique OFF.");
