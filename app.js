@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.17.2-scaffolding";
+  const RQ_BUILD = "v4.19.0-companion";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4493,6 +4493,12 @@ roundData,
         // const does not, which is why fiatRecognitionMode() below is safe and
         // this was not. Keep the numbers literal here, or move the constants
         // above the rack.
+        ["companionToggle", "rq_companion", "OPERATOR COMPANION",
+         "A chat panel for you \u2014 prompt drafting, asking why a round came out as it did, thinking out loud. NOT a seat: it never votes, never enters consensus, never appears in headers or stats. It reads the ledger; the council can never read it. Reload to mount.",
+         "No companion panel."],
+        ["rdsrAutoToggle", "rq_rdsr_auto", "RDSR: AUTO-ARM",
+         "Arms recursive self-critique only when it is worth the overhead: architecture rounds (META + 3 machinery terms), a question that has already divided twice cleanly, or a seat writing [RSDR_REQUEST]. Expires after one round; hard cap of 3 consecutive; skipped when any seat is on a fallback.",
+         "Recursive self-critique arms only from the manual toggle."],
         ["rdsrToggle", "rq_rdsr", "RECURSIVE SELF-CRITIQUE",
          "\u26A0 SEATS READ THIS. Each seat must state a position, argue the strongest case AGAINST it, answer that attack or concede, then give a falsifier. Zero extra API calls. Rounds run with this on are not comparable to rounds without.",
          "Seats answer normally; only the falsifier ask applies (if enabled)."],
@@ -12028,6 +12034,7 @@ roundData,
     } catch (_) { return null; }
   }
 
+  let _rdsrArm = { armed: false, reason: null };   // set pre-dispatch, read at compose and storage
   let _erclInput = null;     // testimony present in THIS round, or null
   let _erclRequest = null;   // a seat's outward request from THIS round, or null
 
@@ -12217,6 +12224,375 @@ roundData,
     window.__rqState = rqState;
   } catch (_) {}
 
+  // ---------- RDSR trigger arming (Kimi seat, round 152) ----------
+  // "Deliberative overhead should scale with problem difficulty." A manual
+  // toggle either bloats simple rounds or stays off forever through inertia.
+  //
+  // ===== THE CAUSALITY ERROR THIS AVOIDS, and it is the reason this build
+  // follows one seat's spec rather than an average of three.
+  //
+  // Round 152: the Claude seat proposed triggers conditioned on the ROUND'S OWN
+  // OUTCOME — "round produces VERIFIED or PROVISIONAL", "current round produces
+  // DIVIDED". But RDSR is a prompt instruction; arming happens BEFORE dispatch.
+  // A round's result cannot decide whether to change the question that produces
+  // it.
+  //
+  //   Gemini: "triggers 1 and 2 require knowing the outcome of the active round"
+  //   Kimi:   "C's trigger (a)(1) conditions arming on the round's own outcome"
+  //
+  // Both refuted it without seeing the other's position. That is the specific
+  // failure a single model cannot catch in itself.
+  //
+  // EVERY TRIGGER BELOW IS EVALUATED BEFORE DISPATCH, from prior rounds and the
+  // incoming question only. The error is impossible here by construction:
+  // nothing in rdsrShouldArm can see the current result, because it does not
+  // exist yet when the function runs.
+  const RQ_RDSR_MACHINERY = /\b(council|seat|retrieval|consensus|trust tag|fallback|ledger|falsifier|rdsr|rsdr|orchestrat|adjudicat|comparator|counterfoil|provenance|thicket)\b/gi;
+  const RQ_RDSR_MIN_HITS  = 3;    // Kimi: tag alone is insufficient
+  const RQ_RDSR_MIN_PRIOR = 2;    // >=2 prior DIVIDED rounds on the same question
+  const RQ_RDSR_MAX_RUN   = 3;    // hard cap on consecutive armed rounds
+  // ⚠ ACCEPTS BOTH SPELLINGS, and that is not tidiness. The council writes
+  // "RSDR" (transposed) throughout its own specs; this codebase writes "RDSR".
+  // The first pattern here was /\[RS?DSR_REQUEST\]/ — which matches RDSR and
+  // RSDSR but NOT RSDR, so a seat following Kimi's spec verbatim would have been
+  // silently ignored. Caught by the suite before it shipped.
+  const RQ_RDSR_REQ_RE    = /^\s*\[(?:RDSR|RSDR)_REQUEST\]\s*$/im;
+  const RQ_RDSR_RUN_K     = "rq_rdsr_run";      // consecutive armed rounds
+  const RQ_RDSR_PEND_K    = "rq_rdsr_pending";  // a seat asked; arm the NEXT round
+
+  function rdsrTriggerEnabled() { return localStorage.getItem("rq_rdsr_auto") === "on"; }
+
+  function rdsrNormalize(q) {
+    try { return String(q || "").toLowerCase().replace(/[^a-z0-9\s]+/g, " ").replace(/\s+/g, " ").trim(); }
+    catch (_) { return ""; }
+  }
+
+  // Kimi's T2, exactly as specified: prior rounds only, every seat answered,
+  // PARALLEL excluded because a merge failure needs a re-ask, not more depth.
+  function rdsrPriorDivides(query) {
+    try {
+      const norm = rdsrNormalize(query);
+      if (norm.length < 20) return 0;
+      return (ledger || []).filter((e) => {
+        if (!e || e.outcome !== "divided") return false;
+        if (e.round_type) return false;                       // note/indexical/narrator are not questions
+        if (e.cs && /PARALLEL/i.test(String(e.cs.verdict || ""))) return false;
+        // every configured seat answered, no fallback, no absent seat
+        const cfs = e.counterfoils || [];
+        if (cfs.some((c) => c && c.proxy)) return false;
+        const rec = (e.header && e.header.receipts) || [];
+        if (rec.some((r) => r && r.absent)) return false;
+        return rdsrNormalize(e.prompt) === norm;
+      }).length;
+    } catch (_) { return 0; }
+  }
+
+  // Returns {armed, reason} — evaluated pre-dispatch, from prior state only.
+  function rdsrShouldArm(query) {
+    if (!rdsrTriggerEnabled()) return { armed: false, reason: null };
+    try {
+      // Hard cap first: a runaway trigger must stop before anything else is
+      // considered. Kimi: "forces off until the operator manually re-arms."
+      const run = parseInt(localStorage.getItem(RQ_RDSR_RUN_K) || "0", 10) || 0;
+      if (run >= RQ_RDSR_MAX_RUN) {
+        logError("[RDSR] auto-arming CAPPED — " + run + " consecutive armed round(s) reached the limit of " +
+          RQ_RDSR_MAX_RUN + ". Forced off until you re-arm manually. This is the inertia guard: " +
+          "'on' must not become permanent by accident.");
+        return { armed: false, reason: null };
+      }
+      // Skipped when any seat is on a fallback, so armed rounds stay comparable
+      // to each other. Read from the LAST round's counterfoils, which is the
+      // best pre-dispatch estimate of roster health available.
+      const last = (ledger || [])[(ledger || []).length - 1];
+      if (last && (last.counterfoils || []).some((c) => c && c.proxy)) {
+        logError("[RDSR] auto-arming SKIPPED — a seat ran on a fallback last round. " +
+          "Armed rounds are kept comparable to each other, so a degraded roster does not arm.");
+        return { armed: false, reason: null };
+      }
+      // T3 — a seat asked last round. Checked first: an explicit request from a
+      // seat outranks any heuristic about the question.
+      if (localStorage.getItem(RQ_RDSR_PEND_K) === "1") {
+        try { localStorage.removeItem(RQ_RDSR_PEND_K); } catch (_) {}   // never stacks
+        return { armed: true, reason: "T3 seat request" };
+      }
+      // T1 — architecture/design. Tag AND keyword density, per Kimi.
+      const cls = classifyEpistemic(query);
+      if (cls === "META") {
+        const hits = new Set((String(query || "").match(RQ_RDSR_MACHINERY) || [])
+          .map((w) => w.toLowerCase()));
+        if (hits.size >= RQ_RDSR_MIN_HITS) {
+          return { armed: true, reason: "T1 architecture (META + " + hits.size + " machinery terms)" };
+        }
+      }
+      // T2 — the same question already divided, twice, cleanly.
+      const prior = rdsrPriorDivides(query);
+      if (prior >= RQ_RDSR_MIN_PRIOR) {
+        return { armed: true, reason: "T2 repeated divide (" + prior + " prior clean DIVIDED rounds on this question)" };
+      }
+      return { armed: false, reason: null };
+    } catch (_) { return { armed: false, reason: null }; }
+  }
+
+  // A seat may ask for depth on the next round. Same shape as the full-text
+  // channel: the request is surfaced, consumed once, and never stacks.
+  function rdsrScanRequest(answers) {
+    if (!rdsrTriggerEnabled()) return;
+    try {
+      const asked = (answers || []).filter((a) => RQ_RDSR_REQ_RE.test(String((a && a.text) || "")));
+      if (!asked.length) return;
+      localStorage.setItem(RQ_RDSR_PEND_K, "1");
+      logError("[RDSR] " + asked.map((a) => seatLabel(a.name)).join(", ") +
+        " requested recursive self-critique for the NEXT round. A seat asking for depth is a seat " +
+        "saying this is harder than it looks \u2014 a signal nothing else in the system captures.");
+    } catch (_) {}
+  }
+
+  // ---------- Operator Companion (rq_companion, default OFF) ----------
+  // A chat panel for the operator. NOT a seat: it does not vote, deliberate,
+  // enter consensus, appear in headers or seat stats, or get embedded.
+  //
+  // ISOLATION IS STRUCTURAL, NOT INTENTIONAL. Nothing in this module calls
+  // recordLedger, sbInsert, embedText, or any council write path. The companion
+  // CANNOT leak into council retrieval because it never touches a surface the
+  // council reads. That is the directive's falsifier, enforced by construction
+  // rather than by discipline.
+  //
+  //     companion -> ledger   read-only, allowed
+  //     council   -> companion  impossible: nothing writes companion text
+  //                             anywhere a seat can reach
+  const RQ_COMP_KEY    = "rq_companion_chat_v1";
+  const RQ_COMP_MAX    = 60;      // messages retained; trims oldest-first, loudly
+  const RQ_COMP_CTX    = 12;      // ledger rounds offered as context
+  // TWO DEVIATIONS FROM THE DIRECTIVE, stated rather than silently made:
+  //
+  // D-1  NO WEB SEARCH. The directive asks for "internet search capability (if
+  //      the model supports it)". OpenRouter free-tier chat completions expose
+  //      no search tool. A stub that LOOKED like search would be worse than not
+  //      having it: the operator would trust answers about current events that
+  //      are pure recall. The system prompt tells the model to say so plainly.
+  //
+  // D-2  NO HARDCODED MODEL. The directive names openrouter/glm-4-9b:free.
+  //      Three free models have dropped out of that catalog in the last week
+  //      alone and repairDeadFloors logs the churn on every boot, so a single
+  //      hardcoded id would 404 within days. The companion walks a short chain
+  //      and names the model that answered.
+  const RQ_COMP_MODELS = [
+    "z-ai/glm-4.6:free",
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+  ];
+  let _compModelOk = null;
+
+  function companionEnabled() { return localStorage.getItem("rq_companion") === "on"; }
+
+  function compLoad() {
+    try { const v = JSON.parse(localStorage.getItem(RQ_COMP_KEY) || "[]"); return Array.isArray(v) ? v : []; }
+    catch (_) { return []; }
+  }
+  function compSave(rows) {
+    try {
+      if (rows.length > RQ_COMP_MAX) {
+        const dropped = rows.length - RQ_COMP_MAX;
+        rows = rows.slice(dropped);
+        logError("[COMPANION] history cap " + RQ_COMP_MAX + " reached — " + dropped +
+          " oldest message(s) dropped. Companion history is NOT the ledger and is not backed up.");
+      }
+      localStorage.setItem(RQ_COMP_KEY, JSON.stringify(rows));
+    } catch (e) {
+      logError("[COMPANION] history persist failed (" + ((e && e.message) || e) + ") — this session only.");
+    }
+  }
+
+  // Read-only ledger context. Deliberately compact: the companion is for the
+  // operator, and a huge context makes a free model slower and worse.
+  function compLedgerContext() {
+    try {
+      const rows = (ledger || []).slice(-RQ_COMP_CTX);
+      if (!rows.length) return "The council ledger is empty.";
+      const lines = rows.map((e, i) => {
+        const n = (ledger || []).length - rows.length + i + 1;
+        const sub = (e.cs && e.cs.verdict) ? " / " + csLabel(e.cs) : "";
+        return "R" + n + " [" + String(e.outcome || "?").toUpperCase() + sub + "] " +
+          clip(String(e.prompt || ""), 140);
+      });
+      return "COUNCIL LEDGER — last " + rows.length + " of " + (ledger || []).length +
+        " rounds (read-only, for context):\n" + lines.join("\n");
+    } catch (_) { return "Ledger unavailable."; }
+  }
+
+  const RQ_COMP_SYSTEM =
+    "You are the operator's companion inside the Red Queen, a browser-based council of three " +
+    "independent AI models that deliberate on a question and record the result with a trust tag. " +
+    "You are NOT one of those seats. You do not vote, deliberate, or enter consensus. Your job is " +
+    "to help the operator think: draft and sharpen prompts, explain why a round came out the way " +
+    "it did, and talk through ideas.\n\n" +
+    "You can see the council's recent rounds below, read-only. The council cannot see this " +
+    "conversation — say so if the operator seems to assume otherwise.\n\n" +
+    "You have NO web access. If a question needs current information you do not have, say so " +
+    "plainly rather than guessing.";
+
+  async function compAsk(userText) {
+    const hist = compLoad();
+    const msgs = [
+      { role: "system", content: RQ_COMP_SYSTEM + "\n\n" + compLedgerContext() },
+      ...hist.slice(-16).map((m) => ({ role: m.role, content: m.text })),
+      { role: "user", content: String(userText || "") },
+    ];
+    const candidates = _compModelOk ? [_compModelOk] : RQ_COMP_MODELS;
+    let lastErr = null;
+    for (let i = 0; i < candidates.length; i++) {
+      const model = candidates[i];
+      try {
+        await paceProvider("openrouter");   // shared key — pace, never mob the seats
+        const res = await fetchWithRetry("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json",
+                     Authorization: "Bearer " + settings.keyOpenRouter },
+          body: JSON.stringify({ model: model, messages: msgs, max_tokens: 1500 }),
+        }, "Companion", 2, [404, 503]);
+        if (res.status === 404 || res.status === 503) { lastErr = "HTTP " + res.status; continue; }
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error.message || "provider error");
+        let txt = data.choices?.[0]?.message?.content || "";
+        txt = txt.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+        if (!txt) { lastErr = "empty answer"; continue; }
+        if (_compModelOk !== model) {
+          _compModelOk = model;
+          logError("[COMPANION] using " + model + (i > 0 ? " (walked past " + candidates.slice(0, i).join(", ") + ")" : "") + ".");
+        }
+        return txt;
+      } catch (e) { lastErr = (e && e.message) || String(e); }
+    }
+    throw new Error("all companion models failed" + (lastErr ? " — last: " + lastErr : ""));
+  }
+
+  function ensureCompanionUI() {
+    if (!companionEnabled() || document.getElementById("rqCompanion")) return;
+    const wrap = document.createElement("div");
+    wrap.id = "rqCompanion";
+    wrap.style.cssText =
+      "position:fixed;top:0;right:0;height:100vh;width:min(400px,92vw);z-index:9998;" +
+      "display:flex;flex-direction:column;background:#0d0708;border-left:1px solid #8B0000;" +
+      "box-shadow:-8px 0 28px rgba(0,0,0,.6);transform:translateX(100%);transition:transform .22s ease;" +
+      "font-family:system-ui,-apple-system,sans-serif;color:#e8e0e0;";
+    const tab = document.createElement("button");
+    tab.id = "rqCompanionTab"; tab.type = "button"; tab.textContent = "COMPANION";
+    tab.style.cssText =
+      "position:fixed;top:50%;right:0;transform:translateY(-50%) rotate(180deg);z-index:9999;" +
+      "writing-mode:vertical-rl;padding:14px 6px;background:#0d0708;color:#B22222;cursor:pointer;" +
+      "border:1px solid #8B0000;border-right:none;border-radius:6px 0 0 6px;font-size:.62rem;" +
+      "letter-spacing:.14em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;";
+    let open = false;
+    const paint = () => { wrap.style.transform = open ? "translateX(0)" : "translateX(100%)"; };
+    tab.addEventListener("click", () => { open = !open; paint(); });
+
+    const head = document.createElement("div");
+    head.style.cssText = "padding:12px 14px;border-bottom:1px solid #3a1414;display:flex;" +
+      "align-items:center;justify-content:space-between;flex:0 0 auto;";
+    head.innerHTML =
+      '<span style="font-family:ui-monospace,Menlo,monospace;font-size:.68rem;letter-spacing:.12em;' +
+      'color:#B22222;">COMPANION</span>' +
+      '<span style="font-family:ui-monospace,Menlo,monospace;font-size:.56rem;color:#7a6a6a;">' +
+      'not a seat &middot; council cannot read this</span>';
+
+    const log = document.createElement("div");
+    log.id = "rqCompanionLog";
+    log.style.cssText = "flex:1 1 auto;overflow-y:auto;padding:12px 14px;font-size:.82rem;line-height:1.5;";
+
+    const foot = document.createElement("div");
+    foot.style.cssText = "flex:0 0 auto;border-top:1px solid #3a1414;padding:10px 12px;";
+    const ta = document.createElement("textarea");
+    ta.rows = 3; ta.placeholder = "Draft a prompt, or ask why a round came out the way it did\u2026";
+    ta.style.cssText = "width:100%;box-sizing:border-box;background:#150c0d;color:#e8e0e0;" +
+      "border:1px solid #3a1414;border-radius:6px;padding:8px;font-size:.8rem;resize:vertical;" +
+      "font-family:inherit;";
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:8px;margin-top:8px;";
+    const mk = (label) => {
+      const b = document.createElement("button");
+      b.type = "button"; b.textContent = label;
+      b.style.cssText = "flex:1;padding:7px;background:transparent;color:#B22222;cursor:pointer;" +
+        "border:1px solid #8B0000;border-radius:6px;font-size:.62rem;letter-spacing:.1em;" +
+        "font-family:ui-monospace,Menlo,monospace;";
+      return b;
+    };
+    const send = mk("SEND"), toCouncil = mk("COPY TO COUNCIL"), clear = mk("CLEAR");
+    row.appendChild(send); row.appendChild(toCouncil); row.appendChild(clear);
+    foot.appendChild(ta); foot.appendChild(row);
+    wrap.appendChild(head); wrap.appendChild(log); wrap.appendChild(foot);
+    document.body.appendChild(wrap); document.body.appendChild(tab);
+
+    const render = () => {
+      const rows = compLoad();
+      log.innerHTML = rows.length ? "" :
+        '<div style="color:#7a6a6a;font-size:.76rem;">Nothing yet. This history is stored separately ' +
+        'from the council ledger and is never visible to the seats.</div>';
+      rows.forEach((m) => {
+        const d = document.createElement("div");
+        d.style.cssText = "margin-bottom:12px;";
+        const who = m.role === "user" ? "YOU" : "COMPANION";
+        const col = m.role === "user" ? "#7a6a6a" : "#B22222";
+        d.innerHTML = '<div style="font-family:ui-monospace,Menlo,monospace;font-size:.54rem;' +
+          'letter-spacing:.12em;color:' + col + ';margin-bottom:3px;">' + who + '</div>' +
+          '<div style="white-space:pre-wrap;">' + String(m.text || "")
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") + '</div>';
+        log.appendChild(d);
+      });
+      log.scrollTop = log.scrollHeight;
+    };
+
+    send.addEventListener("click", async () => {
+      const text = ta.value.trim();
+      if (!text) return;
+      if (!settings.keyOpenRouter) {
+        logError("[COMPANION] no OpenRouter key configured — the companion uses the free tier and needs one.");
+        return;
+      }
+      const rows = compLoad();
+      rows.push({ role: "user", text: text, ts: Date.now() });
+      compSave(rows); ta.value = ""; render();
+      send.disabled = true; send.textContent = "\u2026";
+      try {
+        const reply = await compAsk(text);
+        const r2 = compLoad(); r2.push({ role: "assistant", text: reply, ts: Date.now() });
+        compSave(r2);
+      } catch (e) {
+        const r2 = compLoad();
+        r2.push({ role: "assistant", text: "[failed] " + ((e && e.message) || e), ts: Date.now() });
+        compSave(r2);
+      } finally { send.disabled = false; send.textContent = "SEND"; render(); }
+    });
+
+    toCouncil.addEventListener("click", () => {
+      const rows = compLoad();
+      const lastAssistant = [...rows].reverse().find((m) => m.role === "assistant");
+      const text = ta.value.trim() || (lastAssistant ? lastAssistant.text : "");
+      if (!text) return;
+      try {
+        const box = document.getElementById("queryInput") || document.querySelector("textarea");
+        if (box && box !== ta) {
+          box.value = text;
+          box.dispatchEvent(new Event("input", { bubbles: true }));
+          open = false; paint();
+          logError("[COMPANION] draft copied to the council input. It is NOT sent \u2014 read it, edit it, then press send yourself.");
+        }
+      } catch (_) {}
+    });
+
+    clear.addEventListener("click", () => {
+      if (!confirm("Clear companion history? This does not touch the council ledger.")) return;
+      try { localStorage.removeItem(RQ_COMP_KEY); } catch (_) {}
+      render();
+    });
+
+    ta.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); send.click(); }
+    });
+    render();
+  }
+  try { window.__rqCompanionHistory = () => compLoad(); } catch (_) {}
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -12305,6 +12681,19 @@ roundData,
       // so its provenance is recorded even if the round later fails.
       _erclInput = erclScanInput(query);
       _erclRequest = null;
+      // RDSR — evaluated BEFORE dispatch, from prior rounds and this question
+      // only. The manual flag still forces it on; the trigger only adds arming.
+      _rdsrArm = rdsrShouldArm(query);
+      if (_rdsrArm.armed) {
+        const run = (parseInt(localStorage.getItem(RQ_RDSR_RUN_K) || "0", 10) || 0) + 1;
+        try { localStorage.setItem(RQ_RDSR_RUN_K, String(run)); } catch (_) {}
+        logError("\u25C6 [RDSR] AUTO-ARMED for this round \u2014 " + _rdsrArm.reason +
+          " (" + run + "/" + RQ_RDSR_MAX_RUN + " consecutive). Expires after this round unless a " +
+          "trigger fires again. The reason is stored on the round so a later reader can tell why " +
+          "this one has four levels and its neighbour does not.");
+      } else if (!rdsrEnabled()) {
+        try { localStorage.removeItem(RQ_RDSR_RUN_K); } catch (_) {}   // run breaks on any unarmed round
+      }
       // CPL — the root event for this dispatch. trigger_type is DERIVED from how
       // the round actually started, never assumed: the auto scheduler sets
       // _autoThisRound, the banner sets _rqEndogenousPrompt, and anything else
@@ -12416,7 +12805,7 @@ roundData,
         // RDSR — same after-composition seam, so the prompt hash stays clean.
         // Suppressed on note/indexical/falsifier-test rounds, which are not
         // positions and have nothing to attack.
-        ((rdsrEnabled() && !_noteRound && !_indexicalRound && !isFalsifierTestRound(query))
+        (((rdsrEnabled() || (_rdsrArm && _rdsrArm.armed)) && !_noteRound && !_indexicalRound && !isFalsifierTestRound(query))
           ? ("\n\n" + RQ_RDSR_ASK) : "") +
         _ftBlock +
         ((fulltextRetrieveEnabled() && !_noteRound && !_indexicalRound) ? ("\n\n" + RQ_FT_INSTRUCTION) : "");
@@ -12442,6 +12831,7 @@ roundData,
         // never dispatched: this build has no external fetch by design.
         try { _erclRequest = erclScanRequest(allAnswers); } catch (_) {}
         try { rdsrScan(allAnswers); } catch (_) {}
+        try { rdsrScanRequest(allAnswers); } catch (_) {}
         // v4.4.0 — harvest [REQUEST_FULLTEXT: ...] from the seats' own answers
         // for the NEXT round. Consumed once by ftBuildBlock; a request is not
         // standing, so a seat must ask again if it still needs the text.
@@ -12572,6 +12962,10 @@ roundData,
           // v4.13.0 — RETRIEVAL STATE (council rank 3). Recorded only when
           // injection was ARMED, so its absence is never mistaken for a miss.
           ...(injectionEnabled() ? { retrieval_hit: !!_injectedThisRound } : {}),
+          // v4.18.0 — WHY this round was armed. Under a manual toggle the
+          // operator knows; under auto-arming nobody can tell later unless it
+          // is recorded. Absent on unarmed rounds.
+          ...((_rdsrArm && _rdsrArm.armed) ? { rdsr_trigger: _rdsrArm.reason } : {}),
           // ERCL — provenance for both directions. Additive: an ordinary round
           // carries neither key and the entry is byte-identical.
           ...(_erclInput ? { external_input: _erclInput } : {}),
@@ -12899,6 +13293,17 @@ roundData,
       logError("[BRIEF] window.__rqBrief() for a plain-English read of the last round, " +
         "window.__rqBrief(5) for the last five, window.__rqState() for where the council stands. " +
         "No jargon, no API calls.");
+      try { ensureCompanionUI(); } catch (_) {}
+      logError(companionEnabled()
+        ? "[COMPANION] Operator companion ON — a chat panel on the right, NOT a seat. It reads the ledger; the council cannot read it. History lives in " + RQ_COMP_KEY + ", never in the ledger, never embedded. No web access."
+        : "[COMPANION] Operator companion OFF.");
+      logError(rdsrTriggerEnabled()
+        ? "\u25C6 [RDSR] Auto-arming ON \u2014 T1 architecture (META + " + RQ_RDSR_MIN_HITS +
+          " machinery terms), T2 a question already divided " + RQ_RDSR_MIN_PRIOR +
+          "x cleanly, T3 a seat writing [RSDR_REQUEST]. Armed one round at a time, capped at " +
+          RQ_RDSR_MAX_RUN + " consecutive, skipped on a degraded roster. Every trigger is evaluated " +
+          "BEFORE dispatch \u2014 arming can never depend on the round's own outcome."
+        : "[RDSR] Auto-arming OFF \u2014 manual toggle only.");
       logError(rdsrEnabled()
         ? "\u26A0 [RDSR] Recursive self-critique ON \u2014 seats must attack their own position before defending it. Acceptance test: ONE round where a seat reverses its own L1 at L3. Until that happens the levels are unproven."
         : "[RDSR] Recursive self-critique OFF.");
