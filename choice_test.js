@@ -1,0 +1,12 @@
+const fs=require("fs"),src=fs.readFileSync("app.js","utf8");
+const m=src.match(/const pickOf = \(text\) => \{[\s\S]*?\};/)[0];
+eval(m.replace("const pickOf","globalThis.pickOf"));
+let p=0,f=0;const t=(n,g,w)=>{g===w?(p++,console.log("  PASS  "+n)):(f++,console.log("  FAIL  "+n+" got "+g));};
+t("round-1 gemini","B",pickOf("I choose Option B: Supabase as write-of-record with a local cache."));
+t("round-1 kimi","B",pickOf("Kimi seat position: Option B — Supabase as write-of-record, with a serious local cache."));
+t("round-1 claude","A",pickOf("My position: Option A – IndexedDB as the write-of-record with Supabase serving as an asynchronous mirror."));
+t("numeric option","3",pickOf("I pick option 3 because it preserves provenance."));
+t("no label -> null",null,pickOf("Supabase should be the record. Postgres gives you constraints."));
+t("bare letter never matches",null,pickOf("A is better than B here."));
+t("round-2 gemini has no label",null,pickOf("The Failure Mode: Cascading Unavailability (The All-or-Nothing Crash)."));
+console.log(p+" passed, "+f+" failed");process.exit(f?1:0);
