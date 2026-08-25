@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.19.0-companion";
+  const RQ_BUILD = "v4.20.1-gemini-chain";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -704,7 +704,17 @@
   // The working model is remembered for the session so the chain is walked once,
   // not per round. Ordered newest-first: newer models are cheaper per token at
   // introductory pricing and the older entries exist purely as a floor.
-  const GEMINI_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
+  // v4.20.1 — CHAIN EXHAUSTED 2026-08-25: all three 404'd in one round, and
+  // Google's own error named the replacement — "Please update your code to use
+  // models/gemini-3.6-flash". 2.5-flash is now closed to new users; 3.7 was
+  // busy, 3.5 was busy, and the walk ran out. Chain reordered around the model
+  // Google itself pointed at, with the newest kept ahead of it and 2.5 dropped.
+  //
+  // This is the third catalog churn in two weeks. The chain is doing its job —
+  // the seat degraded rather than failing — but a hardcoded list will keep
+  // expiring, and the honest read is that this needs a periodic check, not a
+  // better guess.
+  const GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash"];
   let _geminiModelOk = null;   // session cache of the first entry that answered
   // ---- Gemini seat. Three layers, added in response to three separate live
   // failures; the history is kept because each one explains a guard that would
@@ -4496,6 +4506,9 @@ roundData,
         ["companionToggle", "rq_companion", "OPERATOR COMPANION",
          "A chat panel for you \u2014 prompt drafting, asking why a round came out as it did, thinking out loud. NOT a seat: it never votes, never enters consensus, never appears in headers or stats. It reads the ledger; the council can never read it. Reload to mount.",
          "No companion panel."],
+        ["rebuttalToggle", "rq_rebuttal", "REBUTTAL PASS",
+         "\u26A0 +1 CALL PER SEAT. After the seats answer blind, each sees the others and may revise or HOLD. Holding is the default and costs nothing. A revision must cite which position moved it; uncited revisions are logged as drift. Opening positions are preserved so every change is measurable.",
+         "Seats answer once, blind to each other. There is no within-round exchange."],
         ["rdsrAutoToggle", "rq_rdsr_auto", "RDSR: AUTO-ARM",
          "Arms recursive self-critique only when it is worth the overhead: architecture rounds (META + 3 machinery terms), a question that has already divided twice cleanly, or a seat writing [RSDR_REQUEST]. Expires after one round; hard cap of 3 consecutive; skipped when any seat is on a fallback.",
          "Recursive self-critique arms only from the manual toggle."],
@@ -5647,6 +5660,21 @@ roundData,
     // v4.12.1 — dispatch is complete; freeze the delivered-prompt record before
     // adjudication reuses the same seat wrappers and overwrites it.
     try { Object.defineProperty(_seatDelivered, "__locked", { value: true, configurable: true }); } catch (_) {}
+    // v4.19.1 — freeze WHO ANSWERED at the same instant. Everything after this
+    // line (adjudication, its fallback walks) may change seatProvider, and none
+    // of it changes who produced the positions above.
+    try {
+      Object.keys(_seatProviderAtAnswer).forEach((k) => delete _seatProviderAtAnswer[k]);
+      Object.keys(seatProvider).forEach((k) => { _seatProviderAtAnswer[k] = seatProvider[k]; });
+    } catch (_) {}
+    // v4.20.0 — OPENINGS ARE FROZEN HERE, before any seat sees another. Without
+    // this the ledger's `positions` would silently become post-rebuttal text and
+    // there would be no baseline for measuring a revision.
+    _openingPositions = eligible.map((a) => ({ seat: a.name, text: String(a.text || "") }));
+    if (rebuttalEnabled() && eligible.length >= 2 && !_noteRound && !_indexicalRound) {
+      try { _rebuttalResult = await runRebuttalPass(query, eligible, calls); }
+      catch (e) { logError("[REBUTTAL] pass failed: " + ((e && e.message) || e) + " — round continues on the opening positions."); }
+    }
     const { agreed, outliers } = checkConsensus(eligible);
 
     // PROVISIONAL rule (Kimi amendment, 2026-07-12): consensus is verified
@@ -12034,6 +12062,8 @@ roundData,
     } catch (_) { return null; }
   }
 
+  let _openingPositions = null;   // frozen pre-rebuttal; the baseline for every revision
+  let _rebuttalResult = null;
   let _rdsrArm = { armed: false, reason: null };   // set pre-dispatch, read at compose and storage
   let _erclInput = null;     // testimony present in THIS round, or null
   let _erclRequest = null;   // a seat's outward request from THIS round, or null
@@ -12046,9 +12076,22 @@ roundData,
   // The failure it addresses, in the seat's words: "A VERIFIED minted on a proxy
   // answer is worse than an honest DIVIDED, because it is a settled falsehood
   // that every later round treats as ground truth."
+  // v4.19.1 — READS THE ANSWER-TIME SNAPSHOT, NOT LIVE STATE.
+  //
+  // The first version read seatProvider[a.name] directly at recordLedger time.
+  // But seatProvider is MUTATED by adjudication's fallback walk, which runs
+  // before the ledger write — so the attestation captured post-adjudication
+  // state and could name a model that did not produce the answer.
+  //
+  // That is precisely the misattribution the Counterfoil exists to close,
+  // committed by the Counterfoil. Same class as the v4.12.1 prompt-digest
+  // defect: I locked that record when dispatch completed and did not lock this
+  // one. Live 2026-08-25: two seats answered on primaries, fell back only
+  // during adjudication, and every downstream surface showed them as proxies.
+  const _seatProviderAtAnswer = {};
   function counterfoilFor(a) {
     try {
-      const prov = seatProvider[a.name] || "unknown";
+      const prov = _seatProviderAtAnswer[a.name] || seatProvider[a.name] || "unknown";
       const proxy = prov !== "primary";
       const text = String((a && a.text) || "");
       return {
@@ -12593,6 +12636,147 @@ roundData,
   }
   try { window.__rqCompanionHistory = () => compLoad(); } catch (_) {}
 
+  // ---------- The Rebuttal Pass (rq_rebuttal, default OFF) ----------
+  // Kimi seat, round 157, conceding the deflationary account and naming exactly
+  // what would be needed to overturn it:
+  //
+  //   "There is no within-round exchange. Seats answer separately; outputs are
+  //    compared afterward... Emergence 'through the exchange' has no mechanism
+  //    here." … "To rule it out: log opening positions, add a rebuttal pass,
+  //    and run Round 156's experiment."
+  //
+  // All three are built together because none means anything alone: without
+  // frozen openings there is no baseline for a revision, and without novelty
+  // detection the pass answers no question.
+  //
+  // ⚠ THE RISK, NAMED BY THE SAME SEAT IN ROUND 87, AND THE REASON EVERY
+  // DESIGN CHOICE BELOW LOOKS THE WAY IT DOES:
+  //
+  //   "Convergence isn't correctness. Seats all reading the same ledger can
+  //    herd — resolving by imitation of the emerging house style rather than
+  //    by independent derivation."
+  //
+  // A rebuttal pass is a herding machine if revision is free. So it is not:
+  //   * a revising seat MUST cite which position moved it; uncited revisions
+  //     are logged UNATTRIBUTED and flagged as drift
+  //   * HOLDING is stated first and stated as costless, so there is no
+  //     gradient toward agreement
+  //   * openings are preserved verbatim, so every revision stays measurable
+  //   * the conformity audit measures path distance on OPENINGS, so the
+  //     instrument that detects herding is unaffected by the feature that
+  //     could cause it
+  const RQ_REB_TIMEOUT_MS = 45000;
+  const RQ_REB_CITE_RE = /\bmoved by\s+position\s+([A-D])\b/i;
+  const RQ_REB_HOLD_RE = /^\s*\[?HOLD\]?\b/im;
+
+  function rebuttalEnabled() { return localStorage.getItem("rq_rebuttal") === "on"; }
+
+  // The instruction. HOLD is stated first and stated as costless, deliberately:
+  // a pass that makes revision feel expected manufactures the convergence it is
+  // supposed to test for.
+  function rebuttalPrompt(originalQuery, positions, selfLetter) {
+    const others = positions.filter((p) => p.letter !== selfLetter)
+      .map((p) => "Position " + p.letter + ":\n" + clip(p.text, 1200)).join("\n\n---\n\n");
+    const mine = positions.find((p) => p.letter === selfLetter);
+    return "The council was asked: " + clip(originalQuery, 600) + "\n\n" +
+      "You submitted Position " + selfLetter + ":\n" + clip(mine ? mine.text : "", 1200) + "\n\n" +
+      "The other seats answered independently, without seeing yours:\n\n" + others + "\n\n" +
+      "You may now revise your position, or hold it.\n\n" +
+      "HOLDING IS THE DEFAULT AND COSTS NOTHING. A position that survives contact with the others " +
+      "is a stronger result than one that moves. Do not revise to reduce disagreement.\n\n" +
+      "If you hold, reply with exactly: [HOLD]\n\n" +
+      "If you revise, you MUST begin with a line naming what moved you:\n" +
+      "MOVED BY POSITION <letter>: <the specific claim that changed your view>\n" +
+      "Then give your revised position. A revision without that line is recorded as UNATTRIBUTED, " +
+      "which is treated as drift rather than reasoning.";
+  }
+
+  // Returns {revised, held, unattributed} and MUTATES answer text in place for
+  // seats that revised. Openings are captured by the caller before this runs.
+  async function runRebuttalPass(originalQuery, eligible, wrappedCalls) {
+    const positions = eligible.map((a, i) => ({ letter: letterFor(i), seat: a.name, text: a.text }));
+    const seatFns = {};
+    (wrappedCalls || []).forEach((c) => { seatFns[c.name] = c.fn; });
+    const revised = [], held = [], unattributed = [], failed = [];
+    for (const p of positions) {
+      const fn = seatFns[p.seat];
+      if (!fn) { failed.push(p.seat); continue; }
+      let out = null;
+      try {
+        out = await Promise.race([
+          fn(rebuttalPrompt(originalQuery, positions, p.letter)),
+          sleep(RQ_REB_TIMEOUT_MS).then(() => "__timeout__"),
+        ]);
+      } catch (_) { out = null; }
+      if (!out || out === "__timeout__") { failed.push(p.seat); continue; }
+      const txt = String(out).trim();
+      if (RQ_REB_HOLD_RE.test(txt) || txt.length < 40) { held.push(p.seat); continue; }
+      const cite = RQ_REB_CITE_RE.exec(txt);
+      const target = eligible.find((a) => a.name === p.seat);
+      if (target) { target.text = txt; target.rebutted = true; }
+      if (cite) {
+        revised.push({ seat: p.seat, movedBy: cite[1].toUpperCase() });
+        if (target) target.movedBy = cite[1].toUpperCase();
+      } else {
+        unattributed.push(p.seat);
+        if (target) target.unattributed = true;
+      }
+    }
+    logError("\u25C7 [REBUTTAL] " + held.length + " held, " + revised.length + " revised, " +
+      unattributed.length + " revised WITHOUT citing a source" +
+      (failed.length ? ", " + failed.length + " failed" : "") + ". " +
+      (revised.length ? "Attributed: " + revised.map((r) => seatLabel(r.seat) + " moved by " + r.movedBy).join("; ") + ". " : "") +
+      (unattributed.length
+        ? "\u26A0 UNATTRIBUTED: " + unattributed.map(seatLabel).join(", ") +
+          " — a revision with no cited cause is drift, not reasoning, and is the herding signature this pass was designed against."
+        : "Every revision cited what moved it."));
+    return { revised: revised, held: held, unattributed: unattributed, failed: failed };
+  }
+
+  // Does the final text contain claims present in NO opening position? This is
+  // the discriminator the whole feature exists to test: three parallel experts
+  // produce a verdict traceable to some seat's opening; a group that reasoned
+  // together may not.
+  //
+  // Deliberately CONSERVATIVE. Sentence-level, embedding-based, and a claim
+  // counts as novel only if it is far from EVERY opening. A false "novel" would
+  // manufacture exactly the result the operator is hoping for, which is the one
+  // direction this must not fail in.
+  const RQ_NOVEL_FAR = 0.55;   // TUNE-AFTER-DATA — min distance from every opening
+  async function detectNovelClaims(finalText, openings) {
+    try {
+      if (!finalText || !openings || openings.length < 2) return null;
+      const claims = claimSplit(finalText);
+      if (!claims.length) return null;
+      const openSents = [];
+      openings.forEach((o) => claimSplit(o.text || "").forEach((c) => openSents.push(c)));
+      if (!openSents.length) return null;
+      const cv = await Promise.all(claims.map((c) => embedText(c)));
+      const ov = await Promise.all(openSents.map((c) => embedText(c)));
+      if (cv.some((v) => !v) || ov.some((v) => !v)) {
+        logError("[NOVELTY] embed worker unavailable — result is UNKNOWN, not 'no novelty found'.");
+        return null;
+      }
+      const novel = [];
+      cv.forEach((v, i) => {
+        let nearest = 1;
+        ov.forEach((w) => { const d = 1 - _cosine384(v, w); if (d < nearest) nearest = d; });
+        if (nearest >= RQ_NOVEL_FAR) novel.push({ claim: clip(claims[i], 140), distance: Math.round(nearest * 100) / 100 });
+      });
+      if (novel.length) {
+        logError("\u25C6 [NOVELTY] " + novel.length + " claim(s) in the final text sit far from EVERY opening " +
+          "position (>= " + RQ_NOVEL_FAR + "). This is the discriminator between parallel competence and a " +
+          "group conclusion no member brought: " +
+          novel.slice(0, 3).map((n) => "\"" + n.claim + "\" (" + n.distance + ")").join(" | ") +
+          ". CANDIDATE ONLY — the threshold is fitted to nothing, and a paraphrase can read as distant.");
+      } else {
+        logError("[NOVELTY] every claim in the final text traces to some opening position. That is the " +
+          "DEFLATIONARY result and it is the expected one: parallel competence plus a record. Not a failure.");
+      }
+      return novel;
+    } catch (_) { return null; }
+  }
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -12681,6 +12865,8 @@ roundData,
       // so its provenance is recorded even if the round later fails.
       _erclInput = erclScanInput(query);
       _erclRequest = null;
+      _openingPositions = null;
+      _rebuttalResult = null;
       // RDSR — evaluated BEFORE dispatch, from prior rounds and this question
       // only. The manual flag still forces it on; the trigger only adds arming.
       _rdsrArm = rdsrShouldArm(query);
@@ -12832,6 +13018,10 @@ roundData,
         try { _erclRequest = erclScanRequest(allAnswers); } catch (_) {}
         try { rdsrScan(allAnswers); } catch (_) {}
         try { rdsrScanRequest(allAnswers); } catch (_) {}
+        // v4.20.0 — the question the pass exists to answer.
+        if (_rebuttalResult && result && result.text) {
+          try { await detectNovelClaims(result.text, _openingPositions || []); } catch (_) {}
+        }
         // v4.4.0 — harvest [REQUEST_FULLTEXT: ...] from the seats' own answers
         // for the NEXT round. Consumed once by ftBuildBlock; a request is not
         // standing, so a seat must ask again if it still needs the text.
@@ -12962,6 +13152,13 @@ roundData,
           // v4.13.0 — RETRIEVAL STATE (council rank 3). Recorded only when
           // injection was ARMED, so its absence is never mistaken for a miss.
           ...(injectionEnabled() ? { retrieval_hit: !!_injectedThisRound } : {}),
+          // v4.20.0 — openings kept SEPARATELY from `positions`, which now hold
+          // post-rebuttal text when the pass ran. Absent when it did not, so an
+          // ordinary round is byte-identical.
+          ...(_rebuttalResult ? {
+            opening_positions: (_openingPositions || []).map((o) => ({ seat: o.seat, text: clip(o.text, 900) })),
+            rebuttal: _rebuttalResult,
+          } : {}),
           // v4.18.0 — WHY this round was armed. Under a manual toggle the
           // operator knows; under auto-arming nobody can tell later unless it
           // is recorded. Absent on unarmed rounds.
@@ -13297,6 +13494,16 @@ roundData,
       logError(companionEnabled()
         ? "[COMPANION] Operator companion ON — a chat panel on the right, NOT a seat. It reads the ledger; the council cannot read it. History lives in " + RQ_COMP_KEY + ", never in the ledger, never embedded. No web access."
         : "[COMPANION] Operator companion OFF.");
+      // v4.19.1 — Counterfoil had NO boot line while every other feature
+      // announced its state. It is always-on with no flag, so without this there
+      // was no way to tell it was active at all.
+      logError("\u25C7 [COUNTERFOIL] Attestation ON (always) \u2014 every answer records the provider and " +
+        "model that actually produced it, captured at ANSWER time before adjudication can overwrite it. " +
+        "A proxy answer renders in seat memory as \"<model>, speaking for <seat>\", never under the seat " +
+        "name. Agreement among proxies alone caps the round at PROVISIONAL.");
+      logError(rebuttalEnabled()
+        ? "\u25C7 [REBUTTAL] Rebuttal pass ON \u2014 seats see each other's openings and may revise or hold, +1 call per seat. Holding is the default and stated as costless; a revision must cite what moved it. Openings are stored separately so revisions are measurable, and NOVELTY detection reports whether the final text contains any claim absent from every opening."
+        : "[REBUTTAL] Rebuttal pass OFF \u2014 seats answer once, blind to each other. There is no within-round exchange, so a conclusion cannot emerge from one.");
       logError(rdsrTriggerEnabled()
         ? "\u25C6 [RDSR] Auto-arming ON \u2014 T1 architecture (META + " + RQ_RDSR_MIN_HITS +
           " machinery terms), T2 a question already divided " + RQ_RDSR_MIN_PRIOR +
