@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.20.1-gemini-chain";
+  const RQ_BUILD = "v4.21.0-ui";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -13349,6 +13349,27 @@ roundData,
       const _body = document.createElement("div");
       consensusText.appendChild(_body);
       renderRich(_body, answer);
+      // v4.21.0 — PROGRESSIVE REVEAL. Deliberately NOT streaming: the text is
+      // already complete and already scored when this runs. Streaming would
+      // mean rendering tokens as they arrive, which is impossible here because
+      // the comparator needs the whole answer before it can produce a verdict —
+      // and showing text before it has been scored would put unverified content
+      // on screen under a trust tag it has not earned yet.
+      //
+      // So this reveals text the operator already has, block by block, purely so
+      // a long verdict does not land as a wall. Nothing about the round changes.
+      // Honoured reduced-motion: the whole point is comfort, and forcing motion
+      // on someone who has asked for none would defeat it.
+      try {
+        const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        if (!reduce) {
+          const blocks = Array.from(_body.children);
+          blocks.forEach((el, i) => {
+            el.classList.add("rq-reveal");
+            el.style.animationDelay = Math.min(i * 55, 660) + "ms";
+          });
+        }
+      } catch (_) {}
       logHistory(query, answer);
       // v3.5.4: the non-speaking seats' answers used to vanish from the visible
       // record on a consensus round. They are the evidence for whether the
