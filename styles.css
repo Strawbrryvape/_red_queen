@@ -86,15 +86,38 @@
 /* v2.2 host context PRESERVED VERBATIM (layers depend on it) */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+/* v4.21.0 — MOBILE: BOTTOM CONTROLS WERE UNREACHABLE.
+   Two causes, neither of them the 100vh usually blamed for this:
+
+   1. height: 100% pins html/body to exactly the INITIAL viewport. .canvas below
+      sets min-height: 100dvh, which on a phone with retracted browser chrome is
+      TALLER than that — so the canvas overflowed a box that could not grow.
+   2. overflow-x: hidden makes an element a SCROLL CONTAINER. On iOS that traps
+      the overflow instead of letting the document scroll to it.
+
+   min-height lets the document grow; overflow-x: clip suppresses horizontal
+   scroll WITHOUT creating a scroll container, which is exactly the distinction
+   between the two properties. */
 html, body {
-  height: 100%;
-  overflow-x: hidden;
+  min-height: 100%;
+  overflow-x: clip;
+}
+@supports not (overflow-x: clip) {
+  html, body { overflow-x: hidden; }   /* older engines: accept the old trade */
 }
 
 body {
+  /* v4.21.0 — 16px base. Previously unset, so it inherited the UA default and
+     every rem-derived size below it ran small on mobile. Set explicitly rather
+     than bumping individual rules, so the scale stays proportional. */
+  font-size: 16px;
+  line-height: 1.5;
   font-family: 'Inter', system-ui, sans-serif;
   color: var(--text);
-  background: #0A0A0A;
+  /* v4.21.0 — warm dark rather than near-black. #0A0A0A sat cold under the
+     crimson gradient and crushed the darkest gradient stops into the page.
+     #262624 keeps them separable and reduces the contrast shock on OLED. */
+  background: #262624;
   position: relative;
 }
 
@@ -568,9 +591,12 @@ body:has(.consensus-bar.divided) {
   justify-content: center;
   padding: 14px 22px;
   text-align: center;
-  font-size: 16px;
+  /* v4.21.0 — the consensus answer is the longest text on the page and was set
+     at the same size as UI chrome. 17px with looser leading; clamp keeps it from
+     growing awkwardly on desktop. */
+  font-size: clamp(17px, 1.05rem, 18px);
   color: var(--text);
-  line-height: 1.45;
+  line-height: 1.6;
   position: relative;
   overflow: hidden;
   transition: min-height var(--ease), border-color var(--ease), box-shadow var(--ease), color var(--ease);
@@ -1604,4 +1630,29 @@ body:has(.agent.consensus) .consensus-bar {
 .consensus-bar strong:first-of-type,
 .consensus-bar b:first-of-type {
   color: var(--gold);
+}
+
+
+/* ==========================================================================
+   v4.21.0 — PROGRESSIVE REVEAL (display only)
+
+   The answer is complete and scored before any of this runs. This is not
+   streaming and must not be mistaken for it: the comparator needs the full
+   text to produce a verdict, so revealing tokens as they arrived would mean
+   showing unverified content under a trust tag it had not earned.
+
+   What this does is stagger already-received blocks so a long verdict arrives
+   readably rather than as a wall. Capped at 660ms total so it never delays
+   comprehension, and disabled entirely under prefers-reduced-motion.
+   ========================================================================== */
+.rq-reveal {
+  opacity: 0;
+  animation: rqReveal 320ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+@keyframes rqReveal {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rq-reveal { opacity: 1; animation: none; transform: none; }
 }
