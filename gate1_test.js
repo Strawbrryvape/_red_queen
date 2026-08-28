@@ -140,5 +140,23 @@ t("the falsifier fix still holds (v4.7.1 regression guard)",
 tt("prose mentioning a level is not treated as a label",
    !csIsBannerLine("My L1 was too strong and I have revised it since."));
 
+
+console.log("\n--- v4.21.1: a bare label is not a position ---");
+// Live 2026-08-27: a seat opened "**My position:**" on its own line and Gate 1
+// scored THAT against two seats' real sentences. Fourth scaffolding miss, and
+// the first with a free-form label rather than a known keyword — so this is a
+// SHAPE rule, not another keyword on a list.
+tt("a bare 'My position:' is skipped", csIsBannerLine("My position:"));
+tt("one-word labels too", csIsBannerLine("Answer:") && csIsBannerLine("Recommendation:"));
+tt("a label WITH content on the same line is NOT skipped",
+   !csIsBannerLine("My position: No — not as framed."));
+tt("a real sentence is never skipped",
+   !csIsBannerLine("No, do not quit your job yet."));
+tt("a long clause ending in a colon is not a label",
+   !csIsBannerLine("The single biggest predictor is whether you enjoy it:"));
+t("the real round now scores the position, not the label",
+  csFirstLine({text:"**My position:**\n\nThis is a high-variance decision that hinges on three things."}),
+  "This is a high-variance decision that hinges on three things.");
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
