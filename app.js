@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.21.0-ui";
+  const RQ_BUILD = "v4.21.1-bare-label";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -7403,6 +7403,17 @@ roundData,
     // the label stripped, because the content after it IS the position — see
     // csFirstLineMeta, which applies this before scoring.
     if (/^[*#>\-\u2022\s]*L[1-4]\b[^\n:]{0,20}:\s*$/i.test(bare)) return true;
+    // (c-2) v4.21.1 — ANY bare "<short phrase>:" with nothing after it.
+    // Live 2026-08-27: a seat opened "**My position:**" on its own line and Gate
+    // 1 scored that as its position — against two seats that had written real
+    // sentences. Fourth time scaffolding has been mistaken for content, and the
+    // first where the label was free-form rather than a known keyword, which is
+    // why this is a SHAPE rule rather than another entry on a list.
+    //
+    // Bounded deliberately: at most four words, no terminal punctuation, and
+    // nothing after the colon. "My position:" is scaffolding. "The answer is
+    // that X:" is a sentence and is left alone.
+    if (/^[*#>\-\u2022\s]*(?:\w+[ \t]*){1,4}:\s*$/.test(bare) && bare.length <= 40) return true;
     if (/^[*#>\-\u2022\s]*L[1-4]\b[^\n:]{0,20}:\s*(?:what you hold|the strongest argument|answer your own|what would change)/i.test(bare)) return true;
     // (c) Bare section label: "Position Statement", "Answer:", "Verdict —".
     if (/^(position|answer|response|verdict|summary|statement|analysis|opinion|conclusion|recommendation)\s*(statement)?\s*[:\-\u2014\u2013]?\s*$/i.test(bare)) return true;
