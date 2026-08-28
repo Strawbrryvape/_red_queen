@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.21.3-failure-phase";
+  const RQ_BUILD = "v4.21.4-sonnet-label";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -355,7 +355,7 @@
   const PRIMARY_MODEL_LABELS = {
     gemini: "Gemini 3.5 Flash",
     kimi: "Moonshot v1 8k",
-    claude: "Claude Haiku 4.5",
+    claude: "Claude Sonnet 5",
   };
 
   // The provider a seat is CONFIGURED to use, before any failover walk.
