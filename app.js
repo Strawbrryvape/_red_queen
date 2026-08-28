@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.21.1-bare-label";
+  const RQ_BUILD = "v4.21.3-failure-phase";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -909,7 +909,12 @@
         "anthropic-dangerous-direct-browser-access": "true",
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        // v4.21.2 — Sonnet 5 replaces Haiku 4.5 as the Claude seat's primary.
+        // Cost note, because it is not small: Sonnet is $2/MTok input and
+        // $10/MTok output against Haiku's $1 and $5 — roughly double per round,
+        // and a council round makes two calls per seat (position + adjudication),
+        // three with the rebuttal pass on.
+        model: "claude-sonnet-5",
         max_tokens: CLAUDE_MAX_TOKENS,
         messages: [{ role: "user", content: query }],
       }),
@@ -5503,7 +5508,34 @@ roundData,
             }
             const next = chain[i + 1];
             if (next) {
-              logError(`${seatLabel(c.name)} ${step.tag} failed (${e.message || e}) — seat falling to ${next.tag}.`);
+              // v4.21.3 — NAME THE PHASE, AND NAME THE FAILURE CLASS.
+              //
+              // Two rounds on 2026-08-28 logged "[HEALTH] 3/3 primary voices"
+              // and then, a minute later, "Claude primary failed (Failed to
+              // fetch)". Read in sequence that looks like seats answering and
+              // then withdrawing. It is not: the first is DISPATCH, the second
+              // is ADJUDICATION — a separate call made after all positions are
+              // in, through the same seat wrapper and therefore the same log
+              // line. Third instance of adjudication state being mistaken for
+              // answer state (see the round-78 metadata overwrite and the
+              // v4.19.1 counterfoil timing fix).
+              //
+              // And "Failed to fetch" is not an HTTP status. It is the browser's
+              // TypeError for a request that never received a response at all —
+              // dropped connection, DNS failure, CORS rejection, or an extension
+              // blocking the endpoint. No model was reached, so no model
+              // declined. Saying so removes the ambiguity that made an
+              // infrastructure fault look like a choice.
+              const _phase = (_seatDelivered && _seatDelivered.__locked) ? "ADJUDICATION" : "dispatch";
+              const _msg = String(e.message || e);
+              const _transport = /failed to fetch|networkerror|load failed|typeerror/i.test(_msg);
+              logError(`${seatLabel(c.name)} ${step.tag} failed during ${_phase} (${_msg}) — seat falling to ${next.tag}.` +
+                (_transport
+                  ? " TRANSPORT-LEVEL: no HTTP response was received, so no model was reached and none declined. Causes are network drop, DNS, CORS, or a browser extension blocking the endpoint — not the provider and not the seat."
+                  : "") +
+                (_phase === "ADJUDICATION"
+                  ? " NOTE: the seat's POSITION this round was produced before this failure and is unaffected; only cross-examination fell back."
+                  : ""));
               // CPL — parented to the FAILED seat_call. This is the spec's own
               // acceptance test 2: "confirm the fallback event names the failed
               // seat_call as parent."
