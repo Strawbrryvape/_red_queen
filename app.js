@@ -5571,6 +5571,8 @@ roundData,
               const _phase = (_seatDelivered && _seatDelivered.__locked) ? "ADJUDICATION" : "dispatch";
               const _msg = String(e.message || e);
               const _transport = /failed to fetch|networkerror|load failed|typeerror/i.test(_msg);
+              stageSet(seatLabel(c.name) + " hit a problem with its usual model \u2014 trying a backup. " +
+                "This is normal and the round continues.");
               logError(`${seatLabel(c.name)} ${step.tag} failed during ${_phase} (${_msg}) — seat falling to ${next.tag}.` +
                 (_transport
                   ? " TRANSPORT-LEVEL: no HTTP response was received, so no model was reached and none declined. Causes are network drop, DNS, CORS, or a browser extension blocking the endpoint — not the provider and not the seat."
@@ -5606,11 +5608,21 @@ roundData,
       calls.length + " seat(s). A seat reporting missing context at this size is hitting its own window, not an assembly bug.");
 
     calls.forEach((c) => agents[c.name].classList.add("thinking"));
+    stageBegin(calls.map((c) => c.name));
+    stageSet("Sending to " + calls.length + " seats, staggered so they answer independently\u2026");
 
     // stagger launches ~700ms apart to avoid same-millisecond burst tripping RPM limits
     const staggered = calls.map((c, i) =>
       sleep(i * 700).then(() => c.fn(query))
     );
+    // Report each seat AS IT LANDS rather than after all settle — the whole
+    // point is that the user sees movement during the wait, not after it.
+    staggered.forEach((pr, i) => {
+      pr.then(
+        () => stageSeat(calls[i].name, (seatProvider[calls[i].name] || "primary") === "primary" ? "answered" : "fallback"),
+        () => stageSeat(calls[i].name, "failed")
+      );
+    });
     const results = await Promise.allSettled(staggered);
 
     const answers = [];
@@ -5746,6 +5758,7 @@ roundData,
     // there would be no baseline for measuring a revision.
     _openingPositions = eligible.map((a) => ({ seat: a.name, text: String(a.text || "") }));
     if (rebuttalEnabled() && eligible.length >= 2 && !_noteRound && !_indexicalRound) {
+      stageSet("Each seat is now reading the others and may revise or hold\u2026");
       try { _rebuttalResult = await runRebuttalPass(query, eligible, calls); }
       catch (e) { logError("[REBUTTAL] pass failed: " + ((e && e.message) || e) + " — round continues on the opening positions."); }
     }
@@ -5804,6 +5817,7 @@ roundData,
       // A correct-but-outvoted seat gets a chance to win by locating errors in
       // the others; the sycophancy guard rejects concessions that name none.
       logError(`Consensus round FAILED by lexical threshold — ${eligible.length} eligible agents, 0 agreements. Entering v3.2 adjudication before declaring DIVIDED.`);
+      stageSet("No agreement yet \u2014 the seats are cross-examining each other\u2019s positions\u2026");
       const adj = await runAdjudication(query, eligible, calls);
       if (adj && adj.resolved) {
         return {
@@ -12974,6 +12988,90 @@ end $$;`;
     } catch (_) { return null; }
   }
 
+  // ---------- Live round stage indicator ----------
+  // Replaces a static "deliberating…" message with the actual sequence. Every
+  // update below is fired by a real event; nothing is on a timer, and no
+  // progress is claimed that has not happened.
+  // v4.23.1 — the stage line is built with innerHTML to carry per-seat colour
+  // spans, so every interpolated value is escaped. Seat labels are app-owned
+  // today, but "app-owned today" is exactly the assumption that stops being
+  // true later.
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  let _stageEl = null;
+  let _stageSeats = {};      // seat -> "waiting" | "answered" | "fallback" | "failed"
+  let _stageActive = false;
+
+  function stageEnsure() {
+    if (_stageEl && _stageEl.isConnected) return _stageEl;
+    try {
+      const el = document.createElement("div");
+      el.id = "rqStage";
+      el.setAttribute("aria-live", "polite");
+      // v4.23.1 — styling moved to styles.css (#rqStage). Inline cssText here
+      // was the same "hook with no rule behind it" pattern flagged twice before:
+      // a class name or element the stylesheet knows nothing about.
+      const bar = document.getElementById("consensusBar");
+      if (bar && bar.parentNode) bar.parentNode.insertBefore(el, bar.nextSibling);
+      _stageEl = el;
+      return el;
+    } catch (_) { return null; }
+  }
+
+  function stageRender(line) {
+    const el = stageEnsure();
+    if (!el) return;
+    const seats = Object.keys(_stageSeats);
+    let roster = "";
+    if (seats.length) {
+      // v4.23.1 — each seat's mark carries that seat's own colour, the same
+      // one its constellation ring uses. Three identical ticks read slower than
+      // three coloured ones, and the colour is already the user's mental index
+      // for which seat is which.
+      roster = seats.map((s) => {
+        const st = _stageSeats[s];
+        const mark = st === "answered" ? "\u2713"
+                   : st === "fallback" ? "\u21bb"
+                   : st === "failed"   ? "\u2717"
+                   : "\u00b7";
+        const cls = "rq-stage-seat is-" + st +
+          (/^(gemini|kimi|claude)$/.test(s) ? " seat-" + s : "");
+        return "<span class=\"" + cls + "\">" +
+          escapeHtml(seatLabel(s)) + " <b>" + mark + "</b></span>";
+      }).join("");
+    }
+    el.innerHTML = "<div class=\"rq-stage-line\">" + escapeHtml(line) + "</div>" +
+      (roster ? "<div class=\"rq-stage-roster\">" + roster + "</div>" : "");
+  }
+
+  function stageBegin(seatNames) {
+    _stageActive = true;
+    _stageSeats = {};
+    (seatNames || []).forEach((n) => { _stageSeats[n] = "waiting"; });
+    stageRender("Composing the question and searching memory\u2026");
+  }
+  function stageSet(line) { if (_stageActive) stageRender(line); }
+  function stageSeat(name, state) {
+    if (!_stageActive) return;
+    _stageSeats[name] = state;
+    const done = Object.values(_stageSeats).filter((s) => s !== "waiting").length;
+    const total = Object.keys(_stageSeats).length;
+    // Named counts, so a hanging seat is identifiable while it hangs rather
+    // than only in the drawer afterwards.
+    stageRender(done < total
+      ? "Seats answering independently \u2014 " + done + " of " + total + " in"
+      : "All " + total + " seats have answered \u2014 comparing positions\u2026");
+  }
+  function stageEnd() {
+    _stageActive = false;
+    _stageSeats = {};
+    try { if (_stageEl) _stageEl.innerHTML = ""; } catch (_) {}
+  }
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -13030,6 +13128,7 @@ end $$;`;
     consensusBar.classList.remove("divided", "provisional", "sole");
     consensusBar.classList.add("loading");
     consensusText.textContent = "The Council is deliberating…";
+    stageEnsure();
     consensusText.style.fontStyle = "italic";
     // #888 was chosen against the v2.2 near-black bar. It is unreadable on the
     // v4.0 lit chamber; this reads on both.
@@ -13520,6 +13619,10 @@ end $$;`;
     if (divided) {
       // No white flash — the Council did not converge. Amber state instead.
       consensusBar.classList.add("divided");
+      // v4.23.0 — clear the stage indicator on the DIVIDED path too. Without
+      // this it lingered under a finished round, which is exactly the "is it
+      // still working?" confusion the indicator exists to remove.
+      stageEnd();
       // Persona line (Gemini request 2026-07-13) — referee voice on a split.
       // v3.5.4: a note round and a roll call are not split decisions, and saying
       // so put DIVIDED-shaped language on rounds that were never in contention.
@@ -13534,6 +13637,7 @@ end $$;`;
       );
       logHistory(query, "NO CONSENSUS — Council divided by design. Individual positions above.");
     } else {
+      stageEnd();
       flashConsensus();
       consensusText.textContent = "";
       consensusText.classList.remove("rq-md", "rq-md-plain");
