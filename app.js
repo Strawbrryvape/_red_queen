@@ -106,12 +106,40 @@
     if ($("provenanceSecret")) $("provenanceSecret").value = settings.provenanceSecret || "";
   })();
   demoToggle.checked = !!settings.demoMode;
+  // v4.22.1 — distinguishes "the user asked for demo mode" from "the demo button
+  // left the flag on". Only the former survives adding real keys.
+  try {
+    demoToggle.addEventListener("change", () => {
+      _demoTickedByUser = demoToggle.checked;
+      if (demoToggle.checked && hasAnyKey()) {
+        logError("[DEMO] Demo Mode ON with real keys configured — every round will be SIMULATED and " +
+          "no model will be called. Untick it to use the live council.");
+      }
+    });
+  } catch (_) {}
+
+  // Reads the form rather than saved settings — this runs during save, before
+  // the new keys have been committed.
+  function hasRealKeyInForm() {
+    try {
+      return ["keyGemini","keyKimi","keyClaude","keyGroq","keyOpenRouter","keyCerebras"]
+        .some((id) => { const el = $(id); return el && String(el.value || "").trim().length > 8; });
+    } catch (_) { return false; }
+  }
+  let _demoTickedByUser = false;   // true only when the operator clicks the box itself
 
   function hasAnyKey() {
     return !!(settings.keyGemini || settings.keyKimi || settings.keyClaude || settings.keyGroq || settings.keyOpenRouter || settings.keyCerebras);
   }
   function inDemoMode() {
     return settings.demoMode || !hasAnyKey();
+  }
+  // Announced at save, because a silently-cleared flag is its own small mystery.
+  function announceDemoCleared(was, now) {
+    if (was && !now) {
+      logError("\u2713 [DEMO] Demo Mode turned OFF automatically \u2014 you saved real API keys, so the " +
+        "council will now call live models. Tick Demo Mode yourself if you actually want simulated rounds.");
+    }
   }
   function refreshDemoBadge() {
     demoBadge.classList.toggle("hidden", !inDemoMode());
@@ -486,8 +514,22 @@
       provenanceSecret: $("provenanceSecret") ? $("provenanceSecret").value.trim() : (settings.provenanceSecret || ""),
       // Epoch is never edited by hand — only the Regenerate flow bumps it.
       provenanceEpoch: settings.provenanceEpoch || 1,
-      demoMode: demoToggle.checked,
+      // v4.22.1 — DEMO MODE MUST NOT SURVIVE A REAL KEY.
+      //
+      // Two entry points set demoMode=true and SAVED it: the landing "Try the
+      // Council" button and onboarding step 1. Nothing ever cleared it. A user
+      // who tried the demo, then added real keys, kept receiving SIMULATED
+      // answers forever — and the only clue is one drawer line most people never
+      // open. The operator hit this walking the first outside user through setup.
+      //
+      // The rule: an explicit tick of the checkbox is respected. A LEFTOVER flag
+      // from the demo button is not, once real keys exist. Nobody adds an API key
+      // in order to keep seeing simulated output.
+      demoMode: demoToggle.checked && !(hasRealKeyInForm() && !_demoTickedByUser),
     };
+    const _demoWas = demoToggle.checked;
+    if (_demoWas && !settings.demoMode) { demoToggle.checked = false; }
+    announceDemoCleared(_demoWas, settings.demoMode);
     saveSettings(settings);
     // v2.9.3: Supabase field sanity checks — catch swapped or malformed
     // values at save time with plain-English corrections, instead of a
@@ -8039,10 +8081,14 @@ roundData,
     tryBtn.className = "rq-cta";
     tryBtn.textContent = "👑 Try the Council (Demo)";
     tryBtn.addEventListener("click", () => {
+      // v4.22.1 — session-only. Previously this SAVED demoMode:true, which then
+      // outlived the demo and made a fully-configured install return simulated
+      // answers with no visible cause.
       settings.demoMode = true;
       demoToggle.checked = true;
-      saveSettings(settings);
       refreshDemoBadge();
+      logError("[DEMO] Demo Mode on for this session only \u2014 responses are SIMULATED and no model " +
+        "is called. It clears when you save real API keys.");
       summonBtn.click();
     });
     const unlockBtn = document.createElement("button");
@@ -9537,7 +9583,7 @@ end $$;`;
   function openOnboarding(step) {
     step = step || 1;
     const stepDefs = [
-      { title: "Step 1 of 4 — Play immediately", body: "<p>Zero keys needed. Demo Mode simulates the full council so you can feel how deliberation works.</p>", keys: [], cta: "Try Demo Mode", ctaFn: () => { settings.demoMode = true; demoToggle.checked = true; saveSettings(settings); refreshDemoBadge(); summonBtn.click(); } },
+      { title: "Step 1 of 4 — Play immediately", body: "<p>Zero keys needed. Demo Mode simulates the full council so you can feel how deliberation works.</p>", keys: [], cta: "Try Demo Mode", ctaFn: () => { settings.demoMode = true; demoToggle.checked = true; refreshDemoBadge(); logError("[DEMO] Demo Mode on for this session only \u2014 responses are SIMULATED. It clears when you save real API keys."); summonBtn.click(); } },
       { title: "Step 2 of 4 — One free key, one live seat", body: "<p>Groq is free and takes ~60 seconds. One key = one real AI advisor answering live.</p>", keys: [KEY_HINTS[0]], cta: "Save & continue", ctaFn: null },
       { title: "Step 3 of 4 — Unlock the full council", body: "<p>Add the free fallback tier (OpenRouter, Cerebras) and any primary seats you have. Every key you skip just means an understudy fills that chair — she works either way.</p>", keys: KEY_HINTS.slice(1), cta: "Save & continue", ctaFn: null },
       { title: "Step 4 of 4 — Long-term memory (optional)", body:
