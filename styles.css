@@ -1656,3 +1656,57 @@ body:has(.agent.consensus) .consensus-bar {
 @media (prefers-reduced-motion: reduce) {
   .rq-reveal { opacity: 1; animation: none; transform: none; }
 }
+
+
+/* ==========================================================================
+   v4.23.1 — LIVE ROUND STAGE INDICATOR
+
+   Shown only while a round is running. Reports actual state — no timer, no
+   simulated progress — so a slow seat is visible as a slow seat rather than
+   as a frozen page.
+
+   Each seat's mark uses that seat's own constellation colour, because the
+   colour is already the user's index for which seat is which.
+   ========================================================================== */
+#rqStage {
+  margin-top: 10px;
+  min-height: 1.2em;
+  text-align: center;
+  font-size: 0.78em;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+#rqStage:empty { margin-top: 0; min-height: 0; }
+
+.rq-stage-line { opacity: 0.9; }
+
+.rq-stage-roster {
+  margin-top: 5px;
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  color: var(--muted);
+  font-size: 0.94em;
+}
+
+.rq-stage-seat { white-space: nowrap; }
+.rq-stage-seat b { font-weight: 700; margin-left: 2px; }
+
+/* Waiting stays muted; anything resolved takes the seat's colour. */
+.rq-stage-seat.is-waiting          { opacity: 0.55; }
+.rq-stage-seat.seat-gemini.is-answered b,
+.rq-stage-seat.seat-gemini.is-fallback b { color: var(--gemini); }
+.rq-stage-seat.seat-kimi.is-answered b,
+.rq-stage-seat.seat-kimi.is-fallback b   { color: var(--kimi); }
+.rq-stage-seat.seat-claude.is-answered b,
+.rq-stage-seat.seat-claude.is-fallback b { color: var(--claude); }
+
+/* A fallback is not a failure — dimmed, not alarmed. */
+.rq-stage-seat.is-fallback { opacity: 0.8; }
+.rq-stage-seat.is-failed b { color: var(--divided, #dc2626); }
+
+@media (prefers-reduced-motion: reduce) {
+  #rqStage, .rq-stage-seat { transition: none; }
+}
