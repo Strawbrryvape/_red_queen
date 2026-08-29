@@ -9474,17 +9474,125 @@ roundData,
   ];
   function keyLooksValid(v, prefix) { return !!v && v.length > 20 && (!prefix || v.startsWith(prefix)); }
 
+  // v4.22.0 — base memory schema, inline so the setup guide never sends a new
+  // user to hunt for a file. This is the BASE only: the migrations in /sql are
+  // for features that default OFF, and handing a beginner four files with no
+  // ordering is how databases end up half-migrated.
+  const RQ_BASE_SCHEMA = `-- Red Queen — base memory schema. Safe to re-run.
+create extension if not exists vector;
+
+create table if not exists rq_events (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  prompt text,
+  response text,
+  consensus_status text,
+  prompt_class text,
+  provenance jsonb,
+  embedding vector(384),
+  consolidated boolean default false,
+  consolidation_group uuid,
+  text_hash text,
+  hmac_commitment text,
+  pillar2_state text
+);
+
+create index if not exists rq_events_created_idx on rq_events (created_at desc);
+create index if not exists rq_events_embed_idx
+  on rq_events using ivfflat (embedding vector_cosine_ops) with (lists = 100);
+
+-- Similarity search used for memory injection.
+create or replace function match_rounds(
+  query_embedding vector(384),
+  match_threshold float,
+  match_count int
+) returns table (
+  id uuid, prompt text, response text,
+  consensus_status text, similarity float
+) language sql stable as $$
+  select e.id, e.prompt, e.response, e.consensus_status,
+         1 - (e.embedding <=> query_embedding) as similarity
+  from rq_events e
+  where e.embedding is not null
+    and 1 - (e.embedding <=> query_embedding) > match_threshold
+  order by e.embedding <=> query_embedding
+  limit match_count;
+$$;
+
+alter table rq_events enable row level security;
+
+-- CREATE POLICY has no IF NOT EXISTS before Postgres 15, and Supabase projects
+-- vary. Guarded so re-running never errors on an existing policy.
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'rq_events' and policyname = 'rq_events_anon'
+  ) then
+    create policy rq_events_anon on rq_events
+      for all to anon using (true) with check (true);
+  end if;
+end $$;`;
+
   function openOnboarding(step) {
     step = step || 1;
     const stepDefs = [
-      { title: "Step 1 of 3 — Play immediately", body: "<p>Zero keys needed. Demo Mode simulates the full council so you can feel how deliberation works.</p>", keys: [], cta: "Try Demo Mode", ctaFn: () => { settings.demoMode = true; demoToggle.checked = true; saveSettings(settings); refreshDemoBadge(); summonBtn.click(); } },
-      { title: "Step 2 of 3 — One free key, one live seat", body: "<p>Groq is free and takes ~60 seconds. One key = one real AI advisor answering live.</p>", keys: [KEY_HINTS[0]], cta: "Save & continue", ctaFn: null },
-      { title: "Step 3 of 3 — Unlock the full council", body: "<p>Add the free fallback tier (OpenRouter, Cerebras) and any primary seats you have. Every key you skip just means an understudy fills that chair — she works either way.</p>", keys: KEY_HINTS.slice(1), cta: "Save & finish", ctaFn: null },
+      { title: "Step 1 of 4 — Play immediately", body: "<p>Zero keys needed. Demo Mode simulates the full council so you can feel how deliberation works.</p>", keys: [], cta: "Try Demo Mode", ctaFn: () => { settings.demoMode = true; demoToggle.checked = true; saveSettings(settings); refreshDemoBadge(); summonBtn.click(); } },
+      { title: "Step 2 of 4 — One free key, one live seat", body: "<p>Groq is free and takes ~60 seconds. One key = one real AI advisor answering live.</p>", keys: [KEY_HINTS[0]], cta: "Save & continue", ctaFn: null },
+      { title: "Step 3 of 4 — Unlock the full council", body: "<p>Add the free fallback tier (OpenRouter, Cerebras) and any primary seats you have. Every key you skip just means an understudy fills that chair — she works either way.</p>", keys: KEY_HINTS.slice(1), cta: "Save & continue", ctaFn: null },
+      { title: "Step 4 of 4 — Long-term memory (optional)", body:
+        "<p><strong>Everything works without this.</strong> Skip it and the council still runs \u2014 " +
+        "you just start fresh every session. Supabase is what lets her remember past rounds and " +
+        "retrieve relevant ones later. Free tier is plenty.</p>" +
+        "<ol style=\"margin:10px 0;padding-left:18px;line-height:1.55;\">" +
+        "<li>Go to <strong>supabase.com</strong> \u2192 sign up \u2192 <strong>New project</strong>. " +
+        "Any name. Save the database password somewhere \u2014 you will not need it here, but you " +
+        "will need it if you ever come back to the project.</li>" +
+        "<li>Wait for it to finish provisioning (~2 minutes).</li>" +
+        "<li>Left sidebar \u2192 <strong>SQL Editor</strong> \u2192 <strong>New query</strong>. " +
+        "Copy the block below, paste it in, press <strong>Run</strong>. It is safe to run twice.</li>" +
+        "<li>Left sidebar \u2192 <strong>Project Settings</strong> \u2192 <strong>API</strong>. " +
+        "Copy the <strong>Project URL</strong> and the <strong>anon public</strong> key \u2014 " +
+        "<em>not</em> the service_role key, which must never go in a browser.</li>" +
+        "<li>Paste both into Settings in the drawer, then <strong>Save settings</strong> and reload.</li>" +
+        "</ol>" +
+        "<p style=\"font-size:0.82em;opacity:0.8;margin-top:10px;\"><strong>How to tell it worked:</strong> " +
+        "open the drawer after your next round. You want a line reading " +
+        "<code>[EMBED] OK \u2014 row \u2026 embedded</code>. If instead you see " +
+        "<code>Failed to fetch</code>, the URL or key is wrong \u2014 rounds still run, but nothing " +
+        "is being saved.</p>",
+        keys: [], cta: "Done", ctaFn: null, sql: RQ_BASE_SCHEMA },
     ];
     const d = stepDefs[step - 1];
     let html = "<h3>" + d.title + "</h3>" + d.body;
     rqModal(html);
     const box = document.querySelector(".rq-modal");
+    // v4.22.0 — the schema, inline and copyable. Sending a beginner to find a
+    // file in a repo folder mid-setup is where people give up.
+    if (d.sql) {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "margin-top:10px;";
+      const copy = document.createElement("button");
+      copy.className = "rq-cta secondary";
+      copy.textContent = "Copy SQL";
+      copy.style.cssText = "font-size:0.78em;padding:6px 12px;margin-bottom:6px;";
+      copy.addEventListener("click", () => {
+        try {
+          navigator.clipboard.writeText(d.sql);
+          copy.textContent = "Copied \u2713";
+          setTimeout(() => { copy.textContent = "Copy SQL"; }, 1800);
+        } catch (_) {
+          copy.textContent = "Select it manually";   // clipboard blocked; never claim success
+        }
+      });
+      const pre = document.createElement("pre");
+      pre.textContent = d.sql;
+      pre.style.cssText = "max-height:190px;overflow:auto;font-size:0.66em;line-height:1.4;" +
+        "padding:10px;border-radius:8px;background:rgba(0,0,0,0.35);border:1px solid rgba(255,255,255,0.1);" +
+        "white-space:pre;user-select:text;";
+      wrap.appendChild(copy); wrap.appendChild(pre);
+      box.appendChild(wrap);
+    }
     d.keys.forEach((k) => {
       const label = document.createElement("label");
       label.style.cssText = "display:block;margin-top:10px;font-size:0.78em;opacity:0.85;";
@@ -9527,7 +9635,7 @@ roundData,
       else logError("Onboarding complete — keys saved. Summon the council when ready.");
     });
     if (step < 3 && !d.ctaFn) {} // cta handles advance
-    if (step > 0 && step < 3) {
+    if (step > 0 && step < 4) {
       const skip = document.createElement("button");
       skip.className = "rq-cta secondary";
       skip.textContent = step === 1 ? "I have keys →" : "Skip →";
