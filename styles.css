@@ -1677,7 +1677,10 @@ body:has(.agent.consensus) .consensus-bar {
   letter-spacing: 0.02em;
   color: var(--text);
 }
-#rqStage:empty { margin-top: 0; min-height: 0; }
+/* v4.23.2 — an EMPTY element still participates in flex layout, which is how
+   this ended up occupying a column beside the answer instead of vanishing.
+   stageEnd() sets display:none; these keep it out of layout either way. */
+#rqStage:empty { display: none; margin-top: 0; min-height: 0; }
 
 .rq-stage-line { opacity: 0.9; }
 
