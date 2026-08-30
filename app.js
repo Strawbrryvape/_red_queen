@@ -13023,6 +13023,13 @@ end $$;`;
   }
 
   function stageRender(line) {
+    // v4.23.2 — GUARDED AT THE RENDER, not just at the callers. stageSet and
+    // stageSeat checked _stageActive, but a seat promise that settles late can
+    // reach stageRender after the verdict has already been drawn — which left
+    // the indicator sitting beside the divided panel, squeezed into a column.
+    // The guard belongs at the point of drawing, so no future caller can
+    // reintroduce this.
+    if (!_stageActive) return;
     const el = stageEnsure();
     if (!el) return;
     const seats = Object.keys(_stageSeats);
@@ -13050,6 +13057,7 @@ end $$;`;
 
   function stageBegin(seatNames) {
     _stageActive = true;
+    try { const el = stageEnsure(); if (el) el.style.display = ""; } catch (_) {}
     _stageSeats = {};
     (seatNames || []).forEach((n) => { _stageSeats[n] = "waiting"; });
     stageRender("Composing the question and searching memory\u2026");
@@ -13067,9 +13075,19 @@ end $$;`;
       : "All " + total + " seats have answered \u2014 comparing positions\u2026");
   }
   function stageEnd() {
+    // Order matters: kill the flag FIRST, so anything racing us is already
+    // refused by the guard above before we clear the DOM.
     _stageActive = false;
     _stageSeats = {};
-    try { if (_stageEl) _stageEl.innerHTML = ""; } catch (_) {}
+    try {
+      if (_stageEl) {
+        _stageEl.innerHTML = "";
+        // display:none rather than relying on :empty — an empty element still
+        // participates in flex layout, which is how it ended up occupying a
+        // column next to the answer instead of vanishing.
+        _stageEl.style.display = "none";
+      }
+    } catch (_) {}
   }
 
   // ---------- Dispatch ----------
@@ -13616,13 +13634,13 @@ end $$;`;
     consensusBar.classList.remove("provisional", "sole");   // v4.0 — cleared every round, exactly as .divided is
     if (trustClass) consensusBar.classList.add(trustClass);
 
+    // v4.23.2 — ONE clear, before the branch, so no render path can miss it.
+    // Previously each branch cleared for itself and the divided path was added
+    // separately; a third branch would have needed remembering.
+    stageEnd();
     if (divided) {
       // No white flash — the Council did not converge. Amber state instead.
       consensusBar.classList.add("divided");
-      // v4.23.0 — clear the stage indicator on the DIVIDED path too. Without
-      // this it lingered under a finished round, which is exactly the "is it
-      // still working?" confusion the indicator exists to remove.
-      stageEnd();
       // Persona line (Gemini request 2026-07-13) — referee voice on a split.
       // v3.5.4: a note round and a roll call are not split decisions, and saying
       // so put DIVIDED-shaped language on rounds that were never in contention.
