@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.21.4-sonnet-label";
+  const RQ_BUILD = "v4.23.3-malformed-label";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -6832,7 +6832,25 @@ roundData,
         if (r.absent) { out.push(`${r.seat}[ABSENT — configured, never answered]`); return; }
         if (named.indexOf(r.seat) !== -1) return;
         const cf = cfs.find((c) => c && c.declared_seat === r.seat);
-        if (cf && cf.chars > 0) {
+        // v4.23.3 — MALFORMED IS NOT ABSTENTION, and conflating them is a
+        // reporting-layer error of exactly the kind this project keeps finding.
+        //
+        // Round 26 (operator's browser): all three seats wrote thousands of
+        // characters and substantively agreed, yet the round recorded DIVIDED
+        // with seats marked ABSTAIN-WITH-CONTENT. Two seats read that back and
+        // built arguments on it — Kimi called it "metadata overriding
+        // substance," Claude called it "a labeling mismatch." Both were reading
+        // the label accurately; the label was wrong.
+        //
+        // A seat whose answer failed to PARSE has not declined to state a
+        // position. It stated one and the machinery could not read it. Those are
+        // different failures with different fixes, and only one of them is about
+        // the seat.
+        if (r.malformed) {
+          out.push(`${r.seat}[UNPARSEABLE — answered${cf && cf.chars ? " (" + cf.chars + " chars)" : ""} ` +
+            `but the response could not be parsed; excluded from consensus. This is a PARSING failure, ` +
+            `not a refusal to answer]`);
+        } else if (cf && cf.chars > 0) {
           out.push(`${r.seat}[ABSTAIN-WITH-CONTENT — wrote ${cf.chars} chars but stated no position; ` +
             `text is in the round, excluded from consensus]`);
         } else {
