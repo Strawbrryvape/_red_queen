@@ -81,8 +81,8 @@ console.log("\n--- TDZ: the rack must not reference constants declared below it 
     belowScope.map((c) => c.name), []);
   tt("the TDZ failure is documented where it happened",
     /EVERY\s+\/\/ SETTINGS BUTTON AFTER THE SIXTH VANISHED|SETTINGS BUTTON AFTER THE SIXTH VANISHED/.test(src));
-  tt("all twenty-four tuples are present",
-    (arr.match(/\["\w+Toggle"/g) || []).length === 24);
+  tt("all twenty-five tuples are present",
+    (arr.match(/\["\w+Toggle"/g) || []).length === 25);
 }
 
 console.log("\n--- the R-P7-10 amendment is on the record ---");
