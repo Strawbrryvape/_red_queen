@@ -1713,3 +1713,30 @@ body:has(.agent.consensus) .consensus-bar {
 @media (prefers-reduced-motion: reduce) {
   #rqStage, .rq-stage-seat { transition: none; }
 }
+
+
+/* ==========================================================================
+   v4.24.0 — RECKONING BADGE
+
+   Sits beside the trust tag when a seat answered its own prior falsifier this
+   round. Four states, and the colours carry the MEANING rather than a
+   ranking: updating and holding-with-a-reason are BOTH good answers, so both
+   read as neutral-positive. Only an ignored condition is marked as a problem,
+   because ignoring a condition you set yourself is the one failure here.
+   ========================================================================== */
+.rq-reck {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.62em;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  border: 1px solid currentColor;
+  background: transparent;
+  vertical-align: middle;
+}
+.rq-reck.is-updated { color: #16a34a; }   /* condition met, position revised */
+.rq-reck.is-held    { color: #2563eb; }   /* condition not met, reason given */
+.rq-reck.is-partial { color: #d97706; }   /* partly met, further evidence named */
+.rq-reck.is-ignored { color: #dc2626; }   /* the condition was not addressed */
