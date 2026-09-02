@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.23.3-malformed-label";
+  const RQ_BUILD = "v4.24.0-reckoning";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4553,6 +4553,9 @@ roundData,
         ["companionToggle", "rq_companion", "OPERATOR COMPANION",
          "A chat panel for you \u2014 prompt drafting, asking why a round came out as it did, thinking out loud. NOT a seat: it never votes, never enters consensus, never appears in headers or stats. It reads the ledger; the council can never read it. Reload to mount.",
          "No companion panel."],
+        ["reckoningToggle", "rq_reckoning", "FORCED RECKONING",
+         "\u26A0 SEATS READ THIS. Every stated falsifier is banked. When later material may meet one, that seat must answer YES/NO/PARTIAL against its own prior words BEFORE the question. Holding with a reason counts; ignoring it is logged. window.__rqReckoning() for each seat\u2019s record.",
+         "Falsifiers are stated and never revisited. 117 stated, 7 revisited was the measured baseline."],
         ["rebuttalToggle", "rq_rebuttal", "REBUTTAL PASS",
          "\u26A0 +1 CALL PER SEAT. After the seats answer blind, each sees the others and may revise or HOLD. Holding is the default and costs nothing. A revision must cite which position moved it; uncited revisions are logged as drift. Opening positions are preserved so every change is measurable.",
          "Seats answer once, blind to each other. There is no within-round exchange."],
@@ -5463,6 +5466,14 @@ roundData,
         q = q.indexOf("{{SEAT_IDENTITY}}") !== -1
           ? q.replace("{{SEAT_IDENTITY}}", identityLine)
           : identityLine + "\n\n" + q;
+        // v4.24.0 — a seat is only ever asked about ITS OWN falsifier. Putting
+        // one seat's condition to another would be an accusation, not a
+        // reckoning, and it would also break prompt parity for no gain.
+        try {
+          if (_reckHits && _reckHits[c.name]) {
+            q = reckPrompt(_reckHits[c.name]) + "\n\n---\n\n" + q;
+          }
+        } catch (_) {}
         // v4.9.1 — measure what THIS seat is actually being sent, at the last
         // point before it leaves the client. Digest is taken with the identity
         // line REMOVED, because that line differs by design (R-PS-6) and would
@@ -13108,6 +13119,197 @@ end $$;`;
     } catch (_) {}
   }
 
+  // ---------- Forced reckoning on stated falsifiers (rq_reckoning, default OFF) ----------
+  // Claude seat, round 27. The measured baseline that motivates it: 117
+  // falsifiers stated across the operator's ledger, 7 ever revisited. A
+  // falsifier nobody collects on is a promise made in the knowledge that
+  // nothing will check.
+  //
+  //   "The claim of falsifiability is itself unfalsifiable — a rhetorical
+  //    gesture that merely sounds rigorous."
+  //
+  // ⚠ THE PROPOSING SEAT'S OWN FALSIFIER, and the reason this is shaped the way
+  // it is rather than as a belief-change detector:
+  //
+  //   "Abandon if belief-revision in language models is fundamentally
+  //    unobservable from outside — if no structured logging can distinguish
+  //    'updated because evidence changed' from 'generated a new answer that
+  //    happens to look updated.'"
+  //
+  // That is probably true, and nothing here pretends otherwise. This cannot see
+  // belief change. What it CAN see is whether a seat COMMITTED — and
+  // YES/NO/PARTIAL against a quoted prior condition is a commitment in a way
+  // that merely different prose is not. Every count below is of commitments
+  // kept and refused, never of inner states.
+  const RQ_RECK_KEY     = "rq_falsifier_bank_v1";
+  const RQ_RECK_SIM     = 0.75;   // TUNE-AFTER-DATA — the spec's number, fitted to nothing
+  const RQ_RECK_MAX     = 400;    // bank cap; oldest trimmed first and said out loud
+  const RQ_RECK_MIN_AGE = 2;      // rounds a falsifier must survive before it can trigger
+
+  function reckoningEnabled() { return localStorage.getItem("rq_reckoning") === "on"; }
+
+  function reckLoad() {
+    try { const v = JSON.parse(localStorage.getItem(RQ_RECK_KEY) || "[]"); return Array.isArray(v) ? v : []; }
+    catch (_) { return []; }
+  }
+  function reckSave(rows) {
+    try {
+      if (rows.length > RQ_RECK_MAX) {
+        const drop = rows.length - RQ_RECK_MAX;
+        rows.splice(0, drop);
+        logError("[RECKONING] bank cap " + RQ_RECK_MAX + " reached \u2014 " + drop +
+          " oldest falsifier(s) dropped. Conditions older than the retained window can no longer trigger.");
+      }
+      localStorage.setItem(RQ_RECK_KEY, JSON.stringify(rows));
+    } catch (_) {}
+  }
+
+  // Deposit: every falsifier a seat states, with the round it was stated in.
+  // Embedded lazily — a bank entry without a vector simply cannot trigger,
+  // which is the safe direction.
+  async function reckDeposit(answers, roundIdx) {
+    if (!reckoningEnabled()) return;
+    try {
+      const bank = reckLoad();
+      for (const a of (answers || [])) {
+        const m = RQ_FALSIFIER_RE.exec(String((a && a.text) || ""));
+        if (!m) continue;
+        const text = clip(m[1].trim(), 400);
+        if (text.length < 30) continue;                       // too thin to match on
+        if (bank.some((b) => b.seat === a.name && b.text === text)) continue;   // verbatim repeat
+        let vec = null;
+        try { vec = await embedText(text); } catch (_) {}
+        bank.push({
+          seat: a.name, round: roundIdx, text: text,
+          vec: vec ? Array.from(vec) : null,
+          status: "UNTESTED", triggered: 0, ts: Date.now(),
+        });
+      }
+      reckSave(bank);
+    } catch (_) {}
+  }
+
+  // Withdraw: does anything in the incoming round plausibly meet a stored
+  // condition? Advisory only — this proposes, the seat decides.
+  async function reckCheck(query, retrievedText) {
+    if (!reckoningEnabled()) return {};
+    try {
+      const bank = reckLoad();
+      const live = bank.filter((b) => b.status === "UNTESTED" && Array.isArray(b.vec) && b.vec.length);
+      if (!live.length) return {};
+      const material = clip(String(query || "") + " " + String(retrievedText || ""), 2000);
+      if (material.trim().length < 40) return {};
+      const mv = await embedText(material);
+      if (!mv) {
+        logError("[RECKONING] embed worker unavailable \u2014 no trigger check ran this round. " +
+          "That is UNKNOWN, not 'nothing matched'.");
+        return {};
+      }
+      const latest = (ledger || []).length;
+      const best = {};
+      live.forEach((b) => {
+        if ((latest - b.round) < RQ_RECK_MIN_AGE) return;      // too fresh to be "revisited"
+        const sim = _cosine384(mv, b.vec);
+        if (sim < RQ_RECK_SIM) return;
+        // One per seat: the closest match wins. Stacking alerts turns a round
+        // into an audit of the ledger rather than an answer to the operator.
+        if (!best[b.seat] || sim > best[b.seat].sim) best[b.seat] = { entry: b, sim: sim };
+      });
+      const seats = Object.keys(best);
+      if (seats.length) {
+        logError("\u25C6 [RECKONING] " + seats.length + " seat(s) face a trigger this round: " +
+          seats.map((s) => seatLabel(s) + " (R" + best[s].entry.round + ", sim " +
+            best[s].sim.toFixed(3) + ")").join(", ") +
+          ". Each must answer YES/NO/PARTIAL against its own prior condition before addressing the " +
+          "question. The match is ADVISORY \u2014 the seat decides whether the condition is met, not this check.");
+      }
+      return best;
+    } catch (_) { return {}; }
+  }
+
+  // The block prepended to a triggered seat's prompt. Deliberately quotes the
+  // seat's OWN words verbatim — a paraphrased condition is a different condition.
+  function reckPrompt(hit) {
+    const b = hit.entry;
+    return "TRIGGER ALERT \u2014 answer this BEFORE the question below.\n\n" +
+      "In an earlier round you stated this falsifier:\n\"" + b.text + "\"\n\n" +
+      "Material in this round may meet that condition. You must begin your answer with one line:\n\n" +
+      "RECKONING: YES  \u2014 the condition is met. Then state your updated position and what changed.\n" +
+      "RECKONING: NO   \u2014 it is not met. Then state why not.\n" +
+      "RECKONING: PARTIAL \u2014 partly met. Then state what further evidence would settle it.\n\n" +
+      "This is not a test of consistency. Holding your position with a stated reason is as good an " +
+      "answer as revising it \u2014 what is not acceptable is ignoring the condition you set yourself.";
+  }
+
+  const RQ_RECK_RE = /^\s*RECKONING\s*:\s*(YES|NO|PARTIAL)\b/im;
+
+  // Record what each triggered seat actually did. Never inferred: a seat that
+  // ignores the alert is logged as IGNORED, which is itself the finding.
+  function reckResolve(answers, hits) {
+    if (!reckoningEnabled()) return;
+    try {
+      const bank = reckLoad();
+      const seats = Object.keys(hits || {});
+      if (!seats.length) return;
+      const out = [];
+      seats.forEach((s) => {
+        const a = (answers || []).find((x) => x && x.name === s);
+        const m = a ? RQ_RECK_RE.exec(String(a.text || "")) : null;
+        const verdict = m ? m[1].toUpperCase() : "IGNORED";
+        const b = bank.find((x) => x.seat === s && x.round === hits[s].entry.round && x.text === hits[s].entry.text);
+        if (b) {
+          // Consumed once whatever the answer. A trigger that re-fires every
+          // round is nagging, and nagging teaches seats to dismiss it.
+          b.status = verdict === "YES" ? "TRIGGERED-UPDATED"
+                   : verdict === "NO" ? "TRIGGERED-HELD"
+                   : verdict === "PARTIAL" ? "TRIGGERED-PARTIAL"
+                   : "TRIGGERED-IGNORED";
+          b.triggered = (b.triggered || 0) + 1;
+        }
+        out.push(seatLabel(s) + ": " + verdict);
+      });
+      reckSave(bank);
+      logError("[RECKONING] " + out.join(" \u00b7 ") +
+        (out.some((o) => /IGNORED/.test(o))
+          ? ". \u26A0 An IGNORED trigger means the seat did not address a condition it set itself \u2014 " +
+            "that is a finding about the seat, not a bug in this check."
+          : ". Every triggered seat answered its own condition."));
+    } catch (_) {}
+  }
+
+  // The track record. Commitments kept and refused — never inner states.
+  function reckRecord() {
+    const bank = reckLoad();
+    if (!bank.length) { logError("[RECKONING] bank empty. Falsifiers are deposited only while the falsifier ask is ON."); return null; }
+    const bySeat = {};
+    bank.forEach((b) => {
+      const k = b.seat;
+      bySeat[k] = bySeat[k] || { stated: 0, updated: 0, held: 0, partial: 0, ignored: 0, untested: 0 };
+      bySeat[k].stated++;
+      if (b.status === "TRIGGERED-UPDATED") bySeat[k].updated++;
+      else if (b.status === "TRIGGERED-HELD") bySeat[k].held++;
+      else if (b.status === "TRIGGERED-PARTIAL") bySeat[k].partial++;
+      else if (b.status === "TRIGGERED-IGNORED") bySeat[k].ignored++;
+      else bySeat[k].untested++;
+    });
+    Object.keys(bySeat).forEach((s) => {
+      const r = bySeat[s];
+      logError("[RECKONING] " + seatLabel(s) + " \u2014 " + r.stated + " falsifier(s) stated, " +
+        (r.updated + r.held + r.partial + r.ignored) + " triggered: " +
+        r.updated + " updated, " + r.held + " held with a reason, " + r.partial + " partial, " +
+        r.ignored + " ignored. " + r.untested + " never triggered. " +
+        "A seat that always holds is either well-calibrated or was never serious \u2014 the counts " +
+        "distinguish those only over many rounds, not in one.");
+    });
+    return bySeat;
+  }
+  try {
+    window.__rqReckoning = reckRecord;
+    window.__rqFalsifierBank = () => reckLoad();
+  } catch (_) {}
+
+  let _reckHits = {};   // seat -> {entry, sim} for THIS round
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -13199,6 +13401,11 @@ end $$;`;
       _erclRequest = null;
       _openingPositions = null;
       _rebuttalResult = null;
+      // RECKONING — reset here; the CHECK itself runs after the memory block is
+      // composed, since retrieved material is exactly what most often meets a
+      // stored condition. Referencing memoryContext at this point would be a
+      // temporal-dead-zone throw on every round.
+      _reckHits = {};
       // RDSR — evaluated BEFORE dispatch, from prior rounds and this question
       // only. The manual flag still forces it on; the trigger only adds arming.
       _rdsrArm = rdsrShouldArm(query);
@@ -13286,6 +13493,9 @@ end $$;`;
       // Putting it in front of MEMORY_HEADER would separate the two and leave the
       // seat reading retrieved history before it has been told what history is.
       let _composedBody;
+      // RECKONING — now that memory is composed, check the bank against the
+      // question PLUS what will actually reach the seats.
+      try { _reckHits = await reckCheck(query, memoryContext || ""); } catch (_) {}
       if (memoryContext) {
         const _mark = "=== CURRENT QUESTION ===\n";
         const _at = memoryContext.lastIndexOf(_mark);
@@ -13350,6 +13560,10 @@ end $$;`;
         try { _erclRequest = erclScanRequest(allAnswers); } catch (_) {}
         try { rdsrScan(allAnswers); } catch (_) {}
         try { rdsrScanRequest(allAnswers); } catch (_) {}
+        // Resolve BEFORE depositing, so a falsifier stated in this same round
+        // cannot be marked resolved by the trigger that preceded it.
+        try { reckResolve(allAnswers, _reckHits); } catch (_) {}
+        try { await reckDeposit(allAnswers, (ledger || []).length + 1); } catch (_) {}
         // v4.20.0 — the question the pass exists to answer.
         if (_rebuttalResult && result && result.text) {
           try { await detectNovelClaims(result.text, _openingPositions || []); } catch (_) {}
@@ -13484,6 +13698,13 @@ end $$;`;
           // v4.13.0 — RETRIEVAL STATE (council rank 3). Recorded only when
           // injection was ARMED, so its absence is never mistaken for a miss.
           ...(injectionEnabled() ? { retrieval_hit: !!_injectedThisRound } : {}),
+          // v4.24.0 — which seats faced a trigger, so a later reader can tell
+          // why a round opened with a seat settling an old debt.
+          ...(Object.keys(_reckHits || {}).length
+            ? { reckoning: Object.keys(_reckHits).map((s) => ({
+                seat: s, from_round: _reckHits[s].entry.round,
+                condition: clip(_reckHits[s].entry.text, 200) })) }
+            : {}),
           // v4.20.0 — openings kept SEPARATELY from `positions`, which now hold
           // post-rebuttal text when the pass ran. Absent when it did not, so an
           // ordinary round is byte-identical.
@@ -13859,6 +14080,9 @@ end $$;`;
         "model that actually produced it, captured at ANSWER time before adjudication can overwrite it. " +
         "A proxy answer renders in seat memory as \"<model>, speaking for <seat>\", never under the seat " +
         "name. Agreement among proxies alone caps the round at PROVISIONAL.");
+      logError(reckoningEnabled()
+        ? "\u25C6 [RECKONING] Forced reckoning ON \u2014 stated falsifiers are banked and a seat facing a match must answer YES/NO/PARTIAL against its own prior condition before the question. Matching is ADVISORY at similarity " + RQ_RECK_SIM + " (TUNE-AFTER-DATA); the seat decides whether the condition is met. Requires the falsifier ask to stay ON, or the bank stops filling."
+        : "[RECKONING] Forced reckoning OFF \u2014 falsifiers are stated and never collected on.");
       logError(rebuttalEnabled()
         ? "\u25C7 [REBUTTAL] Rebuttal pass ON \u2014 seats see each other's openings and may revise or hold, +1 call per seat. Holding is the default and stated as costless; a revision must cite what moved it. Openings are stored separately so revisions are measurable, and NOVELTY detection reports whether the final text contains any claim absent from every opening."
         : "[REBUTTAL] Rebuttal pass OFF \u2014 seats answer once, blind to each other. There is no within-round exchange, so a conclusion cannot emerge from one.");
