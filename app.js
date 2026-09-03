@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.25.0-courier";
+  const RQ_BUILD = "v4.25.1-courier-diagnostics";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -13438,18 +13438,80 @@ end $$;`;
     } catch (_) { return String(html || ""); }
   }
 
+  // v4.25.1 — COUNCIL-DIAGNOSED DEFECT, round 47.
+  //
+  // Three fetches returned an undifferentiated cors_blocked. Two of the hosts
+  // (raw.githubusercontent.com, HN Algolia) normally send permissive CORS
+  // headers, and the Kimi seat argued a uniform failure across differently
+  // configured hosts is weak evidence for three host decisions and stronger
+  // evidence for something upstream. It was right, and the cause was invisible
+  // from inside the council:
+  //
+  //     THE PAGE'S OWN CSP connect-src ALLOWLIST BLOCKS EVERY COURIER FETCH.
+  //
+  // The browser refuses before a request is sent. My catch block then labelled
+  // that TypeError "cors_blocked" — a fourteenth instance of this project's
+  // signature failure, in a feature built to report honestly about fetching.
+  //
+  // Three fixes, all three requested by the council:
+  //   1. Check the CSP allowlist FIRST and say so, rather than guessing after.
+  //   2. GET-only, no custom headers, so nothing triggers a preflight that
+  //      would fail for a reason unrelated to the host's CORS policy.
+  //   3. Distinguish csp_blocked / network_error / cors_blocked instead of
+  //      collapsing every exception into one label.
+  //
+  // Parsed from the live document so it can never drift from what the page
+  // actually enforces.
+  let _cspAllow = null;
+  function coCspHosts() {
+    if (_cspAllow) return _cspAllow;
+    _cspAllow = [];
+    try {
+      const meta = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+      const c = meta ? meta.getAttribute("content") || "" : "";
+      const m = /connect-src([^;]*)/i.exec(c);
+      if (m) {
+        _cspAllow = m[1].split(/\s+/).filter((x) => /^https?:\/\//i.test(x))
+          .map((x) => { try { return new URL(x).host; } catch (_) { return null; } })
+          .filter(Boolean);
+      }
+    } catch (_) {}
+    return _cspAllow;
+  }
+  function coCspAllows(url) {
+    try {
+      const hosts = coCspHosts();
+      if (!hosts.length) return true;      // no connect-src => not restricted here
+      const h = new URL(url).host;
+      return hosts.some((a) => h === a || h.endsWith("." + a));
+    } catch (_) { return true; }
+  }
+
   async function coFetchOne(url) {
     const paste = coPasteGet();
     if (Object.prototype.hasOwnProperty.call(paste, url)) {
       const text = String(paste[url] || "");
       return { url: url, via: "paste", http: 200, text: text, ok: true };
     }
+    // Checked BEFORE the attempt: a CSP refusal is not a host decision, and
+    // reporting it as one sends the council chasing the wrong hypothesis.
+    if (!coCspAllows(url)) {
+      return { url: url, via: "direct", ok: false, reason: "csp_blocked",
+               detail: "this page's connect-src allowlist does not include " +
+                 (function () { try { return new URL(url).host; } catch (_) { return "that host"; } })() +
+                 " — the browser refuses before any request is sent, so the host's own CORS policy was never consulted" };
+    }
     try {
       const ctl = new AbortController();
       const kill = setTimeout(() => ctl.abort(), RQ_CO_TIMEOUT_MS);
-      // redirect:"follow" keeps the browser inside the requested URL's own
-      // chain. No link-following, no scope expansion.
-      const res = await fetch(url, { signal: ctl.signal, redirect: "follow", credentials: "omit" });
+      // GET-only, no custom headers, redirect within the URL's own chain.
+      // Council request 2: anything that triggers a CORS PREFLIGHT can fail for
+      // reasons unrelated to the host's actual policy, which is exactly the
+      // ambiguity this whole fix exists to remove.
+      const res = await fetch(url, {
+        method: "GET", signal: ctl.signal, redirect: "follow",
+        credentials: "omit", mode: "cors", referrerPolicy: "no-referrer",
+      });
       clearTimeout(kill);
       const ctype = res.headers.get("content-type") || "";
       if (!/text|json|xml/i.test(ctype) && ctype) {
@@ -13460,21 +13522,46 @@ end $$;`;
       return { url: url, finalUrl: res.url || url, via: "direct", http: res.status, text: coExtract(body, ctype), ok: true };
     } catch (e) {
       const msg = String((e && e.message) || e);
-      // A CORS block and a network drop are indistinguishable from inside the
-      // browser — fetch throws the same TypeError for both. Reported as the
-      // likelier of the two for a cross-origin URL rather than guessed at.
-      const reason = /abort/i.test(msg) ? "timeout" : "cors_blocked";
-      return { url: url, via: "direct", ok: false, reason: reason, detail: clip(msg, 120) };
+      // Council request 3: report what is actually distinguishable rather than
+      // collapsing everything into one label. A browser genuinely cannot tell a
+      // CORS rejection from a network failure — both throw the same TypeError —
+      // so that ambiguity is STATED rather than resolved by guessing.
+      const reason = /abort/i.test(msg) ? "timeout"
+                   : /Content Security Policy|violates the following/i.test(msg) ? "csp_blocked"
+                   : "cors_or_network";
+      return { url: url, via: "direct", ok: false, reason: reason,
+               detail: clip(msg, 160) + (reason === "cors_or_network"
+                 ? " | AMBIGUOUS BY CONSTRUCTION: the browser reports CORS rejection and network failure identically. Not a guess withheld — a distinction the platform does not expose."
+                 : "") };
     }
   }
 
   // Build the payload for THIS round from what was requested LAST round.
   // Consumed once — a request is not standing.
+  // Council request 1: a known CORS-open control in every batch, so a batch of
+  // failures can be told apart from a broken pipeline. jsdelivr is already in
+  // the CSP allowlist and serves permissive CORS headers, so it isolates the
+  // fault: control OK + targets failed => host-side. Control failed too =>
+  // pipeline. Costs one small request and answers a question the council could
+  // not otherwise settle.
+  const RQ_CO_CONTROL = "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/package.json";
+  async function coProbeControl() {
+    try {
+      const r = await coFetchOne(RQ_CO_CONTROL);
+      logError("[COURIER] control probe " + (r.ok ? "OK" : "FAILED (" + r.reason + ")") +
+        " \u2014 " + (r.ok
+          ? "the fetch pipeline works, so any failures below are host-side or URL-specific."
+          : "the pipeline itself is blocked, so failures below say NOTHING about the requested hosts."));
+      return r.ok;
+    } catch (_) { return false; }
+  }
+
   async function coBuildBlock() {
     if (!courierEnabled()) return "";
     const pending = coPendGet();
     if (!pending.length) return "";
     coPendSet([]);
+    const controlOk = await coProbeControl();
     const parts = [], failed = [];
     let total = 0;
     for (const url of pending) {
@@ -13505,10 +13592,14 @@ end $$;`;
     }
     failed.forEach((f) => {
       logError("[COURIER] NOT DELIVERED | " + f.reason + " \u2014 " + clip(f.url, 80) +
-        (f.reason === "cors_blocked"
-          ? ". The host refused a cross-origin read, which is most of the web. Paste the text yourself " +
-            "with window.__rqPaste(url, text) and it will be packaged identically, marked via=paste."
-          : "") + (f.detail ? " (" + f.detail + ")" : ""));
+        (f.reason === "csp_blocked"
+          ? ". This is THIS PAGE's policy, not the host's. Add the host to connect-src in index.html, " +
+            "or paste with window.__rqPaste(url, text)."
+          : f.reason === "cors_or_network"
+          ? ". Paste the text yourself with window.__rqPaste(url, text) and it will be packaged " +
+            "identically, marked via=paste."
+          : "") + (f.detail ? " (" + f.detail + ")" : "") +
+        (controlOk === false ? " [CONTROL ALSO FAILED — treat this failure as uninformative about the host]" : ""));
     });
     if (!parts.length) {
       if (failed.length) {
