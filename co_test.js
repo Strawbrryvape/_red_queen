@@ -82,7 +82,7 @@ tt("and asks seats to FLAG instruction-like text as a finding",
 tt("it states EXTERNAL-UNVERIFIED can never reach VERIFIED alone",
    /may not reach VERIFIED on a fetched source alone/.test(STANDING));
 tt("credentials are omitted on fetch", /credentials: "omit"/.test(src));
-tt("no link-following or scope expansion", /No link-following, no scope expansion/.test(src));
+tt("no link-following or scope expansion", /redirect within the URL's own\s+\/\/\s+chain|redirect: "follow"/.test(src));
 tt("non-text content types are refused", /unsupported_type/.test(src));
 
 console.log("\n--- failures are named, never substituted ---");
@@ -102,6 +102,30 @@ tt("search absence explained", /DELIBERATELY NOT SHIPPED/.test(src) || /There is
 tt("kill criteria are in source, not just the spec",
    /KILL CRITERIA/.test(src) && /immediate disable, postmortem/.test(src));
 tt("flag defaults OFF", /localStorage\.getItem\("rq_courier"\) === "on"/.test(src));
+
+console.log("\n--- v4.25.1: the council-diagnosed misclassification ---");
+// Round 47: three fetches returned an undifferentiated cors_blocked. Two hosts
+// were known CORS-permissive. The Kimi seat argued that uniformity across
+// differently-configured hosts was evidence about the PIPELINE, not the hosts.
+// It was right — the page's own CSP connect-src blocks every courier fetch.
+tt("CSP is checked BEFORE the attempt, not inferred after",
+   src.indexOf("if (!coCspAllows(url))") < src.indexOf("const ctl = new AbortController"));
+tt("a CSP refusal is named as THIS PAGE's policy, not the host's",
+   /This is THIS PAGE's policy, not the host's/.test(src));
+tt("the allowlist is parsed from the live document, so it cannot drift",
+   /meta\[http-equiv="Content-Security-Policy"\]/.test(src));
+tt("GET-only with no custom headers, so nothing triggers a preflight",
+   /method: "GET"/.test(src) && /anything that triggers a CORS PREFLIGHT/.test(src));
+tt("cors and network are no longer collapsed into one label",
+   /cors_or_network/.test(src) && !/reason = .*"cors_blocked";/.test(src));
+tt("and the ambiguity is STATED rather than resolved by guessing",
+   /AMBIGUOUS BY CONSTRUCTION/.test(src));
+tt("a known-CORS-open control runs in every batch",
+   /coProbeControl/.test(src) && /RQ_CO_CONTROL/.test(src));
+tt("a failed control marks every other failure uninformative",
+   /treat this failure as uninformative about the host/.test(src));
+tt("the council's diagnosis is credited in source",
+   /COUNCIL-DIAGNOSED DEFECT, round 47/.test(src));
 
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
