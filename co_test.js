@@ -18,9 +18,12 @@ eval([grab(/  const clip = .*/), grab(/  function ftDigest\(s\) \{[\s\S]*?\n  \}
       grab(/  function coScanRequests\(answers\) \{[\s\S]*?\n  \}/),
       grab(/  const RQ_CO_TRANSFORM = .*/).replace(/^\s*const /,"var "),
       grab(/  function coExtract\(html, ctype\) \{[\s\S]*?\n  \}/),
-      grab(/  const RQ_CO_INSTRUCTION =[\s\S]*?no search in this build\.";/).replace(/^\s*const /,"var ")].join("\n") +
+      grab(/  function coTruncate\(text, cap\) \{[\s\S]*?\n  \}/),
+      grab(/  const RQ_CO_OFFSET_RE = .*/).replace(/^\s*const /,"var "),
+      grab(/  function coParseRequest\(raw\) \{[\s\S]*?\n  \}/),
+      grab(/  const RQ_CO_INSTRUCTION =[\s\S]*?through the URL\.";/).replace(/^\s*const /,"var ")].join("\n") +
      "\nglobalThis.coScanRequests=coScanRequests;globalThis.coExtract=coExtract;globalThis.coPendGet=coPendGet;" +
-     "globalThis.STANDING=RQ_CO_STANDING;globalThis.INSTR=RQ_CO_INSTRUCTION;");
+     "globalThis.coTruncate=coTruncate;globalThis.coParseRequest=coParseRequest;globalThis.STANDING=RQ_CO_STANDING;globalThis.INSTR=RQ_CO_INSTRUCTION;");
 
 let p=0,f=0;
 const t=(n,g,w)=>{const ok=JSON.stringify(g)===JSON.stringify(w);ok?(p++,console.log("  PASS  "+n)):(f++,console.log("  FAIL  "+n+"  got "+JSON.stringify(g)));};
@@ -95,10 +98,10 @@ tt("a CORS block tells the operator what to do instead",
 
 console.log("\n--- truncation is declared, never bridged ---");
 tt("truncation states the cap and refuses to summarise the remainder",
-   /the remainder is NOT summarised and NOT bridged/.test(src));
+   /remainder is NOT summarised and NOT bridged/i.test(src));
 
 console.log("\n--- what is NOT built is documented as recoverable ---");
-tt("search absence explained", /DELIBERATELY NOT SHIPPED/.test(src) || /There is no search in this build/.test(INSTR));
+tt("search absence explained", /DELIBERATELY NOT SHIPPED/.test(src) || /no dedicated search in this build/.test(INSTR));
 tt("kill criteria are in source, not just the spec",
    /KILL CRITERIA/.test(src) && /immediate disable, postmortem/.test(src));
 tt("flag defaults OFF", /localStorage\.getItem\("rq_courier"\) === "on"/.test(src));
@@ -126,6 +129,35 @@ tt("a failed control marks every other failure uninformative",
    /treat this failure as uninformative about the host/.test(src));
 tt("the council's diagnosis is credited in source",
    /COUNCIL-DIAGNOSED DEFECT, round 47/.test(src));
+
+console.log("\n--- v4.26.0: the four upgrades the council asked for ---");
+t("offset parses off a piped suffix",
+  coParseRequest("https://x.com/a | offset=4000"), {url:"https://x.com/a",offset:4000});
+t("a plain URL still works", coParseRequest("https://x.com/a"), {url:"https://x.com/a",offset:0});
+tt("a REAL #fragment is preserved, not eaten as an offset",
+   coParseRequest("https://x.com/a#frag").url === "https://x.com/a#frag");
+const json=JSON.stringify({items:Array.from({length:40},(_,i)=>({id:i,t:"story "+i}))});
+const jc=coTruncate(json,300);
+t("JSON cuts at a structural boundary", jc.boundary, "json");
+tt("and the cut text ends on a closed element", /\}$/.test(jc.text));
+// The sentence break must fall past 60% of the cap, or a hard cut is correct —
+// surrendering 40% of an excerpt to reach a full stop loses more than it gains.
+const pc=coTruncate("First sentence here. Second sentence follows on. Third one lands too. "+"tail ".repeat(60), 90);
+t("prose cuts at a sentence when one is near enough", pc.boundary, "sentence");
+t("but falls back to a hard cut when the break is too early",
+  coTruncate("Short. "+"x".repeat(400), 90).boundary, "hard");
+tt("short text is never truncated", coTruncate("short",999).truncated === false);
+tt("the per-source cap was raised on the seats' own report", /RQ_CO_PER_SOURCE  = 4000/.test(src));
+tt("the receipt states the whole document size, not just the slice",
+   /doc_total_chars=/.test(src) && /remaining=/.test(src));
+tt("and tells the seat exactly how to continue",
+   /to continue\. The remainder is NOT summarised/.test(src) && /offset=" \+ end \+ "\]/.test(src));
+tt("a request from a FALLBACK is attributed to the model, not the seat",
+   /NOT the seat itself/.test(src) && /requested_by=/.test(src));
+tt("and it reads the answer-time snapshot so adjudication cannot overwrite it",
+   /_seatProviderAtAnswer\[a\.name\]/.test(src));
+tt("search-via-query-URL is explicitly sanctioned, per Kimi's note",
+   /sanctioned way to search through the URL/.test(INSTR));
 
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
