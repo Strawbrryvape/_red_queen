@@ -18,12 +18,14 @@ eval([grab(/  const clip = .*/), grab(/  function ftDigest\(s\) \{[\s\S]*?\n  \}
       grab(/  function coScanRequests\(answers\) \{[\s\S]*?\n  \}/),
       grab(/  const RQ_CO_TRANSFORM = .*/).replace(/^\s*const /,"var "),
       grab(/  function coExtract\(html, ctype\) \{[\s\S]*?\n  \}/),
+      grab(/  const RQ_CO_REWRITES = \[[\s\S]*?\n  \];/).replace(/^\s*const /,"var "),
+      grab(/  function coRewrite\(url\) \{[\s\S]*?\n  \}/),
       grab(/  function coTruncate\(text, cap\) \{[\s\S]*?\n  \}/),
       grab(/  const RQ_CO_OFFSET_RE = .*/).replace(/^\s*const /,"var "),
       grab(/  function coParseRequest\(raw\) \{[\s\S]*?\n  \}/),
       grab(/  const RQ_CO_INSTRUCTION =[\s\S]*?through the URL\.";/).replace(/^\s*const /,"var ")].join("\n") +
      "\nglobalThis.coScanRequests=coScanRequests;globalThis.coExtract=coExtract;globalThis.coPendGet=coPendGet;" +
-     "globalThis.coTruncate=coTruncate;globalThis.coParseRequest=coParseRequest;globalThis.STANDING=RQ_CO_STANDING;globalThis.INSTR=RQ_CO_INSTRUCTION;");
+     "globalThis.coRewrite=coRewrite;globalThis.coTruncate=coTruncate;globalThis.coParseRequest=coParseRequest;globalThis.STANDING=RQ_CO_STANDING;globalThis.INSTR=RQ_CO_INSTRUCTION;");
 
 let p=0,f=0;
 const t=(n,g,w)=>{const ok=JSON.stringify(g)===JSON.stringify(w);ok?(p++,console.log("  PASS  "+n)):(f++,console.log("  FAIL  "+n+"  got "+JSON.stringify(g)));};
@@ -94,7 +96,8 @@ console.log("\n--- failures are named, never substituted ---");
 tt("no substitute source is ever fetched",
    /No substitute source was fetched/.test(src));
 tt("a CORS block tells the operator what to do instead",
-   /Paste the text yourself/.test(src) && /__rqPaste\(url, text\)/.test(src));
+   /no client-side change can overrule that/.test(src) &&
+   /Open it yourself, copy the text, and run/.test(src));
 
 console.log("\n--- truncation is declared, never bridged ---");
 tt("truncation states the cap and refuses to summarise the remainder",
@@ -158,6 +161,32 @@ tt("and it reads the answer-time snapshot so adjudication cannot overwrite it",
    /_seatProviderAtAnswer\[a\.name\]/.test(src));
 tt("search-via-query-URL is explicitly sanctioned, per Kimi's note",
    /sanctioned way to search through the URL/.test(INSTR));
+
+console.log("\n--- v4.28.2: CORS-open equivalents ---");
+// With connect-src opened, remaining failures are genuine server refusals. Many
+// of those hosts serve the same content CORS-open at a different URL.
+tt("wikipedia article -> API with origin=*",
+   /api\.php/.test(coRewrite("https://en.wikipedia.org/wiki/Foo")) &&
+   /origin=\*/.test(coRewrite("https://en.wikipedia.org/wiki/Foo")));
+t("github blob -> raw",
+  coRewrite("https://github.com/a/b/blob/main/x.md"), "https://raw.githubusercontent.com/a/b/main/x.md");
+t("github repo -> API",
+  coRewrite("https://github.com/a/b"), "https://api.github.com/repos/a/b");
+tt("arxiv abs -> export API", /export\.arxiv\.org/.test(coRewrite("https://arxiv.org/abs/2401.1")));
+tt("reddit -> .json", /\.json$/.test(coRewrite("https://www.reddit.com/r/x/new")));
+tt("hn item -> firebase API", /firebaseio/.test(coRewrite("https://news.ycombinator.com/item?id=1")));
+tt("npm -> registry", /registry\.npmjs\.org/.test(coRewrite("https://www.npmjs.com/package/react")));
+tt("an unknown host gets NO rewrite \u2014 no guessing at APIs",
+   coRewrite("https://remoteok.com/api") === null &&
+   coRewrite("https://example.org/page") === null);
+tt("the rewrite is retried only ONCE, and only on a refusal",
+   /if \(!\/cors_or_network\|http_40\[0-9\]\/\.test/.test(src));
+tt("a rewritten source is DECLARED in the receipt, never silent",
+   /REWRITTEN_FROM=/.test(src) && /not a substitute source/.test(src));
+tt("if the equivalent also fails, the ORIGINAL failure is what is reported",
+   /Report the ORIGINAL failure, not the rewrite's/.test(src));
+tt("a hard failure gives the operator the exact paste command",
+   /window\.__rqPaste\(\\"" \+ f\.url/.test(src));
 
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
