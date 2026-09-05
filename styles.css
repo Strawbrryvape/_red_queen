@@ -1740,3 +1740,78 @@ body:has(.agent.consensus) .consensus-bar {
 .rq-reck.is-held    { color: #2563eb; }   /* condition not met, reason given */
 .rq-reck.is-partial { color: #d97706; }   /* partly met, further evidence named */
 .rq-reck.is-ignored { color: #dc2626; }   /* the condition was not addressed */
+
+
+/* ==========================================================================
+   v4.27.0 — ATTACHMENTS
+
+   The drop zone and list existed in markup with no code behind them. These are
+   the styles for the working version.
+
+   An image is shown DIMMED with a struck note, because the seats genuinely
+   cannot read it. Making an unreadable attachment look identical to a readable
+   one would be the interface lying about what the council received.
+   ========================================================================== */
+.drop-zone.is-drag {
+  border-color: var(--kimi);
+  background: rgba(0, 212, 170, 0.07);
+}
+
+.attachment-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.attachment-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 0.78em;
+}
+
+.attachment-item .att-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.attachment-item .att-note {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+/* Unreadable by the seats — dimmed and named as such, never styled as normal. */
+.attachment-item.is-unreadable {
+  border-style: dashed;
+  opacity: 0.72;
+}
+.attachment-item.is-unreadable .att-note { color: #d97706; }
+
+.attachment-item .att-x {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 1.15em;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+}
+.attachment-item .att-x:hover { color: var(--divided, #dc2626); }
+
+/* Touch targets stay comfortable on a phone, which is where this was failing. */
+@media (max-width: 600px) {
+  .attachment-item { padding: 10px 12px; font-size: 0.82em; }
+  .attachment-item .att-x { padding: 0 8px; font-size: 1.3em; }
+}
