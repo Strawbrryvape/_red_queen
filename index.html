@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://generativelanguage.googleapis.com https://api.anthropic.com https://api.moonshot.ai https://api.moonshot.cn https://api.groq.com https://api.cerebras.ai https://openrouter.ai https://ykkafntuuxiauokmcozz.supabase.co https://cdn.jsdelivr.net https://huggingface.co https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.hf.co https://us.aws.cdn.hf.co https://raw.githubusercontent.com https://api.github.com https://hn.algolia.com https://en.wikipedia.org https://*.wikipedia.org https://api.crossref.org https://export.arxiv.org https://arxiv.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; worker-src blob:;"><link rel="preconnect" href="https://fonts.googleapis.com">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://generativelanguage.googleapis.com https://api.anthropic.com https://api.moonshot.ai https://api.moonshot.cn https://api.groq.com https://api.cerebras.ai https://openrouter.ai https://ykkafntuuxiauokmcozz.supabase.co https://cdn.jsdelivr.net https://huggingface.co https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.hf.co https://us.aws.cdn.hf.co https://raw.githubusercontent.com https://api.github.com https://hn.algolia.com https://en.wikipedia.org https://*.wikipedia.org https://api.crossref.org https://export.arxiv.org https://arxiv.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; worker-src blob: https://cdn.jsdelivr.net;"><link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
@@ -82,8 +82,8 @@
     <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/>
     </svg>
-    <span id="dropZoneLabel">Attach documents — tap or drop .txt / .md / .log / .csv</span>
-    <input type="file" id="fileInput" accept=".txt,.md,.log,.csv,.json" multiple hidden>
+    <span id="dropZoneLabel">Attach documents or photos — tap or drop</span>
+    <input type="file" id="fileInput" accept=".txt,.md,.log,.csv,.json,.pdf,.docx,.rst,.yml,.xml,.html,.jpg,.jpeg,.png,.gif,.webp,.heic,.heif,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/*" multiple hidden>
   </div>
   <ul id="attachmentList" class="attachment-list hidden"></ul>
 </div>
