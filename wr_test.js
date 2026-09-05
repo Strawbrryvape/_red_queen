@@ -114,5 +114,24 @@ tt("seats are told nothing fires automatically", /Nothing fires automatically, e
 tt("and are asked for a falsifier ON THE ACTION", /falsifier for the action itself/.test(INSTR));
 tt("flag defaults OFF", /localStorage\.getItem\("rq_write_courier"\) === "on"/.test(src));
 
+console.log("\n--- v4.29.0: the signature must be reachable on a phone ---");
+// Confirmation was console-only. A gate nobody can pass is not a safety
+// feature, it is a dead feature.
+tt("a panel is rendered when a proposal survives the gates",
+   /function wrPanel\(\)/.test(src) && /wrPanelClose\(\); wrPanel\(\);/.test(src));
+tt("it is built with DOM calls, not innerHTML, because every value is model-authored",
+   /every value here is\s+\/\/ model-authored|const mk = \(cls, txt\)/.test(src) &&
+   /e\.textContent = txt/.test(src));
+tt("the gates are unchanged \u2014 the panel routes through wrConfirm",
+   /await wrConfirm\(t, \{ irreversible: !reversible \}\)/.test(src));
+tt("an irreversible target gets a different button and a warning class",
+   /is-irreversible/.test(src) && /Send anyway/.test(src));
+tt("the token field is cleared before the await, not after",
+   /tok\.value = "";\s*\/\/ clear the field before the await/.test(src));
+tt("a pending proposal EXPIRES when a new round starts",
+   /the pending proposal expired/.test(src) && /no longer current\. WRITE_REJECTED/.test(src));
+tt("the panel says nothing has been sent",
+   /Nothing has been sent\. This proposal expires/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
