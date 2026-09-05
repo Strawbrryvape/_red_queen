@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.28.0-write-courier";
+  const RQ_BUILD = "v4.29.0-write-panel";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -13591,6 +13591,17 @@ end $$;`;
   }
   function coCspAllows(url) {
     try {
+      // v4.28.1 — a bare `https:` scheme-source in connect-src permits ANY https
+      // origin. The host parser below skips it (it is not a full URL), leaving an
+      // empty list, which the next line already treats as unrestricted — but
+      // relying on that coincidence would leave a future reader thinking the
+      // check was broken. Stated explicitly instead.
+      try {
+        const meta = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+        const c = meta ? meta.getAttribute("content") || "" : "";
+        const m = /connect-src([^;]*)/i.exec(c);
+        if (m && /(^|\s)https:(\s|$)/.test(m[1])) return true;   // scheme-source: all https allowed
+      } catch (_) {}
       const hosts = coCspHosts();
       if (!hosts.length) return true;      // no connect-src => not restricted here
       const h = new URL(url).host;
@@ -13598,7 +13609,81 @@ end $$;`;
     } catch (_) { return true; }
   }
 
+  // v4.28.2 — CORS-OPEN EQUIVALENTS.
+  //
+  // With connect-src opened, the remaining failures are genuine server-side
+  // refusals — the host declines cross-origin reads and no client-side change
+  // can overrule that. But a large share of those hosts DO serve the same
+  // content CORS-open at a different URL: an API beside the HTML page, a raw
+  // endpoint beside the rendered one, a feed beside the site.
+  //
+  // So a blocked fetch is retried ONCE against the known equivalent before it
+  // is reported as blocked. The receipt records which URL actually answered, so
+  // a rewrite is never silent — a seat citing a source must be able to see that
+  // it came from the API rather than the page it asked for.
+  //
+  // Deliberately a small, checkable table rather than a guess-the-API
+  // heuristic. A wrong rewrite would deliver content from a URL nobody
+  // requested, which is worse than an honest failure.
+  const RQ_CO_REWRITES = [
+    // Wikipedia refuses cross-origin unless origin=* is present.
+    [/^https:\/\/([a-z-]+)\.wikipedia\.org\/wiki\/(.+)$/i,
+     (m) => "https://" + m[1] + ".wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&origin=*&titles=" + encodeURIComponent(decodeURIComponent(m[2]))],
+    // GitHub blob pages are blocked; raw is open.
+    [/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/(.+)$/i,
+     (m) => "https://raw.githubusercontent.com/" + m[1] + "/" + m[2] + "/" + m[3]],
+    // A repo root has no readable body; the API describes it.
+    [/^https:\/\/github\.com\/([^/]+)\/([^/?#]+)\/?$/i,
+     (m) => "https://api.github.com/repos/" + m[1] + "/" + m[2]],
+    // arXiv abstract pages block; the export mirror does not.
+    [/^https:\/\/arxiv\.org\/abs\/(.+)$/i,
+     (m) => "https://export.arxiv.org/api/query?id_list=" + m[1]],
+    // Reddit serves JSON at the same path.
+    [/^https:\/\/(?:www\.)?reddit\.com\/(.+?)\/?$/i,
+     (m) => "https://www.reddit.com/" + m[1] + ".json"],
+    // Hacker News items have a CORS-open API.
+    [/^https:\/\/news\.ycombinator\.com\/item\?id=(\d+)$/i,
+     (m) => "https://hacker-news.firebaseio.com/v0/item/" + m[1] + ".json"],
+    // npm package pages block; the registry is open.
+    [/^https:\/\/(?:www\.)?npmjs\.com\/package\/(.+?)\/?$/i,
+     (m) => "https://registry.npmjs.org/" + m[1]],
+    // StackOverflow questions via the public API.
+    [/^https:\/\/stackoverflow\.com\/questions\/(\d+)/i,
+     (m) => "https://api.stackexchange.com/2.3/questions/" + m[1] + "?site=stackoverflow&filter=withbody"],
+  ];
+  function coRewrite(url) {
+    for (const [re, fn] of RQ_CO_REWRITES) {
+      const m = re.exec(url);
+      if (m) { try { return fn(m); } catch (_) { return null; } }
+    }
+    return null;
+  }
+
+  // Retries a blocked fetch ONCE against its CORS-open equivalent. Records the
+  // rewrite on the result so the receipt can name the URL that actually
+  // answered — a rewrite the seat cannot see is a source it did not request.
   async function coFetchOne(url) {
+    const first = await coFetchDirect(url);
+    if (first.ok) return first;
+    if (!/cors_or_network|http_40[0-9]/.test(String(first.reason || ""))) return first;
+    const alt = coRewrite(url);
+    if (!alt || alt === url) return first;
+    logError("[COURIER] " + clip(url, 60) + " refused (" + first.reason +
+      ") \u2014 retrying its CORS-open equivalent: " + clip(alt, 70));
+    const second = await coFetchDirect(alt);
+    if (second.ok) {
+      second.rewrittenFrom = url;
+      second.url = alt;
+      return second;
+    }
+    // Report the ORIGINAL failure, not the rewrite's — the seat asked for the
+    // first URL and that is what it needs told.
+    first.detail = (first.detail || "") + " | the CORS-open equivalent (" + clip(alt, 60) +
+      ") also failed: " + second.reason;
+    return first;
+  }
+
+  async function coFetchDirect(url) {
     const paste = coPasteGet();
     if (Object.prototype.hasOwnProperty.call(paste, url)) {
       const text = String(paste[url] || "");
@@ -13712,6 +13797,8 @@ end $$;`;
         " | chars=" + text.length + " | doc_total_chars=" + totalLen +
         " | offset=" + req.offset + "\u2013" + end + " | remaining=" + remaining +
         " | sha256=" + digest + " | transform=" + (r.via === "paste" ? "none" : RQ_CO_TRANSFORM) +
+        (r.rewrittenFrom ? " | REWRITTEN_FROM=" + r.rewrittenFrom +
+          " (the requested URL refused cross-origin reads; this is its CORS-open equivalent, not a substitute source)" : "") +
         (cut.truncated ? " | cut_at=" + cut.boundary : "") +
         (who ? " | requested_by=" + who.seat + (who.proxy ? " [via " + clip(String(who.model || who.provider), 24) + ", NOT the seat itself]" : "") : "") +
         " | provenance=EXTERNAL-UNVERIFIED | audit=UNAUDITED\n" +
@@ -13733,8 +13820,9 @@ end $$;`;
           ? ". This is THIS PAGE's policy, not the host's. Add the host to connect-src in index.html, " +
             "or paste with window.__rqPaste(url, text)."
           : f.reason === "cors_or_network"
-          ? ". Paste the text yourself with window.__rqPaste(url, text) and it will be packaged " +
-            "identically, marked via=paste."
+          ? ". The host refuses cross-origin reads and no client-side change can overrule that. " +
+            "Open it yourself, copy the text, and run:  window.__rqPaste(\"" + f.url + "\", \"...\")  " +
+            "\u2014 it will be packaged identically, marked via=paste."
           : "") + (f.detail ? " (" + f.detail + ")" : "") +
         (controlOk === false ? " [CONTROL ALSO FAILED — treat this failure as uninformative about the host]" : ""));
     });
@@ -14122,6 +14210,7 @@ end $$;`;
           return null;
         }
         _wrProposal = prop;
+        try { wrPanelClose(); wrPanel(); } catch (_) {}
         logError("\u25C6 [WRITE] PROPOSAL AWAITING YOU \u2014 " + method + " " + clip(url, 80) +
           ", proposed by " + seatLabel(a.name) + ", authorised by VERIFIED 3/3. " +
           "NOTHING HAS BEEN SENT. Review it with window.__rqWriteReview(), then " +
@@ -14238,7 +14327,83 @@ end $$;`;
       localStorage.setItem("rq_write_log", JSON.stringify(log.slice(-100)));
     } catch (_) {}
     _wrProposal = null;
+    try { wrPanelClose(); } catch (_) {}
     return { outcome: outcome, status: status, receipt: receipt };
+  }
+
+  // v4.29.0 — MOBILE SIGNING.
+  //
+  // Confirmation was console-only (__rqWriteReview / __rqWriteConfirm), and a
+  // phone has no usable console. On mobile the council could PROPOSE a write
+  // and the operator could never sign it — a gate nobody can pass is not a
+  // safety feature, it is a dead feature.
+  //
+  // The panel below changes NOTHING about the gates. VERIFIED 3/3 is still
+  // required, the atomicity re-check still runs, irreversible targets still
+  // need the second confirmation, and the token is still a parameter that dies
+  // with the call. It only makes the existing signature reachable by thumb.
+  function wrPanel() {
+    const pr = _wrProposal;
+    if (!pr) return;
+    try {
+      let host = pr.url;
+      try { host = new URL(pr.url).host; } catch (_) {}
+      const reversible = /\/(issues|comments|gists|drafts)\b/i.test(pr.url) || pr.method === "PATCH";
+      const wrap = document.createElement("div");
+      wrap.id = "rqWritePanel";
+      wrap.className = "rq-write-panel" + (reversible ? "" : " is-irreversible");
+      // Built with DOM calls rather than innerHTML: every value here is
+      // model-authored, and this is the one panel where a mistake is an action
+      // rather than a rendering bug.
+      const mk = (cls, txt) => { const e = document.createElement("div"); e.className = cls; e.textContent = txt; return e; };
+      wrap.appendChild(mk("wp-title", "The council proposes an action"));
+      wrap.appendChild(mk("wp-line", pr.method + "  \u2192  " + host));
+      wrap.appendChild(mk("wp-url", pr.url));
+      wrap.appendChild(mk("wp-line", "Proposed by " + seatLabel(pr.seat) +
+        " \u00b7 authorised by " + pr.tally.trust.toUpperCase() + " (" + pr.tally.agreed.length + " seats)"));
+      if (pr.payload) {
+        const pay = document.createElement("pre");
+        pay.className = "wp-payload";
+        pay.textContent = clip(pr.payload, 900);
+        wrap.appendChild(pay);
+      }
+      wrap.appendChild(mk("wp-rev", reversible
+        ? "This target looks undoable \u2014 what it creates can be closed or deleted afterwards."
+        : "\u26A0 NO UNDO PATH IS KNOWN. If this succeeds it may not be possible to take back."));
+      const tok = document.createElement("input");
+      tok.type = "password";
+      tok.className = "wp-token";
+      tok.setAttribute("autocomplete", "off");
+      tok.setAttribute("autocapitalize", "off");
+      tok.setAttribute("spellcheck", "false");
+      tok.placeholder = "API token if the endpoint needs one \u2014 never stored";
+      wrap.appendChild(tok);
+      const row = document.createElement("div");
+      row.className = "wp-row";
+      const no = document.createElement("button");
+      no.type = "button"; no.className = "wp-btn wp-no"; no.textContent = "Reject";
+      const yes = document.createElement("button");
+      yes.type = "button"; yes.className = "wp-btn wp-yes";
+      yes.textContent = reversible ? "Sign and send" : "Send anyway \u2014 cannot be undone";
+      row.appendChild(no); row.appendChild(yes);
+      wrap.appendChild(row);
+      wrap.appendChild(mk("wp-foot",
+        "Nothing has been sent. This proposal expires when the next round begins."));
+      no.addEventListener("click", () => { wrCancel(); wrPanelClose(); });
+      yes.addEventListener("click", async () => {
+        yes.disabled = true; no.disabled = true; yes.textContent = "Sending\u2026";
+        let t = tok.value || "";
+        tok.value = "";                       // clear the field before the await
+        try { await wrConfirm(t, { irreversible: !reversible }); }
+        finally { t = null; wrPanelClose(); }
+      });
+      const anchor = document.getElementById("consensusBar");
+      if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(wrap, anchor.nextSibling);
+      else document.body.appendChild(wrap);
+    } catch (_) {}
+  }
+  function wrPanelClose() {
+    try { const el = document.getElementById("rqWritePanel"); if (el) el.remove(); } catch (_) {}
   }
 
   function wrCancel() {
@@ -14356,6 +14521,15 @@ end $$;`;
       _erclRequest = null;
       _openingPositions = null;
       _rebuttalResult = null;
+      // A pending proposal expires when a new round starts — the consensus that
+      // authorised it is no longer the current verdict, which is the same rule
+      // the atomicity check enforces at signing time.
+      if (_wrProposal) {
+        logError("[WRITE] the pending proposal expired \u2014 a new round has started, so the " +
+          "consensus that authorised it is no longer current. WRITE_REJECTED.");
+        _wrProposal = null;
+        try { wrPanelClose(); } catch (_) {}
+      }
       // RECKONING — reset here; the CHECK itself runs after the memory block is
       // composed, since retrieved material is exactly what most often meets a
       // stored condition. Referencing memoryContext at this point would be a
