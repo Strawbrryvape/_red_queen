@@ -3,7 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https://generativelanguage.googleapis.com https://api.anthropic.com https://api.moonshot.ai https://api.moonshot.cn https://api.groq.com https://api.cerebras.ai https://openrouter.ai https://ykkafntuuxiauokmcozz.supabase.co https://cdn.jsdelivr.net https://huggingface.co https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.hf.co https://us.aws.cdn.hf.co https://raw.githubusercontent.com https://api.github.com https://hn.algolia.com https://en.wikipedia.org https://*.wikipedia.org https://api.crossref.org https://export.arxiv.org https://arxiv.org; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; worker-src blob: https://cdn.jsdelivr.net;"><link rel="preconnect" href="https://fonts.googleapis.com">
+<!-- v4.28.1 — connect-src opened to https: . The previous named allowlist blocked
+     every real-world Courier target (remoteok.com was CSP-blocked in round 52), and a
+     hardcoded host list cannot work for a feature whose purpose is fetching arbitrary
+     URLs. script-src remains 'self' + jsdelivr, which is what actually prevents script
+     injection; connect-src only ever limited where an ALREADY-compromised page could
+     send data. Keys still never leave the browser. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; worker-src blob: https://cdn.jsdelivr.net;"><link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
