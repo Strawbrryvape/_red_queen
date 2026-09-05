@@ -1815,3 +1815,95 @@ body:has(.agent.consensus) .consensus-bar {
   .attachment-item { padding: 10px 12px; font-size: 0.82em; }
   .attachment-item .att-x { padding: 0 8px; font-size: 1.3em; }
 }
+
+
+/* ==========================================================================
+   v4.29.0 — WRITE PROPOSAL PANEL
+
+   Confirmation used to be console-only, which meant a phone could never sign.
+   The gates are unchanged; this only makes the signature reachable by thumb.
+
+   Styled to look like a decision, not a notification. An irreversible target
+   takes a red border and a differently-worded button, because the one failure
+   this panel must never produce is a reflexive tap.
+   ========================================================================== */
+.rq-write-panel {
+  margin: 12px 0;
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--gemini);
+  background: rgba(66, 133, 244, 0.06);
+  font-size: 0.82em;
+  line-height: 1.5;
+}
+.rq-write-panel.is-irreversible {
+  border-color: #dc2626;
+  background: rgba(220, 38, 38, 0.07);
+}
+
+.rq-write-panel .wp-title {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+.rq-write-panel .wp-line { color: var(--text); margin-bottom: 4px; }
+.rq-write-panel .wp-url {
+  color: var(--muted);
+  font-size: 0.9em;
+  word-break: break-all;
+  margin-bottom: 8px;
+}
+.rq-write-panel .wp-payload {
+  max-height: 140px;
+  overflow: auto;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.32);
+  font-size: 0.86em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.rq-write-panel .wp-rev { margin: 8px 0; color: var(--muted); }
+.rq-write-panel.is-irreversible .wp-rev { color: #f87171; font-weight: 600; }
+
+.rq-write-panel .wp-token {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 8px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.28);
+  color: var(--text);
+  font-size: 16px;            /* 16px stops iOS zooming the page on focus */
+}
+
+.rq-write-panel .wp-row { display: flex; gap: 10px; margin-top: 4px; }
+.rq-write-panel .wp-btn {
+  flex: 1 1 0;
+  padding: 12px 10px;         /* comfortable thumb target */
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: transparent;
+  color: var(--text);
+  font-size: 0.95em;
+  cursor: pointer;
+}
+.rq-write-panel .wp-no:hover { border-color: var(--muted); }
+.rq-write-panel .wp-yes { border-color: var(--gemini); color: var(--gemini); }
+.rq-write-panel.is-irreversible .wp-yes { border-color: #dc2626; color: #f87171; }
+.rq-write-panel .wp-btn:disabled { opacity: 0.5; cursor: default; }
+
+.rq-write-panel .wp-foot {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.88em;
+}
+
+@media (max-width: 600px) {
+  .rq-write-panel { font-size: 0.88em; padding: 16px; }
+  .rq-write-panel .wp-row { flex-direction: column; }
+  .rq-write-panel .wp-btn { padding: 14px 10px; }
+}
