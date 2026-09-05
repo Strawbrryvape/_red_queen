@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.26.0-courier-paging";
+  const RQ_BUILD = "v4.28.0-write-courier";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -3937,7 +3937,30 @@ roundData,
   // Walk the seat's model list until one answers (v2.5). Every hop is
   // logged — silence is never an option.
   async function callOpenRouterWalk(query, seatName) {
-    const list = OR_SEAT_MODELS[seatName] || OR_SEAT_MODELS.gemini;
+    // v4.28.0 — LAST-RESORT BORROWING.
+    //
+    // Live 2026-09-02: the Kimi seat went ABSENT when Moonshot hit its quota.
+    // Cause was not the routing — the chain reached OpenRouter correctly. It was
+    // that BOTH of Kimi's fallbacks are the same family (google/gemma-4-31b and
+    // google/gemma-4-26b), so one family-wide free-tier limit emptied the whole
+    // chain. This codebase already fixed family collisions ACROSS seats in
+    // v3.8.1; this is the same bug WITHIN a single seat's chain.
+    //
+    // Rather than guess at which free models are live today — the roster has
+    // gone stale four times and every hardcoded guess ages badly — the chain now
+    // ends by borrowing from the other seats' lists, furthest family first.
+    //
+    // This DELIBERATELY breaks the family-diversity rule, and only at the point
+    // where the alternative is an absent seat. An absent seat contributes
+    // nothing and drops the consensus bar for everyone else; a borrowed model
+    // contributes an answer that the Counterfoil records as a proxy, so the
+    // collision is visible in the record instead of hidden by a gap.
+    const own = OR_SEAT_MODELS[seatName] || OR_SEAT_MODELS.gemini;
+    const borrowed = Object.keys(OR_SEAT_MODELS)
+      .filter((k) => k !== seatName)
+      .reduce((acc, k) => acc.concat(OR_SEAT_MODELS[k] || []), [])
+      .filter((m) => own.indexOf(m) === -1);
+    const list = own.concat(borrowed);
     let lastErr = null;
     for (let i = 0; i < list.length; i++) {
       const model = list[i];
@@ -3948,7 +3971,14 @@ roundData,
       } catch (e) {
         lastErr = e;
         if (list[i + 1]) {
-          logError(`OpenRouter ${model} failed (${e.message || e}) — walking to ${list[i + 1]}.`);
+          const nextIsBorrowed = i + 1 >= own.length;
+          logError(`OpenRouter ${model} failed (${e.message || e}) — walking to ${list[i + 1]}.` +
+            (nextIsBorrowed
+              ? " \u26A0 BORROWED from another seat's chain: this seat's own family is exhausted. It " +
+                "breaks family diversity on purpose, because an absent seat contributes nothing and " +
+                "lowers the consensus bar for everyone else. The Counterfoil records which model " +
+                "actually answered, so the collision is visible rather than hidden."
+              : ""));
         }
       }
     }
@@ -3968,7 +3998,13 @@ roundData,
         messages: [{ role: "user", content: query }],
         max_tokens: REASONING_MAX_TOKENS, // v2.7.2: Nemotron truncated twice tonight at 1000
       }),
-    }, "OpenRouter");
+    }, "OpenRouter", 3, [429]);
+    // v4.28.0 — 429 NO LONGER RETRIED HERE. fetchWithRetry burned ~8s of
+    // exponential backoff per model on a free-tier quota that does not clear in
+    // eight seconds, so a rate-limited chain spent ~16s failing before the seat
+    // went absent. Same reasoning as the Gemini 503 fix: retrying is the wrong
+    // response when a different model is one line away.
+    if (res.status === 429) throw new Error(`OpenRouter ${model} rate-limited (429) — free-tier quota, walking on rather than waiting`);
     if (res.status === 404) throw new Error(`OpenRouter model ${model} unavailable (404) — swap OR_SEAT_MODELS entry for another free model family`);
     if (!res.ok) throw new Error(`OpenRouter HTTP ${res.status}`);
     const data = await res.json();
@@ -4553,6 +4589,9 @@ roundData,
         ["companionToggle", "rq_companion", "OPERATOR COMPANION",
          "A chat panel for you \u2014 prompt drafting, asking why a round came out as it did, thinking out loud. NOT a seat: it never votes, never enters consensus, never appears in headers or stats. It reads the ledger; the council can never read it. Reload to mount.",
          "No companion panel."],
+        ["writeCourierToggle", "rq_write_courier", "WRITE COURIER (v1)",
+         "\u26A0 THE COUNCIL CAN PROPOSE ACTIONS ON EXTERNAL SYSTEMS. A proposal needs VERIFIED 3/3 AND your typed confirmation \u2014 nothing fires automatically and there is no setting that changes that. Tokens are pasted at execution, never stored. POST/PUT/PATCH only; no DELETE, no payments, no irreversible action without a second confirmation.",
+         "Seats cannot propose writes. The council observes and advises only."],
         ["courierToggle", "rq_courier", "THE COURIER",
          "\u26A0 UNTRUSTED TEXT ENTERS SEAT CONTEXT. Seats may write [REQUEST_FETCH: url]; one fetch, one payload, delivered identically to all seats next round. Verbatim only \u2014 never summarised, never ranked. Works on CORS-open hosts; otherwise paste with window.__rqPaste(url, text). Tagged EXTERNAL-UNVERIFIED and can never reach VERIFIED alone. PILOT FEATURE: 20 rounds against stated kill criteria.",
          "No external fetching. Seats work from the ledger and the operator\u2019s prompt only."],
@@ -13730,6 +13769,502 @@ end $$;`;
     "offset the previous receipt reported. There is no dedicated search in this build, but any GET " +
     "API that takes query parameters is a sanctioned way to search through the URL.";
 
+  // ---------- Attachments ----------
+  // The drop zone, file input and attachment list have been in index.html since
+  // early on with NO code behind them. This is that code.
+  const RQ_ATT_MAX_CHARS   = 40000;   // total text across all attachments
+  const RQ_ATT_PER_FILE    = 20000;   // per file, before truncation is declared
+  const RQ_ATT_MAX_FILES   = 8;
+  const RQ_PDFJS = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js";
+  const RQ_PDFJS_WORKER = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+
+  let _attachments = [];   // {name, kind, chars, text, note}
+
+  function attIsText(f) {
+    return /\.(txt|md|markdown|log|csv|tsv|json|rst|yml|yaml|xml|html?|js|ts|py|java|c|cpp|h|sh|sql|ini|conf|toml)$/i.test(f.name)
+      || /^text\//i.test(f.type) || /json|xml|javascript/i.test(f.type);
+  }
+  function attIsPdf(f) { return /\.pdf$/i.test(f.name) || f.type === "application/pdf"; }
+  function attIsDocx(f) { return /\.docx$/i.test(f.name) || /wordprocessingml/i.test(f.type); }
+  // iOS frequently reports an EMPTY type for HEIC, so extension is checked first.
+  function attIsImage(f) {
+    return /\.(jpe?g|png|gif|webp|heic|heif|bmp|tiff?)$/i.test(f.name) || /^image\//i.test(f.type);
+  }
+
+  function attLoadScript(src) {
+    return new Promise((res, rej) => {
+      if (document.querySelector('script[src="' + src + '"]')) return res();
+      const s = document.createElement("script");
+      s.src = src; s.onload = () => res(); s.onerror = () => rej(new Error("failed to load " + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  // PDF: page numbers are preserved so a seat can cite a location rather than
+  // quoting into a void.
+  async function attReadPdf(file) {
+    await attLoadScript(RQ_PDFJS);
+    const lib = window.pdfjsLib;
+    if (!lib) throw new Error("pdf.js did not load");
+    try { lib.GlobalWorkerOptions.workerSrc = RQ_PDFJS_WORKER; } catch (_) {}
+    const buf = await file.arrayBuffer();
+    const doc = await lib.getDocument({ data: buf }).promise;
+    const out = [];
+    let chars = 0;
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const tc = await page.getTextContent();
+      const t = tc.items.map((x) => x.str).join(" ").replace(/\s+/g, " ").trim();
+      if (t) { out.push("[p." + i + "] " + t); chars += t.length; }
+      if (chars > RQ_ATT_PER_FILE) {
+        out.push("[TRUNCATED after page " + i + " of " + doc.numPages +
+          " at the " + RQ_ATT_PER_FILE + "-char per-file cap. The remainder is NOT summarised.]");
+        break;
+      }
+    }
+    if (!out.length) {
+      // A scanned PDF has no text layer. Saying so is the whole point — an
+      // empty extraction reported as an empty document would be a lie.
+      throw new Error("no text layer — this looks like a scanned PDF. The council cannot read images; " +
+        "paste the text or describe it.");
+    }
+    return out.join("\n\n");
+  }
+
+  // DOCX is a zip. Unpacked in-browser with the same library already used for
+  // spreadsheets elsewhere in the ecosystem; falls back to a raw scan.
+  async function attReadDocx(file) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    // Minimal inflate-free path: locate word/document.xml in the zip's stored
+    // entries. Most .docx are DEFLATE, so try DecompressionStream first.
+    try {
+      const ds = new DecompressionStream("deflate-raw");
+      const text = await attUnzipEntry(buf, "word/document.xml", ds);
+      if (text) return attStripDocxXml(text);
+    } catch (_) {}
+    throw new Error("could not unpack this .docx in the browser. Save it as .txt or paste the text.");
+  }
+  async function attUnzipEntry(bytes, wanted, _ds) {
+    // Local file headers: PK\x03\x04. Walk them and inflate the match.
+    for (let i = 0; i < bytes.length - 30; i++) {
+      if (bytes[i] !== 0x50 || bytes[i+1] !== 0x4b || bytes[i+2] !== 0x03 || bytes[i+3] !== 0x04) continue;
+      const method = bytes[i+8] | (bytes[i+9] << 8);
+      const compSize = bytes[i+18] | (bytes[i+19]<<8) | (bytes[i+20]<<16) | (bytes[i+21]<<24);
+      const nameLen = bytes[i+26] | (bytes[i+27] << 8);
+      const extraLen = bytes[i+28] | (bytes[i+29] << 8);
+      const name = new TextDecoder().decode(bytes.slice(i+30, i+30+nameLen));
+      const start = i + 30 + nameLen + extraLen;
+      if (name !== wanted) continue;
+      const data = bytes.slice(start, start + compSize);
+      if (method === 0) return new TextDecoder().decode(data);
+      const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      return await new Response(stream).text();
+    }
+    return null;
+  }
+  function attStripDocxXml(xml) {
+    return String(xml || "")
+      .replace(/<\/w:p>/g, "\n")
+      .replace(/<w:tab[^>]*\/>/g, "\t")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"')
+      .replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  // Images: measured, never read. See the header note.
+  function attReadImage(file) {
+    return new Promise((res) => {
+      try {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          const dims = img.naturalWidth + "\u00d7" + img.naturalHeight;
+          URL.revokeObjectURL(url);
+          res(dims);
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); res(null); };
+        img.src = url;
+      } catch (_) { res(null); }
+    });
+  }
+
+  async function attIngest(files) {
+    const list = Array.from(files || []);
+    if (!list.length) return;
+    for (const f of list) {
+      if (_attachments.length >= RQ_ATT_MAX_FILES) {
+        logError("[ATTACH] " + RQ_ATT_MAX_FILES + "-file limit reached; " + f.name + " was NOT added.");
+        continue;
+      }
+      try {
+        if (attIsImage(f)) {
+          const dims = await attReadImage(f);
+          _attachments.push({
+            name: f.name, kind: "image", chars: 0, text: null,
+            note: "image" + (dims ? ", " + dims : "") + ", " + Math.round(f.size / 1024) + "KB",
+          });
+          logError("\u26A0 [ATTACH] " + f.name + " attached as an IMAGE. The seats are text-only and " +
+            "CANNOT see it \u2014 it is recorded by name and size only. If its contents matter, describe " +
+            "them in your question or paste the text.");
+          continue;
+        }
+        let text = null;
+        if (attIsPdf(f)) text = await attReadPdf(f);
+        else if (attIsDocx(f)) text = await attReadDocx(f);
+        else if (attIsText(f)) text = await f.text();
+        else {
+          // Unknown type: try text, and if it looks binary, say so rather than
+          // attaching mojibake that a seat would try to read.
+          const t = await f.text();
+          if (/[\u0000-\u0008\u000E-\u001F]/.test(t.slice(0, 2000))) {
+            throw new Error("this looks like a binary file and has no readable text");
+          }
+          text = t;
+        }
+        let truncated = false;
+        if (text.length > RQ_ATT_PER_FILE) { text = text.slice(0, RQ_ATT_PER_FILE); truncated = true; }
+        _attachments.push({
+          name: f.name, kind: attIsPdf(f) ? "pdf" : attIsDocx(f) ? "docx" : "text",
+          chars: text.length, text: text,
+          note: Math.round(text.length / 1000) + "k chars" + (truncated ? ", TRUNCATED" : ""),
+        });
+        logError("[ATTACH] " + f.name + " \u2014 " + text.length + " chars extracted" +
+          (truncated ? " (TRUNCATED at " + RQ_ATT_PER_FILE + "; the remainder is NOT summarised)" : "") + ".");
+      } catch (e) {
+        // A failed read is announced, never silently skipped. A file the
+        // operator believes was attached and was not is the worst outcome here.
+        logError("\u2717 [ATTACH] " + f.name + " could NOT be read: " + ((e && e.message) || e) +
+          " \u2014 it was NOT attached and the seats will not see it.");
+      }
+    }
+    attRender();
+  }
+
+  function attRender() {
+    try {
+      const ul = document.getElementById("attachmentList");
+      if (!ul) return;
+      ul.innerHTML = "";
+      ul.classList.toggle("hidden", !_attachments.length);
+      _attachments.forEach((a, i) => {
+        const li = document.createElement("li");
+        li.className = "attachment-item" + (a.kind === "image" ? " is-unreadable" : "");
+        li.innerHTML = '<span class="att-name"></span><span class="att-note"></span>' +
+          '<button class="att-x" type="button" aria-label="Remove">\u00d7</button>';
+        li.querySelector(".att-name").textContent = a.name;
+        li.querySelector(".att-note").textContent =
+          a.kind === "image" ? "not readable by the seats \u2014 " + a.note : a.note;
+        li.querySelector(".att-x").addEventListener("click", () => {
+          _attachments.splice(i, 1); attRender();
+        });
+        ul.appendChild(li);
+      });
+      const label = document.getElementById("dropZoneLabel");
+      if (label) {
+        label.textContent = _attachments.length
+          ? _attachments.length + " attached \u2014 tap to add more"
+          : "Attach documents or photos \u2014 tap or drop";
+      }
+    } catch (_) {}
+  }
+
+  // What actually reaches the seats. Images are named as unreadable rather than
+  // omitted, so a seat knows something exists that it cannot see.
+  function attBlock() {
+    if (!_attachments.length) return "";
+    const readable = _attachments.filter((a) => a.text);
+    const unreadable = _attachments.filter((a) => !a.text);
+    let out = "", total = 0;
+    readable.forEach((a) => {
+      if (total >= RQ_ATT_MAX_CHARS) return;
+      let t = a.text;
+      if (total + t.length > RQ_ATT_MAX_CHARS) t = t.slice(0, RQ_ATT_MAX_CHARS - total);
+      total += t.length;
+      out += "\n\n[ATTACHED FILE: " + a.name + " | " + a.kind + " | " + t.length + " chars]\n" + t;
+    });
+    if (unreadable.length) {
+      out += "\n\n[ATTACHED BUT UNREADABLE \u2014 the operator attached " + unreadable.length +
+        " file(s) you CANNOT see: " + unreadable.map((a) => a.name + " (" + a.note + ")").join(", ") +
+        ". This council is text-only. Do not guess at their contents, and do not treat the filename as " +
+        "evidence of what they contain. If the answer depends on them, say so and ask the operator to " +
+        "describe or paste the relevant part.]";
+    }
+    return out;
+  }
+  function attClear() { _attachments = []; attRender(); }
+
+  (function wireAttachments() {
+    try {
+      const zone = document.getElementById("dropZone");
+      const input = document.getElementById("fileInput");
+      if (!zone || !input) return;
+      // v4.27.0 — MOBILE. The old accept list (.txt,.md,.log,.csv,.json) meant
+      // Android and iOS filtered the picker so hard that the photo library and
+      // camera were unreachable. Broadened, and iOS reports an empty MIME type
+      // for HEIC often enough that extensions are listed explicitly.
+      input.setAttribute("accept",
+        ".txt,.md,.markdown,.log,.csv,.tsv,.json,.rst,.yml,.yaml,.xml,.html,.pdf,.docx," +
+        ".jpg,.jpeg,.png,.gif,.webp,.heic,.heif,text/*,application/pdf," +
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/*");
+      input.setAttribute("multiple", "multiple");
+      zone.addEventListener("click", () => input.click());
+      zone.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
+      });
+      input.addEventListener("change", () => { attIngest(input.files); input.value = ""; });
+      ["dragover", "dragenter"].forEach((ev) => zone.addEventListener(ev, (e) => {
+        e.preventDefault(); zone.classList.add("is-drag");
+      }));
+      ["dragleave", "drop"].forEach((ev) => zone.addEventListener(ev, (e) => {
+        e.preventDefault(); zone.classList.remove("is-drag");
+      }));
+      zone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        if (e.dataTransfer && e.dataTransfer.files) attIngest(e.dataTransfer.files);
+      });
+      // Paste an image or text straight into the question box — the fastest
+      // path on desktop and the only one on some mobile browsers.
+      const qi = document.getElementById("queryInput");
+      if (qi) qi.addEventListener("paste", (e) => {
+        try {
+          const items = (e.clipboardData && e.clipboardData.files) || [];
+          if (items.length) attIngest(items);
+        } catch (_) {}
+      });
+      attRender();
+    } catch (_) {}
+  })();
+  try { window.__rqAttachments = () => _attachments.map((a) => ({ name: a.name, kind: a.kind, chars: a.chars })); } catch (_) {}
+
+  // ---------- The Write Courier v1 (rq_write_courier, default OFF) ----------
+  // Council round 50, DIVIDED. Two specs arrived; this builds the Claude seat's.
+  //
+  // ⚠ NOT BUILT, AND NOT DEFERRED — DECLINED. The Gemini seat's §2.2:
+  //
+  //     "Tier 2 (Bounded Autonomy): Pre-approved write scopes execute
+  //      automatically upon consensus."
+  //
+  // That is autonomous mutation of external state with no human present, and it
+  // contradicts the doctrine every feature here has been built to. The R-P7-10
+  // amendment moved consent from pre-dispatch to pre-influence rather than
+  // removing it. Auto-dispatched rounds are barred from retrieval until a human
+  // reviews them. The fiat retro patch is operator-run. A council that may not
+  // enter its OWN MEMORY unreviewed must not POST to the open internet
+  // unattended.
+  //
+  // The same spec's token storage is declined for the same reason: a leaked
+  // read key exposes data, a leaked write token lets someone act as the
+  // operator.
+  //
+  // The Claude seat's governing sentence is the design instead:
+  //
+  //     "No write auto-fires. The user is the final signature, the council is
+  //      the drafting committee."
+  const RQ_WR_MAX_PAYLOAD = 8000;
+  const RQ_WR_TIMEOUT_MS  = 8000;
+  // GET is deliberately ABSENT: a read is not a write, and routing one through
+  // this gate would put a harmless fetch behind a VERIFIED 3/3 requirement while
+  // teaching seats that the two are the same kind of act. Reads go to the read
+  // Courier, which is GET-only by design.
+  const RQ_WR_RE = /\[WRITE_REQUEST:\s*(POST|PUT|PATCH)\s+(https:\/\/[^\s|\]]{6,400})\s*(?:\|\s*payload\s*=\s*([\s\S]{0,8000}?))?\s*(?:\|\s*idempotency-key\s*=\s*([\w-]{1,64}))?\s*\]/i;
+
+  // DELETE is absent from the grammar above by design, not oversight. The spec
+  // puts destructive operations out of scope for this phase, and a method that
+  // cannot be expressed cannot be proposed.
+  const RQ_WR_FORBIDDEN_HOST = /(?:stripe|paypal|squareup|coinbase|binance|plaid|venmo)\./i;
+
+  function writeCourierEnabled() { return localStorage.getItem("rq_write_courier") === "on"; }
+
+  let _wrProposal = null;   // the manifest awaiting confirmation, if any
+
+  // Parsed from the round's answers. A proposal is only ever a PROPOSAL — it
+  // reaches nothing until the gate and the operator both pass it.
+  function wrScanProposal(answers, roundTrust, agreedSeats) {
+    if (!writeCourierEnabled()) return null;
+    try {
+      for (const a of (answers || [])) {
+        const m = RQ_WR_RE.exec(String((a && a.text) || ""));
+        if (!m) continue;
+        const method = m[1].toUpperCase();
+        const url = m[2].trim();
+        const payload = (m[3] || "").trim();
+        const idem = m[4] || null;
+        const prop = {
+          seat: a.name, method: method, url: url, payload: payload,
+          idempotency: idem, proposed_at: new Date().toISOString(),
+          // The tally AT PROPOSAL TIME. Re-checked before dispatch; if it has
+          // moved, the write is refused. This is the Claude seat's own
+          // falsifier, enforced rather than trusted.
+          tally: { trust: roundTrust || "unknown", agreed: (agreedSeats || []).slice() },
+          digest: ftDigest(method + "\n" + url + "\n" + payload),
+        };
+        // Gate 1: consensus. VERIFIED 3/3 only.
+        const full = String(roundTrust) === "verified" && (agreedSeats || []).length >= 3;
+        if (!full) {
+          logError("\u25C7 [WRITE] proposal REJECTED at the consensus gate \u2014 " + method + " " +
+            clip(url, 70) + ". This round is " + String(roundTrust).toUpperCase() +
+            " with " + ((agreedSeats || []).length) + " agreeing seat(s); a write requires VERIFIED 3/3. " +
+            "Writes are not idempotent, so the read courier's fetch-anytime privilege does not transfer. " +
+            "WRITE_REJECTED \u2014 no network call was made.");
+          return null;
+        }
+        // Gate 2: scope. Refused before the operator is ever asked, so a
+        // forbidden target never reaches a confirmation dialog where a tired
+        // operator might wave it through.
+        if (RQ_WR_FORBIDDEN_HOST.test(url)) {
+          logError("\u2717 [WRITE] proposal REFUSED \u2014 " + clip(url, 70) + " looks like a payments or " +
+            "financial endpoint, which is out of scope for this architecture phase. WRITE_REJECTED.");
+          return null;
+        }
+        if (payload.length > RQ_WR_MAX_PAYLOAD) {
+          logError("\u2717 [WRITE] proposal REFUSED \u2014 payload is " + payload.length + " chars, over the " +
+            RQ_WR_MAX_PAYLOAD + " cap. WRITE_REJECTED.");
+          return null;
+        }
+        _wrProposal = prop;
+        logError("\u25C6 [WRITE] PROPOSAL AWAITING YOU \u2014 " + method + " " + clip(url, 80) +
+          ", proposed by " + seatLabel(a.name) + ", authorised by VERIFIED 3/3. " +
+          "NOTHING HAS BEEN SENT. Review it with window.__rqWriteReview(), then " +
+          "window.__rqWriteConfirm(\"<token or empty>\") to execute. The council drafted this; " +
+          "you are the signature.");
+        return prop;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // Plain language, because a manifest nobody reads is a rubber stamp.
+  function wrReview() {
+    if (!_wrProposal) { logError("[WRITE] no proposal pending."); return null; }
+    const p = _wrProposal;
+    let host = p.url;
+    try { host = new URL(p.url).host; } catch (_) {}
+    const reversible = /\/(issues|comments|gists|drafts)\b/i.test(p.url) || p.method === "PATCH";
+    logError(
+      "\u2500\u2500 WRITE PROPOSAL \u2500\u2500\n" +
+      "The council wants to send a " + p.method + " request to " + host + ".\n" +
+      "Full URL: " + p.url + "\n" +
+      "Proposed by: " + seatLabel(p.seat) + " | authorised by: " + p.tally.trust.toUpperCase() +
+        " (" + p.tally.agreed.length + " seats)\n" +
+      "Payload (" + p.payload.length + " chars): " + (p.payload ? clip(p.payload, 600) : "(none)") + "\n" +
+      "Manifest digest: " + p.digest + "\n" +
+      (reversible
+        ? "Reversibility: this target looks undoable (the thing created can be closed or deleted afterwards)."
+        : "\u26A0 REVERSIBILITY: NO UNDO PATH IS KNOWN for this target. If it succeeds, it may not be " +
+          "possible to take back. Confirming requires window.__rqWriteConfirm(token, { irreversible: true }).") +
+      "\nNothing has been sent. This proposal expires when the next round begins.");
+    return p;
+  }
+
+  // The operator signs. Token is a parameter, never read from storage and never
+  // returned to a caller.
+  async function wrConfirm(token, opts) {
+    if (!writeCourierEnabled()) { logError("[WRITE] the Write Courier is off."); return null; }
+    const p = _wrProposal;
+    if (!p) { logError("[WRITE] no proposal pending. Nothing to confirm."); return null; }
+    const o = opts || {};
+    let host = p.url;
+    try { host = new URL(p.url).host; } catch (_) {}
+    const reversible = /\/(issues|comments|gists|drafts)\b/i.test(p.url) || p.method === "PATCH";
+    if (!reversible && !o.irreversible) {
+      logError("\u2717 [WRITE] REFUSED \u2014 no undo path is known for " + host + ", so this needs the " +
+        "second confirmation the spec requires: window.__rqWriteConfirm(token, { irreversible: true }). " +
+        "The fact that it cannot be undone is being told to you BEFORE execution, not discovered after. " +
+        "WRITE_REJECTED.");
+      return null;
+    }
+    // THE ATOMICITY CHECK. The Claude seat's falsifier, enforced: if the round
+    // that authorised this is no longer the latest, or its verdict has moved,
+    // the authorisation is stale and the write does not fire.
+    try {
+      const last = (ledger || [])[(ledger || []).length - 1];
+      const stillVerified = last && last.outcome === "verified";
+      if (!stillVerified) {
+        logError("\u2717 [WRITE] REFUSED \u2014 the authorising consensus is no longer the current verdict. " +
+          "A vote that can be re-tallied after the write fires would make the safety model illusory, " +
+          "which is the seat's own stated falsifier for this design. WRITE_REJECTED.");
+        _wrProposal = null;
+        return null;
+      }
+    } catch (_) {}
+    const started = Date.now();
+    let status = null, ok = false, reason = null, bodyDigest = null;
+    try {
+      const ctl = new AbortController();
+      const kill = setTimeout(() => ctl.abort(), RQ_WR_TIMEOUT_MS);
+      const headers = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = "Bearer " + token;
+      if (p.idempotency) headers["Idempotency-Key"] = p.idempotency;
+      const res = await fetch(p.url, {
+        method: p.method, headers: headers, credentials: "omit",
+        body: p.payload || undefined, signal: ctl.signal,
+      });
+      clearTimeout(kill);
+      status = res.status;
+      ok = res.ok;
+      const body = await res.text().catch(() => "");
+      bodyDigest = ftDigest(body);
+      if (!ok) reason = "http_" + res.status;
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      reason = /abort/i.test(msg) ? "timeout"
+             : /Content Security Policy/i.test(msg) ? "csp_blocked"
+             : "cors_or_network";
+    } finally {
+      // The token is a parameter and dies with the call. It was never stored,
+      // never logged, and never placed in a prompt.
+      token = null;
+    }
+    const outcome = ok ? "WRITE_OK" : (reason && /csp|cors|timeout/.test(reason) ? "WRITE_BLOCKED" : "WRITE_BLOCKED");
+    const receipt =
+      "[WRITE_RECEIPT] outcome=" + outcome + " | method=" + p.method + " | host=" + host +
+      " | http=" + (status == null ? "none" : status) +
+      (reason ? " | reason=" + reason : "") +
+      " | response_digest=" + (bodyDigest || "n/a") +
+      " | manifest_digest=" + p.digest +
+      " | authorised_by=" + p.tally.trust + "(" + p.tally.agreed.length + " seats: " +
+        p.tally.agreed.map(seatLabel).join(",") + ")" +
+      " | proposed_by=" + p.seat +
+      " | elapsed_ms=" + (Date.now() - started) +
+      " | at=" + new Date().toISOString();
+    logError((ok ? "\u2713 " : "\u2717 ") + receipt +
+      (outcome === "WRITE_BLOCKED" && /cors/.test(String(reason))
+        ? " \u2014 ENVIRONMENTAL, not a council failure: most authenticated APIs reject cross-origin " +
+          "writes at preflight regardless of credentials."
+        : ""));
+    try {
+      const log = JSON.parse(localStorage.getItem("rq_write_log") || "[]");
+      log.push({ receipt: receipt, ok: ok, at: Date.now() });
+      localStorage.setItem("rq_write_log", JSON.stringify(log.slice(-100)));
+    } catch (_) {}
+    _wrProposal = null;
+    return { outcome: outcome, status: status, receipt: receipt };
+  }
+
+  function wrCancel() {
+    if (!_wrProposal) { logError("[WRITE] no proposal pending."); return false; }
+    logError("[WRITE] WRITE_REJECTED by the operator \u2014 proposal discarded, no network call was made.");
+    _wrProposal = null;
+    return true;
+  }
+
+  // Told to the seats only when the channel is armed.
+  const RQ_WR_INSTRUCTION =
+    "You may PROPOSE a write with [WRITE_REQUEST: <METHOD> <https URL> | payload=<JSON> | " +
+    "idempotency-key=<uuid>], methods POST/PUT/PATCH only. A proposal is not an action: it requires " +
+    "VERIFIED 3/3 agreement in this round, and then the OPERATOR must review and confirm it by hand. " +
+    "Nothing fires automatically, ever. State a falsifier for the action itself \u2014 what observed " +
+    "outcome would mean the write was wrong \u2014 so the council can judge itself against its own " +
+    "prediction rather than rationalising afterwards. DELETE, payments and anything with no undo path " +
+    "are out of scope.";
+
+  try {
+    window.__rqWriteReview = wrReview;
+    window.__rqWriteConfirm = wrConfirm;
+    window.__rqWriteCancel = wrCancel;
+    window.__rqWriteLog = () => { try { return JSON.parse(localStorage.getItem("rq_write_log") || "[]"); } catch (_) { return []; } };
+  } catch (_) {}
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -13961,6 +14496,7 @@ end $$;`;
         _coBlock +
         (_coBlock ? ("\n\n" + RQ_CO_STANDING) : "") +
         (courierEnabled() ? ("\n\n" + RQ_CO_INSTRUCTION) : "") +
+        (writeCourierEnabled() ? ("\n\n" + RQ_WR_INSTRUCTION) : "") +
         // RDSR — same after-composition seam, so the prompt hash stays clean.
         // Suppressed on note/indexical/falsifier-test rounds, which are not
         // positions and have nothing to attack.
@@ -13994,6 +14530,12 @@ end $$;`;
         // Resolve BEFORE depositing, so a falsifier stated in this same round
         // cannot be marked resolved by the trigger that preceded it.
         try { coScanRequests(allAnswers); } catch (_) {}
+        // WRITE COURIER — scanned with the ACTUAL verdict and agreeing set, so
+        // the consensus gate reads real state rather than a seat's claim about it.
+        try {
+          wrScanProposal(allAnswers, divided ? "divided" : (result.trust || "unknown"),
+            (result._agreed || []).map((x) => x && x.name).filter(Boolean));
+        } catch (_) {}
         try { reckResolve(allAnswers, _reckHits); } catch (_) {}
         try { await reckDeposit(allAnswers, (ledger || []).length + 1); } catch (_) {}
         // v4.20.0 — the question the pass exists to answer.
@@ -14376,7 +14918,10 @@ end $$;`;
 
   sendBtn.addEventListener("click", () => {
     const q = queryInput.value.trim();
-    if (!q) return;
+    // v4.27.0 — a question is now valid if EITHER text or an attachment is
+    // present. Requiring text meant an operator who attached a document and
+    // pressed send got silence with no explanation.
+    if (!q && !_attachments.length) return;
     queryInput.value = "";
     // v2.2 UI package (K3 Swarm spec §3). Setting .value in code does NOT fire an
     // input event, so ui-plus.js's char counter and auto-grow textarea would stay
@@ -14384,7 +14929,14 @@ end $$;`;
     // ui-plus.js is absent — nothing is listening.
     try { queryInput.dispatchEvent(new Event("input", { bubbles: true })); } catch (_) {}
     closeSheet();
-    dispatch(q);
+    const _att = attBlock();
+    if (_att) {
+      logError("[ATTACH] sending " + _attachments.length + " attachment(s), " + _att.length +
+        " chars, in the composed prompt. They are cleared after this round \u2014 attachments do not " +
+        "persist into later rounds unless re-attached.");
+    }
+    dispatch((q || "(see attached)") + _att);
+    attClear();
   });
 
   queryInput.addEventListener("keydown", (e) => {
@@ -14515,6 +15067,9 @@ end $$;`;
         "model that actually produced it, captured at ANSWER time before adjudication can overwrite it. " +
         "A proxy answer renders in seat memory as \"<model>, speaking for <seat>\", never under the seat " +
         "name. Agreement among proxies alone caps the round at PROVISIONAL.");
+      logError(writeCourierEnabled()
+        ? "\u25C6 [WRITE] Write Courier v1 ON \u2014 seats may PROPOSE a write; it requires VERIFIED 3/3 and then your typed confirmation. NOTHING FIRES AUTOMATICALLY and no setting creates an autonomous path. Review with window.__rqWriteReview(), sign with window.__rqWriteConfirm(token). Tokens live for one call and are never stored. Most authenticated APIs will still refuse a cross-origin write at preflight \u2014 that is WRITE_BLOCKED and environmental, not a council failure."
+        : "[WRITE] Write Courier OFF \u2014 the council observes and advises; it cannot act.");
       logError(courierEnabled()
         ? "\u25C6 [COURIER] Delegate fetch ON \u2014 seats may request a URL; one fetch, one payload, byte-identical to every seat, delivered next round. VERBATIM ONLY: nothing is summarised, ranked, or resolved \u2014 courier, not analyst. Direct fetch works on CORS-open hosts; everything else returns NOT DELIVERED with a reason and can be pasted via window.__rqPaste(url, text). No search and no relay in this build. \u26A0 This is the first feature that puts UNTRUSTED text in seat context; it is a 20-round pilot with stated kill criteria."
         : "[COURIER] Delegate fetch OFF.");
