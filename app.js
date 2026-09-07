@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.31.3-export-fulltext";
+  const RQ_BUILD = "v4.31.4-export-speaker";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -14620,13 +14620,27 @@ end $$;`;
     let positions = e.positions || [];
     let spokenFull = null;
     let hydrated = false;
+    let guessedLead = false;
     try {
       const ft = await readFullText(e.t);
       if (ft) {
         hydrated = true;
         positions = positions.map((p) => ({ seat: p.seat, text: (ft[p.seat] || p.text) }));
-        const lead = (e.speaker && ft[e.speaker]) || null;
-        spokenFull = lead || null;
+        // Prefer the recorded speaker. For rounds stored before v4.31.4 there
+        // is no speaker field, so fall back to the LONGEST stored position —
+        // on a consensus round the spoken text is one seat's answer verbatim,
+        // and the longest stored text is the best available guess at which.
+        // Marked as a guess in the file rather than presented as certain.
+        const named = e.speaker && ft[e.speaker];
+        if (named) { spokenFull = named; }
+        else {
+          let best = null;
+          Object.keys(ft).forEach((k) => {
+            const v = String(ft[k] || "");
+            if (!best || v.length > best.length) best = v;
+          });
+          if (best && best.length > 200) { spokenFull = best; guessedLead = true; }
+        }
       }
     } catch (_) {}
     const seats = positions.map((p) => p.seat);
@@ -14678,7 +14692,11 @@ end $$;`;
       ? "\n\n---\n\u26A0 TRUNCATED: the full-text store had no record for this round, so the body above " +
         "is the ledger's 600-character summary, not the complete answer. Turn on FULL-TEXT LEDGER to " +
         "keep verbatim responses for future rounds.\n"
-      : "";
+      : (guessedLead
+        ? "\n\n---\nNOTE: this round predates speaker recording, so the longest stored seat response was " +
+          "used as the spoken text. It is verbatim and complete, but which seat spoke is INFERRED rather " +
+          "than recorded. Rounds from this build forward record the speaker explicitly.\n"
+        : "");
     const agreeing = (e.counts || "").split("/")[0];
     out.push({
       name: "[" + tag + "] " + slug + ".md",
@@ -14815,7 +14833,12 @@ end $$;`;
       wrap.appendChild(label);
       const row = document.createElement("div");
       row.className = "ap-row";
-      [["Markdown", "md"], ["Word", "docx"], ["Text", "txt"]].forEach(([txt, fmt]) => {
+      // v4.31.4 — "Copy" replaces "Word" as the middle option. A .docx does open
+      // in Google Docs, but only after downloading, uploading to Drive and
+      // converting — three steps on a phone. The operator does not have Word.
+      // Clipboard goes straight into a Google Doc in one paste, which is the
+      // actual destination. Word is still available via __rqExportDocx().
+      [["Markdown", "md"], ["Copy", "clip"], ["Text", "txt"]].forEach(([txt, fmt]) => {
         const b = document.createElement("button");
         b.type = "button";
         b.className = "ap-btn";
@@ -14830,8 +14853,20 @@ end $$;`;
             // reflect the round as stored rather than a snapshot taken before
             // storage settled.
             const files = await artBuild(e);
-            files.forEach((f) => artDownload(f.name, f.body, fmt));
-            b.textContent = "Saved \u2713";
+            if (fmt === "clip") {
+              // Multiple files are joined with a rule between them rather than
+              // silently concatenated, so a parallel round's separate positions
+              // stay visibly separate after a paste.
+              const joined = files.map((f) => f.body).join("\n\n" + "\u2500".repeat(40) + "\n\n");
+              await navigator.clipboard.writeText(joined);
+              b.textContent = "Copied \u2713";
+              logError("[ARTIFACT] " + joined.length + " chars copied to the clipboard" +
+                (files.length > 1 ? " (" + files.length + " positions, separated by a rule)" : "") +
+                ". Paste straight into a Google Doc \u2014 no download, no upload, no conversion.");
+            } else {
+              files.forEach((f) => artDownload(f.name, f.body, fmt));
+              b.textContent = "Saved \u2713";
+            }
           } catch (err) {
             b.textContent = "Failed";
             logError("[ARTIFACT] export failed: " + ((err && err.message) || err));
@@ -15222,6 +15257,12 @@ end $$;`;
           outcome: divided ? "divided" : (result.trust || "unknown"),
           counts: result.agreedCount != null ? `${result.agreedCount}/${result.eligibleCount}` : "",
           verdict: divided ? null : clip(result.text, 600),
+          // v4.31.4 — the export needs to know WHICH seat spoke, or it cannot
+          // find that seat's verbatim text in the full-text store. v4.31.3 read
+          // `e.speaker`, which was never written — so hydration silently failed
+          // and every export fell back to the 600-char clip above. The fix was
+          // reading a field that did not exist.
+          ...(result && result.speakerSeat ? { speaker: result.speakerSeat } : {}),
           // v3.5.4: positions are now recorded on EVERY round, not only divided
           // ones. Previously a consensus round kept only the speaking seat's
           // text, so the ledger — and the embedded corpus built from it —
