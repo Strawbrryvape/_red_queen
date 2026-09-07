@@ -442,7 +442,11 @@ body:has(.consensus-bar.divided) {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  padding: 96px 20px calc(48px + env(safe-area-inset-bottom));
+  /* v4.31.2 — bottom reserve raised 48px -> 96px. The fixed MEMORY ON / FORGET
+     bar sits over this scroll container, and 48px did not clear it: seat text
+     rendered underneath and was unreadable on a phone. The safe-area inset is
+     added on top because on iOS the home indicator sits below the bar again. */
+  padding: 96px 20px calc(96px + env(safe-area-inset-bottom, 0px));
 }
 
 
@@ -568,10 +572,38 @@ body:has(.consensus-bar.divided) {
 /* ---------- THE VERDICT ALTAR (CONSENSUS BAR) ---------- */
 
 .consensus-wrap {
+  /* v4.31.2 — THE MOBILE TWO-COLUMN DEFECT, fixed at its source.
+     This was display:flex with no direction, so it defaulted to a ROW. Every
+     panel that inserts after #consensusBar — the divided transcript, the
+     artifact export panel, the stage indicator — became a sibling FLEX ITEM
+     and sat BESIDE the answer rather than below it. On a 390px viewport that
+     squeezed seat text to roughly four words per line.
+     One property fixes all of it, and fixes anything inserted there later. */
   display: flex;
+  flex-direction: column;
+  align-items: center;
   justify-content: center;
   padding: 24px 0;
   position: relative; /* v4.0: anchor for SOLE halo ::before (R10) */
+}
+
+/* Children stretch to the column width rather than shrinking to content —
+   without this, align-items:center would leave every panel at its intrinsic
+   width and the transcript would still be narrow. */
+.consensus-wrap > #dividedPanel,
+.consensus-wrap > #rqArtPanel,
+.consensus-wrap > #rqWritePanel,
+.consensus-wrap > #rqStage {
+  align-self: stretch;
+  width: 100%;
+  min-width: 0;          /* lets long words wrap instead of forcing overflow */
+}
+
+/* Defect 4 — a floor on readable width, so a future layout change cannot
+   squeeze the transcript like this again without visibly breaking instead. */
+#dividedPanel .divided-card {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* v2.2 architecture preserved (28px radius, blur, overflow hidden, min-height,
@@ -1953,4 +1985,33 @@ body:has(.agent.consensus) .consensus-bar {
 @media (max-width: 600px) {
   .rq-art-panel { font-size: 0.84em; padding: 12px; }
   .rq-art-panel .ap-btn { padding: 13px 8px; }   /* thumb target */
+}
+
+
+/* ==========================================================================
+   v4.31.2 — MOBILE OCCLUSION AND PANEL HEIGHT
+
+   Defect 2: the MEMORY ON / FORGET bar is fixed over the scroll container,
+   which had no bottom padding, so seat text rendered underneath it and was
+   unreadable. The reserve is bar height plus the safe-area inset, since on
+   iOS the home indicator sits below the bar again.
+
+   Defect 3: the export panel had large dead space beneath its buttons — it
+   was a stretched flex item inheriting the row's height. With the column fix
+   above it collapses to content, and this makes that explicit.
+   ========================================================================== */
+.rq-art-panel,
+.rq-write-panel {
+  align-self: stretch;
+  height: auto;          /* never inherit a stretched row height */
+  flex: 0 0 auto;        /* collapse to content, do not grow */
+}
+
+@media (max-width: 640px) {
+  /* Explicit at the breakpoint too, so the stack survives any future rule
+     that reintroduces a row above this width. */
+  .consensus-wrap { flex-direction: column; }
+  .consensus-wrap > * { width: 100%; min-width: 0; }
+  .canvas { padding-bottom: calc(104px + env(safe-area-inset-bottom, 0px)); }
+  #dividedPanel .divided-card { padding: 12px 14px; }
 }
