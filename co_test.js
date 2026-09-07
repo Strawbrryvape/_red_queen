@@ -188,5 +188,29 @@ tt("if the equivalent also fails, the ORIGINAL failure is what is reported",
 tt("a hard failure gives the operator the exact paste command",
    /window\.__rqPaste\(\\"" \+ f\.url/.test(src));
 
+console.log("\n--- v4.31.0: reaching the rest of the web ---");
+tt("gist -> API", /api\.github\.com\/gists/.test(coRewrite("https://gist.github.com/x/abc123def")));
+tt("pypi -> json", /pypi\.org\/pypi\/.*\/json/.test(coRewrite("https://pypi.org/project/requests/")));
+tt("crates.io -> API", /api\/v1\/crates/.test(coRewrite("https://crates.io/crates/serde")));
+tt("huggingface model -> API", /api\/models/.test(coRewrite("https://huggingface.co/meta/llama")));
+tt("a hard paywall gets NO rewrite rather than a broken one",
+   coRewrite("https://www.nytimes.com/2026/01/01/x.html") === null);
+
+console.log("\n--- the read proxy is opt-in and declares itself ---");
+tt("it defaults OFF", /localStorage\.getItem\("rq_courier_proxy"\) === "on"/.test(src));
+tt("the privacy cost is stated, not buried",
+   /THE URL IS SENT TO A THIRD PARTY/.test(src) && /privacy cost, not a key-exposure one/.test(src));
+tt("it only runs after a direct read was refused",
+   /if \(!\/cors_or_network\|http_40\[0-9\]\/\.test\(String\(firstFailure\.reason/.test(src));
+tt("a proxied read is DECLARED on the receipt",
+   /VIA_THIRD_PARTY_PROXY=r\.jina\.ai/.test(src) &&
+   /one more link from the source than a direct fetch/.test(src));
+tt("the receipt still names the URL the SEAT asked for",
+   /r\.url = url;\s*\/\/ the receipt names what the seat ASKED for/.test(src));
+tt("if the proxy also fails, the ORIGINAL failure is reported",
+   /the read proxy also failed/.test(src));
+tt("the dependency risk is acknowledged in source",
+   /can go down, rate-limit, or start\s+\/\/\s+charging|degrades to direct\+paste/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
