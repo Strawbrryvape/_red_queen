@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.31.0-courier-proxy";
+  const RQ_BUILD = "v4.31.1-gemini-38";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -411,6 +411,14 @@
     }
     if (p === "groq") return "Groq: Llama 3.3";
     if (p === "cerebras") return "Cerebras: " + CEREBRAS_MODEL_LABEL;
+    // v4.31.1 — the Gemini seat walks a model chain, so a fixed label can name
+    // a model that is not answering. _geminiModelOk holds whichever entry
+    // actually responded this session; the constant is only the fallback for
+    // before the first successful call. Same lesson as the build stamp: a label
+    // that cannot go stale beats one that is merely correct today.
+    if (name === "gemini" && _geminiModelOk) {
+      return "Gemini " + String(_geminiModelOk).replace(/^gemini-/, "").replace(/-flash$/, " Flash");
+    }
     return PRIMARY_MODEL_LABELS[name] || "primary";
   }
 
@@ -756,7 +764,13 @@
   // the seat degraded rather than failing — but a hardcoded list will keep
   // expiring, and the honest read is that this needs a periodic check, not a
   // better guess.
-  const GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash"];
+  // v4.31.1 — 3.8 added at the head, 2026-09-06. The chain is ORDERED and
+  // self-healing: a 404 (retired, or not enabled on this key) advances to the
+  // next entry and the working model is cached for the session. So if 3.8 is
+  // not live on the operator's key yet, the seat silently falls to 3.6 and the
+  // round is unaffected — which is why a new model can go in without waiting
+  // to confirm access first.
+  const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash"];
   let _geminiModelOk = null;   // session cache of the first entry that answered
   // ---- Gemini seat. Three layers, added in response to three separate live
   // failures; the history is kept because each one explains a guard that would
