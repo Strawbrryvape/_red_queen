@@ -115,6 +115,31 @@ tt("no merge step or generative call in the export path",
 tt("docx is real OOXML", /word\/document\.xml/.test(src) && /\[Content_Types\]\.xml/.test(src));
 tt("flag defaults OFF", /localStorage\.getItem\("rq_artifacts"\) === "on"/.test(src));
 
+console.log("\n--- v4.31.4: the speaker field the export was reading did not exist ---");
+tt("the ledger now stores the speaking seat",
+   /result && result\.speakerSeat \? \{ speaker: result\.speakerSeat \}/.test(src));
+tt("and the defect is named: it read a field that was never written",
+   /reading a field that did not exist/.test(src));
+tt("older rounds fall back to the longest stored response",
+   /longest stored/.test(src) && /guessedLead = true/.test(src));
+tt("and the inference is DISCLOSED in the file, not presented as recorded",
+   /INFERRED rather\s+\/\/|which seat spoke is INFERRED/.test(src));
+FT = { gemini:"SHORT", kimi:"THE_LONGEST_STORED_RESPONSE_"+"y".repeat(400), claude:"MID" };
+const g = (await artBuild({t:1,prompt:"q",outcome:"verified",counts:"3/3",verdict:"clip",
+  positions:[{seat:"gemini",text:"a"},{seat:"kimi",text:"b"},{seat:"claude",text:"c"}]}))[0].body;
+tt("a speakerless round still exports the full verbatim text",
+   g.includes("THE_LONGEST_STORED_RESPONSE_") && g.length > 400);
+tt("and says the speaker was inferred", /INFERRED rather than recorded/.test(g));
+
+console.log("\n--- Copy replaces Word for the Google Docs path ---");
+tt("the middle button is Copy", /\["Copy", "clip"\]/.test(src));
+tt("clipboard writes the joined body", /navigator\.clipboard\.writeText\(joined\)/.test(src));
+tt("multiple positions are separated by a visible rule, not concatenated",
+   /join\("\\n\\n" \+ "\\u2500"\.repeat\(40\)/.test(src));
+tt("Word is still reachable", /window\.__rqExportDocx/.test(src));
+tt("the reason for the swap is documented",
+   /three steps on a phone|does not have Word/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
 })();
