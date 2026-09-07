@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.31.1-gemini-38";
+  const RQ_BUILD = "v4.31.3-export-fulltext";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -14603,9 +14603,32 @@ end $$;`;
   }
 
   // Returns [{name, body}] — one entry per file the verdict calls for.
-  function artBuild(e) {
+  // v4.31.3 — THE 600-CHAR TRUNCATION. The ledger stores
+  // `verdict: clip(result.text, 600)` — a summary for the TIMELINE, not the
+  // answer. The export read that field, so every VERIFIED artifact was cut at
+  // 600 characters while the full text sat in IndexedDB untouched.
+  //
+  // A truncated export is worse than a missing one: it looks complete. The file
+  // ends mid-sentence with no marker, and a reader downstream of the operator
+  // has no way to know anything was lost.
+  //
+  // artBuild is now async and hydrates from the full-text store, falling back to
+  // the clip ONLY when F1 is off or the row has aged out — and saying so in the
+  // file when it does, rather than silently shipping a fragment.
+  async function artBuild(e) {
     const tag = artTag(e);
-    const positions = e.positions || [];
+    let positions = e.positions || [];
+    let spokenFull = null;
+    let hydrated = false;
+    try {
+      const ft = await readFullText(e.t);
+      if (ft) {
+        hydrated = true;
+        positions = positions.map((p) => ({ seat: p.seat, text: (ft[p.seat] || p.text) }));
+        const lead = (e.speaker && ft[e.speaker]) || null;
+        spokenFull = lead || null;
+      }
+    } catch (_) {}
     const seats = positions.map((p) => p.seat);
     const title = clip(String(e.prompt || "round").replace(/\s+/g, " ").trim(), 60);
     const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "round";
@@ -14638,12 +14661,29 @@ end $$;`;
     }
 
     // VERIFIED / PROVISIONAL / SOLE / RESOLVED — one file, speaking seat verbatim.
-    const spoken = e.verdict || (positions[0] && positions[0].text) || "";
+    // Prefer the speaking seat's VERBATIM text; fall back to the 600-char
+    // ledger clip only if nothing better exists, and mark it when that happens.
+    let spoken = spokenFull;
+    if (!spoken) {
+      const lead = positions.find((p) => p.seat === e.speaker);
+      spoken = (lead && lead.text) || (positions[0] && positions[0].text) || e.verdict || "";
+    }
+    // Fires on ANY un-hydrated build. The ledger's `positions` are clipped for
+    // the timeline exactly as `verdict` is, so falling back to either one still
+    // ships a fragment — the earlier check only caught the verdict path and let
+    // the positions path through silently, which is the same defect one branch
+    // over.
+    const clipped = !hydrated;
+    const truncNote = clipped
+      ? "\n\n---\n\u26A0 TRUNCATED: the full-text store had no record for this round, so the body above " +
+        "is the ledger's 600-character summary, not the complete answer. Turn on FULL-TEXT LEDGER to " +
+        "keep verbatim responses for future rounds.\n"
+      : "";
     const agreeing = (e.counts || "").split("/")[0];
     out.push({
       name: "[" + tag + "] " + slug + ".md",
       body: prov + artHeader(e, tag, title) +
-        String(spoken) +
+        String(spoken) + truncNote +
         artSignature(e, seats) +
         (agreeing && seats.length && String(agreeing) !== String(seats.length)
           ? "\nNOTE: " + agreeing + " of " + seats.length + " seats agreed. The seats not listed as " +
@@ -14737,16 +14777,16 @@ end $$;`;
     const rows = ledger || [];
     const e = (idx == null) ? rows[rows.length - 1] : rows[idx - 1];
     if (!e) { logError("[ARTIFACT] no such round."); return null; }
-    const files = artBuild(e);
-    files.forEach((f) => artDownload(f.name, f.body, fmt || "md"));
-    if (files.length > 1) {
-      logError("[ARTIFACT] " + files.length + " files \u2014 this round was " + artTag(e) +
-        ", and the seats answered different facets. They are NOT merged, because merging positions " +
-        "that were never reconciled would assert a consensus that does not exist.");
-    }
-    return files.map((f) => f.name);
+    return artBuild(e).then((files) => {
+      files.forEach((f) => artDownload(f.name, f.body, fmt || "md"));
+      if (files.length > 1) {
+        logError("[ARTIFACT] " + files.length + " files \u2014 this round was " + artTag(e) +
+          ", and the seats answered different facets. They are NOT merged, because merging positions " +
+          "that were never reconciled would assert a consensus that does not exist.");
+      }
+      return files.map((f) => f.name);
+    });
   }
-
   // v4.30.1 — MOBILE EXPORT. The layer shipped console-only, which is the same
   // mistake the write gate made: a phone has no usable console, so the feature
   // existed and could not be reached. The ledger is written BEFORE the answer
@@ -14757,7 +14797,10 @@ end $$;`;
     try {
       artPanelClose();
       const tag = artTag(e);
-      const files = artBuild(e);
+      // v4.31.3 — artBuild is async now (it reads the full-text store), so the
+      // build moved to CLICK time. Calling it here would have handed a Promise
+      // to the download path and written an empty file.
+      const nFiles = (artTag(e) === "DIVIDED-PARALLEL") ? ((e.positions || []).length || 1) : 1;
       const wrap = document.createElement("div");
       wrap.id = "rqArtPanel";
       wrap.className = "rq-art-panel";
@@ -14766,8 +14809,8 @@ end $$;`;
       // Says what you will GET, not just that export exists. On a parallel
       // round the file count is the point: three files means three positions
       // that were never reconciled.
-      label.textContent = files.length > 1
-        ? "Export \u2014 " + files.length + " files, one per seat (" + tag + ", never merged)"
+      label.textContent = nFiles > 1
+        ? "Export \u2014 " + nFiles + " files, one per seat (" + tag + ", never merged)"
         : "Export \u2014 1 file (" + tag + ")";
       wrap.appendChild(label);
       const row = document.createElement("div");
@@ -14777,11 +14820,22 @@ end $$;`;
         b.type = "button";
         b.className = "ap-btn";
         b.textContent = txt;
-        b.addEventListener("click", () => {
+        b.addEventListener("click", async () => {
           b.disabled = true;
           const prev = b.textContent;
-          b.textContent = "Saved \u2713";
-          try { files.forEach((f) => artDownload(f.name, f.body, fmt)); } catch (_) {}
+          b.textContent = "Building\u2026";
+          try {
+            // Building at CLICK time rather than at panel render: artBuild now
+            // reads verbatim text from the full-text store, and the file should
+            // reflect the round as stored rather than a snapshot taken before
+            // storage settled.
+            const files = await artBuild(e);
+            files.forEach((f) => artDownload(f.name, f.body, fmt));
+            b.textContent = "Saved \u2713";
+          } catch (err) {
+            b.textContent = "Failed";
+            logError("[ARTIFACT] export failed: " + ((err && err.message) || err));
+          }
           setTimeout(() => { b.textContent = prev; b.disabled = false; }, 1800);
         });
         row.appendChild(b);
