@@ -1907,3 +1907,50 @@ body:has(.agent.consensus) .consensus-bar {
   .rq-write-panel .wp-row { flex-direction: column; }
   .rq-write-panel .wp-btn { padding: 14px 10px; }
 }
+
+
+/* ==========================================================================
+   v4.30.1 — ARTIFACT EXPORT PANEL
+
+   The layer shipped console-only, unreachable on a phone. This is the same
+   correction the write gate needed: a capability nobody can reach is not a
+   capability.
+
+   Deliberately quieter than the write panel. Exporting is not a decision with
+   consequences the way signing a write is, and styling it with equal weight
+   would flatten a distinction that matters.
+   ========================================================================== */
+.rq-art-panel {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 0.78em;
+}
+
+.rq-art-panel .ap-label {
+  color: var(--muted);
+  margin-bottom: 8px;
+  letter-spacing: 0.02em;
+}
+
+.rq-art-panel .ap-row { display: flex; gap: 8px; }
+
+.rq-art-panel .ap-btn {
+  flex: 1 1 0;
+  padding: 10px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: transparent;
+  color: var(--text);
+  font-size: 0.95em;
+  cursor: pointer;
+}
+.rq-art-panel .ap-btn:hover { border-color: var(--kimi); color: var(--kimi); }
+.rq-art-panel .ap-btn:disabled { opacity: 0.55; cursor: default; border-color: var(--kimi); color: var(--kimi); }
+
+@media (max-width: 600px) {
+  .rq-art-panel { font-size: 0.84em; padding: 12px; }
+  .rq-art-panel .ap-btn { padding: 13px 8px; }   /* thumb target */
+}
