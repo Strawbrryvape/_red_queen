@@ -2015,3 +2015,37 @@ body:has(.agent.consensus) .consensus-bar {
   .canvas { padding-bottom: calc(104px + env(safe-area-inset-bottom, 0px)); }
   #dividedPanel .divided-card { padding: 12px 14px; }
 }
+
+
+/* ==========================================================================
+   v4.32.0 — READ ALOUD
+
+   A play control per seat position and on the consensus answer. Small and
+   quiet: it sits beside the seat name, not above the text. The point is to
+   be available, not to compete with the answer for attention.
+   ========================================================================== */
+.rq-voice-btn {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.72em;
+  line-height: 1.5;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.rq-voice-btn:hover { color: var(--text); border-color: var(--muted); }
+.rq-voice-btn.is-playing { color: var(--kimi); border-color: var(--kimi); }
+
+.rq-voice-btn.is-consensus {
+  display: inline-block;
+  margin: 0 0 8px 0;
+}
+
+/* Thumb-sized on a phone, where this feature is most useful — listening to a
+   long verdict while doing something else is the actual use case. */
+@media (max-width: 600px) {
+  .rq-voice-btn { padding: 6px 14px; font-size: 0.8em; }
+}
