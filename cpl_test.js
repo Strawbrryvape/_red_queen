@@ -76,7 +76,13 @@ tt("round_invoke derives schedule vs operator, never assumes",
 tt("consolidation is SCHEDULE-rooted, not operator-rooted",
    /kind[\s\S]{0,80}consolidation[\s\S]{0,200}trigger_type: "schedule"/.test(src) ||
    /cplWrite\("consolidation", \{\s*\n\s*trigger_type: "schedule"/.test(src));
-tt("the cap trims oldest-first and says so", /oldest event\(s\) dropped/.test(src));
+// v4.33.0 — the warning now fires ONCE per session. At the cap the old version
+// logged on every event write: ten-plus identical lines per round, burying
+// everything else. A warning repeated until it is ignored is not a warning.
+tt("the cap trims oldest-first and says so", /trimming oldest-first from here on/.test(src));
+tt("but only warns once per session", /_cplCapWarned/.test(src));
+tt("and says the trimming continues silently after that",
+   /trimming continues silently/.test(src));
 tt("the digest is called a digest, not a hash chain",
    /payload_digest/.test(src) && !/payload_hash/.test(src));
 tt("the D-B deviation is documented", /a second, weaker chain here would look like/.test(src) ||
