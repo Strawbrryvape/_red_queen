@@ -16,6 +16,8 @@ eval([grab(/  const clip = .*/),
       grab(/  function reckoningEnabled\(\) \{.*\}/),
       grab(/  function reckLoad\(\) \{[\s\S]*?\n  \}/),
       grab(/  function reckSave\(rows\) \{[\s\S]*?\n  \}/),
+      "var seatProvider={kimi:'primary'};function seatModelLabel(){return 'Moonshot v1 8k';}",
+      grab(/  function reckCurrentModel\(seat\) \{[\s\S]*?\n  \}/),
       grab(/  function reckPrompt\(hit\) \{[\s\S]*?\n  \}/),
       grab(/  const RQ_RECK_RE = .*/),
       grab(/  function reckResolve\(answers, hits\) \{[\s\S]*?\n  \}/),
@@ -95,6 +97,31 @@ tt("the threshold is marked unfitted", /TUNE-AFTER-DATA/.test(src) && /RQ_RECK_S
 tt("the proposing seat's own falsifier is recorded in source",
    /unobservable from outside/.test(src) && /PROPOSING SEAT.S OWN FALSIFIER/.test(src));
 tt("flag defaults OFF", /localStorage\.getItem\("rq_reckoning"\) === "on"/.test(src));
+
+console.log("\n--- v4.33.0: SASL succession (Kimi seat, round 88) ---");
+// The bank stored falsifiers by seat LABEL, so a trigger presented the
+// condition to whatever model held that seat now. A known risk, left unguarded
+// to see whether it occurred. It occurred, and the council found it.
+const mk=(author)=>({entry:{seat:"kimi",round:14,text:cond,author_model:author},sim:0.8});
+const pInherit = reckPrompt(mk("gemma-4-26b-a4b-it"));
+tt("a model change is declared as a SUCCESSION", /SUCCESSION: this condition was authored by/.test(pInherit));
+tt("both models are named", /gemma-4-26b-a4b-it/.test(pInherit) && /Moonshot v1 8k/.test(pInherit));
+tt("the seat is offered ADOPT / REVISE / WITHDRAW",
+   /ADOPT it/.test(pInherit) && /REVISE it/.test(pInherit) && /WITHDRAW it/.test(pInherit));
+tt("and told not to assume it by default",
+   /the seat label persisted, the author did not/.test(pInherit));
+const pSame = reckPrompt(mk("Moonshot v1 8k"));
+tt("same model produces NO succession notice", !/SUCCESSION/.test(pSame));
+const pUnknown = reckPrompt(mk(null));
+tt("an unknown author is reported as unknown, never assumed continuous",
+   /which model stated it is UNKNOWN/.test(pUnknown) && !/SUCCESSION: this condition was authored by/.test(pUnknown));
+tt("the authoring model is banked at deposit", /author_model:/.test(src));
+tt("holding an INHERITED condition is counted separately from holding your own",
+   /resolved_by_successor/.test(src) && /inherited commitments, not/.test(src));
+
+console.log("\n--- v4.33.0: the CPL cap no longer floods the drawer ---");
+tt("the cap warning fires once per session", /_cplCapWarned/.test(src));
+tt("and says the trimming continues silently", /trimming continues silently/.test(src));
 
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
