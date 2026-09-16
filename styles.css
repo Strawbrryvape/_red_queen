@@ -2049,3 +2049,63 @@ body:has(.agent.consensus) .consensus-bar {
 @media (max-width: 600px) {
   .rq-voice-btn { padding: 6px 14px; font-size: 0.8em; }
 }
+
+
+/* ==========================================================================
+   v4.34.0 — STEELMAN CARD
+
+   Spec §1.6.2. The visual language is hatched and dashed on purpose: this card
+   must be unmistakable for a seat position even in grayscale or a screenshot,
+   because a manufactured objection read back as genuine dissent is exactly the
+   Counterfoil-class error the feature exists to avoid.
+
+   Rendered with the existing palette variables rather than the swarm's
+   stylesheet, which does not know this project's tokens or breakpoints.
+   ========================================================================== */
+.rq-steelman-card {
+  margin: 12px 0;
+  padding: 14px 16px;
+  border: 1px dashed var(--claude, #D4A574);
+  border-radius: 12px;
+  font-size: 0.82em;
+  line-height: 1.55;
+  background:
+    repeating-linear-gradient(
+      45deg,
+      rgba(212, 165, 116, 0.05) 0 8px,
+      transparent 8px 16px
+    );
+}
+
+.rq-steelman-card__banner {
+  font-weight: 700;
+  font-size: 0.86em;
+  letter-spacing: 0.04em;
+  color: var(--claude, #D4A574);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+
+.rq-steelman-card__attribution {
+  color: var(--muted);
+  font-size: 0.9em;
+  margin-bottom: 8px;
+}
+
+.rq-steelman-card__body {
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.rq-steelman-card__vindication {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.12);
+  color: var(--muted);
+  font-size: 0.92em;
+}
+
+@media (max-width: 600px) {
+  .rq-steelman-card { font-size: 0.88em; padding: 14px; }
+}
