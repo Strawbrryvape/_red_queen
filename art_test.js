@@ -140,6 +140,28 @@ tt("Word is still reachable", /window\.__rqExportDocx/.test(src));
 tt("the reason for the swap is documented",
    /three steps on a phone|does not have Word/.test(src));
 
+console.log("\n--- v4.34.1: M-7, the seat-identity join (organ re-audit) ---");
+// positions[].seat holds the DYNAMIC label; the full-text store is keyed by the
+// RAW name. On every fallback round the lookup missed, fell back to the 300-char
+// clip, and no warning fired because the store itself existed.
+FT = { kimi:"KIMI_VERBATIM_"+"z".repeat(500), gemini:"GEM_VERBATIM_"+"z".repeat(500) };
+const fb = await artBuild({t:1,prompt:"q",outcome:"divided",cs:{verdict:"TRUE SPLIT"},counts:"0/2",
+  seats:[{n:"gemini"},{n:"kimi"}],
+  positions:[{seat:"Gemini",text:"clip"},{seat:"Kimi [fallback: OpenRouter gemma-4-26b]",text:"clip"}]});
+tt("a FALLBACK-labelled seat still resolves to its verbatim text",
+   fb[0].body.includes("KIMI_VERBATIM_"));
+tt("and so does the primary", fb[0].body.includes("GEM_VERBATIM_"));
+tt("neither falls back to the clip", !/## POSITION[\s\S]{0,40}clip/.test(fb[0].body));
+// a genuinely missing record must be DECLARED, not silently clipped
+FT = { gemini:"GEM_VERBATIM_"+"z".repeat(500) };
+const part = await artBuild({t:1,prompt:"q",outcome:"divided",cs:{verdict:"TRUE SPLIT"},counts:"0/2",
+  seats:[{n:"gemini"},{n:"kimi"}],
+  positions:[{seat:"Gemini",text:"clip"},{seat:"Kimi",text:"clip"}]});
+tt("a partial hydration is declared in the file", /PARTIAL: 1 of 2 position/.test(part[0].body));
+tt("and says which part is complete", /The rest are complete/.test(part[0].body));
+tt("the join uses the stable index-aligned key, not the rendered label",
+   /rawNames\[i\]/.test(src) && /the label is for reading, not keying/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
 })();
