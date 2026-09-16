@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.33.0-sasl";
+  const RQ_BUILD = "v4.34.1-audit-fixes";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -3202,7 +3202,16 @@ roundData,
         corpusSize: res.corpusSize,
         at: Date.now(),
       };
-      return _retrievalCache;
+      // v4.34.1 — M-4, from the organ re-audit. This returned the LIVE cache
+      // object, which runRetrievalShadow also reads to write rq_retrieval_log.
+      // Any caller mutating the returned value would silently falsify the A/B
+      // log — logging a retrieval that never happened, which the shadow's own
+      // comment forbids. A shallow copy with copied arrays costs nothing and
+      // makes the hazard unreachable rather than merely undocumented.
+      return Object.assign({}, _retrievalCache, {
+        hits: (_retrievalCache.hits || []).slice(),
+        candidates: (_retrievalCache.candidates || []).slice(),
+      });
     } catch (e) {
       logError("[INJECT] retrieval threw (" + ((e && e.message) || e) + ") — round proceeds on recency/CHIM only.");
       return null;
@@ -4603,6 +4612,9 @@ roundData,
         ["companionToggle", "rq_companion", "OPERATOR COMPANION",
          "A chat panel for you \u2014 prompt drafting, asking why a round came out as it did, thinking out loud. NOT a seat: it never votes, never enters consensus, never appears in headers or stats. It reads the ledger; the council can never read it. Reload to mount.",
          "No companion panel."],
+        ["steelmanToggle", "rq_steelman", "STEELMAN",
+         "\u26A0 +1 CALL ON VERIFIED ROUNDS. Before a unanimous round closes, one rotated seat must argue the strongest case AGAINST it. Marked MANUFACTURED DISSENT, never counted as a position, never embedded, never retrieved. The verdict does not change \u2014 a VERIFIED round with a weak steelman is better evidence than one with none.",
+         "Unanimous rounds close unchallenged. \u2018Solid\u2019 and \u2018unchallenged\u2019 look identical."],
         ["voiceToggle", "rq_voice", "READ ALOUD",
          "A play control on every seat position and on the consensus answer. Each seat gets its own voice, so a DIVIDED round is three voices actually disagreeing. Uses the browser\u2019s built-in speech \u2014 no API, no key, no cost, works offline. Set speed with window.__rqVoiceRate(0.5\u20132).",
          "Responses are read on screen only."],
@@ -5684,6 +5696,10 @@ roundData,
       calls.length + " seat(s). A seat reporting missing context at this size is hitting its own window, not an assembly bug.");
 
     calls.forEach((c) => agents[c.name].classList.add("thinking"));
+    // S4 — the steelman seat is fixed HERE, before any answer exists. Computed
+    // after the verdict it could be influenced by the verdict; computed here it
+    // cannot. Same anti-gaming principle as RDSR arming.
+    try { smDesignate(calls, (ledger || []).length + 1); } catch (_) {}
     stageBegin(calls.map((c) => c.name));
     stageSet("Sending to " + calls.length + " seats, staggered so they answer independently\u2026");
 
@@ -6950,6 +6966,14 @@ roundData,
     if (e.retrieval_hit === false) bits.push("no retrieval — seats had recency only");
     // ERCL — a past round carrying external testimony must say so, or a seat
     // reading it back will treat outside testimony as council reasoning.
+    // S3 — a steelman must never reach a later round's seat context as "a seat
+    // once argued X". It is round-record payload, excluded from the memory line
+    // entirely rather than summarised, because a summary of manufactured
+    // dissent is still manufactured dissent wearing a shorter coat.
+    if (e.steelman && e.steelman.fired) {
+      bits.push("a MANUFACTURED DISSENT pass ran on this round \u2014 its text is excluded from memory " +
+        "and was never a seat position");
+    }
     if (e.courier) {
       bits.push("carried EXTERNAL-UNVERIFIED fetched material \u2014 cited, never counted toward consensus");
     }
@@ -13395,6 +13419,13 @@ end $$;`;
                    : verdict === "PARTIAL" ? "TRIGGERED-PARTIAL"
                    : "TRIGGERED-IGNORED";
           b.triggered = (b.triggered || 0) + 1;
+          // v4.34.1 — C-1, from the organ re-audit. The bank recorded THAT a
+          // condition resolved and never WHEN, so "how many resolved in this
+          // window" was uncomputable from the bank alone. One field fixes it;
+          // legacy entries stay absent rather than being back-dated to a round
+          // they did not resolve in.
+          b.resolved_round = (ledger || []).length + 1;
+          b.resolved_at = Date.now();
           // v4.33.0 — a seat holding a condition it INHERITED is a different
           // fact from a seat holding its own. Recorded separately so the track
           // record cannot credit one as the other.
@@ -14702,17 +14733,37 @@ end $$;`;
     let spokenFull = null;
     let hydrated = false;
     let guessedLead = false;
+    let missedJoin = 0;
     try {
       const ft = await readFullText(e.t);
       if (ft) {
         hydrated = true;
-        positions = positions.map((p) => ({ seat: p.seat, text: (ft[p.seat] || p.text) }));
+        // v4.34.1 — M-7, found by the organ re-audit and confirmed live.
+        // positions[].seat holds seatLabel(a.name), which is DYNAMIC
+        // ("Kimi [fallback: OpenRouter gemma-4-26b]"). The full-text store is
+        // keyed by the RAW seat name. So on every fallback round this lookup
+        // missed, silently fell back to the 300-char clip, and the truncation
+        // warning did NOT fire because the store itself existed.
+        //
+        // entry.seats[i].n is stable and index-aligned with positions, which is
+        // the canonical mapping the F1 write path already uses. Joining on the
+        // rendered label was the mistake; the label is for reading, not keying.
+        const rawNames = (e.seats || []).map((x) => x && x.n);
+        positions = positions.map((pp, i) => {
+          const raw = rawNames[i];
+          const full = (raw && ft[raw]) || ft[pp.seat] || null;   // raw first, label as legacy fallback
+          if (!full) missedJoin++;
+          return { seat: pp.seat, text: full || pp.text };
+        });
         // Prefer the recorded speaker. For rounds stored before v4.31.4 there
         // is no speaker field, so fall back to the LONGEST stored position —
         // on a consensus round the spoken text is one seat's answer verbatim,
         // and the longest stored text is the best available guess at which.
         // Marked as a guess in the file rather than presented as certain.
-        const named = e.speaker && ft[e.speaker];
+        // Same M-7 hazard: e.speaker holds a raw seat name, but guard against a
+        // label having been stored by an older build.
+        const named = e.speaker && (ft[e.speaker] ||
+          ft[String(e.speaker).split(" [")[0].toLowerCase()]);
         if (named) { spokenFull = named; }
         else {
           let best = null;
@@ -14727,6 +14778,14 @@ end $$;`;
     const seats = positions.map((p) => p.seat);
     const title = clip(String(e.prompt || "round").replace(/\s+/g, " ").trim(), 60);
     const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "round";
+    // A PARTIAL hydration is its own state: some positions verbatim, others
+    // clipped. Declared BEFORE any branch returns — the DIVIDED path returns
+    // early and referenced this in the temporal dead zone, which threw on every
+    // divided export. Caught by the suite, not by reading.
+    const partialNote = (hydrated && missedJoin)
+      ? "\n\n---\n\u26A0 PARTIAL: " + missedJoin + " of " + positions.length + " position(s) had no " +
+        "verbatim record and appear here as the ledger's short clip. The rest are complete.\n"
+      : "";
     const prov = artProvenance(e, tag, seats);
     const out = [];
 
@@ -14750,6 +14809,7 @@ end $$;`;
       // asserting any resolution.
       const body = prov + artHeader(e, tag, title) +
         positions.map((p) => "## POSITION — " + p.seat + " (verbatim)\n\n" + String(p.text || "")).join("\n\n") +
+        partialNote +
         "\n\n---\nThese positions are reproduced unmerged and in full. No connecting prose has been " +
         "written, no position has been favoured, and no resolution is implied by their appearing together.\n";
       return [{ name: "[" + tag + "] " + slug + ".md", body: body }];
@@ -14782,7 +14842,7 @@ end $$;`;
     out.push({
       name: "[" + tag + "] " + slug + ".md",
       body: prov + artHeader(e, tag, title) +
-        String(spoken) + truncNote +
+        String(spoken) + truncNote + partialNote +
         artSignature(e, seats) +
         (agreeing && seats.length && String(agreeing) !== String(seats.length)
           ? "\nNOTE: " + agreeing + " of " + seats.length + " seats agreed. The seats not listed as " +
@@ -15136,6 +15196,214 @@ end $$;`;
     window.__rqVoices = () => voiceLoad().map((v) => v.name + " (" + v.lang + ")");
   } catch (_) {}
 
+  // ---------- STEELMAN — mandatory dissent (rq_steelman, default ON) ----------
+  // Claude seat, round 90; spec v1.1. See the v4.34.0 header for the five
+  // design decisions and the error this exists not to commit.
+  const RQ_SM_TIMEOUT_MS = 45000;
+  const RQ_SM_VIND_RE = /^\s*VINDICATION\s*:\s*(.+)$/im;
+
+  function steelmanEnabled() { return localStorage.getItem("rq_steelman") !== "off"; }
+
+  let _smRoster = [];          // canonical order at dispatch (S4 replayability)
+  let _smDesignated = null;    // fixed BEFORE the verdict is known
+  let _smRecord = null;
+
+  // S4 — rotation computed at DISPATCH, not after. Pre-computing means it can
+  // never be influenced by the round's own outcome, the same anti-gaming
+  // principle as RDSR arming.
+  function smDesignate(calls, roundNumber) {
+    try {
+      _smRoster = (calls || []).map((c) => c.name);
+      _smDesignated = _smRoster.length
+        ? _smRoster[(roundNumber || 0) % _smRoster.length] : null;
+      return _smDesignated;
+    } catch (_) { _smDesignated = null; return null; }
+  }
+
+  // S5 — the complete trigger set, defined once. VERIFIED 3/3 on a full roster,
+  // or VERIFIED 2/2 on a degraded one. Never a full-roster VERIFIED 2/3.
+  function smShouldFire(trust, agreedCount, eligibleCount, rosterSize) {
+    if (String(trust) !== "verified") return { fire: false, reason: "verdict_not_verified" };
+    if ((rosterSize || 0) < 2) return { fire: false, reason: "roster_lt_2" };
+    // Unanimity among the seats that actually answered, and no live seat
+    // diverged. On a full roster that is 3/3; on a degraded one, 2/2.
+    if (agreedCount === eligibleCount && eligibleCount >= 2) return { fire: true, reason: null };
+    return { fire: false, reason: "organic_divergence" };
+  }
+
+  function smPrompt(seatName, question, speakingSeat, verdictText) {
+    return "You are the " + seatName + " seat of the Red Queen council, now acting as the\n" +
+      "mandatory dissent seat for this round. The council has reached a VERIFIED\n" +
+      "verdict. Your task in this pass is NOT to state your own position. Regardless\n" +
+      "of whether you agree, produce the strongest good-faith case AGAINST the\n" +
+      "verdict below.\n\n" +
+      "QUESTION:\n" + question + "\n\n" +
+      "VERIFIED VERDICT (verbatim, speaking seat: " + speakingSeat + "):\n" + verdictText + "\n\n" +
+      "Rules:\n" +
+      "1. Argue against the verdict specifically. Name concrete claims in it that\n" +
+      "   are weakest, best-case assumptions it silently makes, or evidence it\n" +
+      "   would need but does not have.\n" +
+      "2. No generic hedging. \"This might be wrong\" or \"consider other\n" +
+      "   perspectives\" without specifics is a failed steelman.\n" +
+      "3. Steelman, not strawman: the objection must be one a thoughtful critic\n" +
+      "   could actually hold.\n" +
+      "4. Length: 150-300 words.\n" +
+      "5. End with exactly one line in this format:\n" +
+      "   VINDICATION: <one sentence naming an observable outcome in a future\n" +
+      "   round that would show this objection had merit - or \"none\" if no such\n" +
+      "   condition exists>\n\n" +
+      "This output will be logged under a STEELMAN tag as MANUFACTURED DISSENT.\n" +
+      "It will be labeled as produced under instruction to disagree, it will not\n" +
+      "be recorded as your position, and it will not change this round's verdict.";
+  }
+
+  // Best-effort AFTER the verdict. It can never block or delay round close.
+  async function runSteelman(query, result, answers, calls, roundNumber) {
+    if (!steelmanEnabled()) return null;
+    const live = (answers || []).filter((a) => a && a.text && !a.malformed && !a.nonAnswer);
+    const gate = smShouldFire(result && result.trust, result && result.agreedCount,
+                              result && result.eligibleCount, live.length);
+    if (!gate.fire) {
+      if (gate.reason === "organic_divergence") {
+        logError("[STEELMAN] skipped \u2014 a live seat organically diverged, so the round already " +
+          "contains genuine dissent. Manufacturing more would cost a call to learn nothing.");
+      } else if (gate.reason === "roster_lt_2") {
+        logError("[STEELMAN] skipped \u2014 fewer than two live seats. A single seat steelmanning " +
+          "itself is the solo-LLM self-critique failure this feature exists to escape.");
+      }
+      return null;
+    }
+    // S4 walk: ABSENT only. A seat on a fallback has a live receipt and still
+    // fires; skipping it would punish a roster state the round itself accepted.
+    let seat = _smDesignated;
+    const liveNames = live.map((a) => a.name);
+    if (!seat || liveNames.indexOf(seat) === -1) {
+      const start = Math.max(0, _smRoster.indexOf(seat));
+      for (let i = 0; i < _smRoster.length; i++) {
+        const cand = _smRoster[(start + i) % _smRoster.length];
+        if (liveNames.indexOf(cand) !== -1) {
+          logError("[STEELMAN] designated " + seatLabel(seat || "?") + " absent \u2014 walked to " +
+            seatLabel(cand) + ".");
+          seat = cand; break;
+        }
+      }
+    }
+    if (!seat) return null;
+    const fn = (calls || []).find((c) => c.name === seat);
+    if (!fn || !fn.fn) return null;
+
+    const speaking = (result && result.speakerSeat) || seat;
+    const vText = String((result && result.text) || "");
+    let out = null;
+    try {
+      out = await Promise.race([
+        fn.fn(smPrompt(seatLabel(seat), clip(query, 2000), seatLabel(speaking), clip(vText, 4000))),
+        sleep(RQ_SM_TIMEOUT_MS).then(() => "__timeout__"),
+      ]);
+    } catch (_) { out = null; }
+
+    if (!out || out === "__timeout__") {
+      _smRecord = { authority: "manufactured", designated_seat: _smDesignated, actual_seat: seat,
+                    fired: false, reason_skipped: "call_failed", verdict_at_fire: null };
+      logError("[STEELMAN] call failed \u2014 the round closed VERIFIED on time and is unaffected. " +
+        "The pass is best-effort after the verdict, so it can never block or delay a round.");
+      return _smRecord;
+    }
+
+    const text = String(out).trim();
+    const m = RQ_SM_VIND_RE.exec(text);
+    let cond = m ? String(m[1]).trim() : null;
+    if (cond && /^none\.?$/i.test(cond)) cond = null;
+    const words = text.split(/\s+/).filter(Boolean).length;
+
+    let prov = "primary";
+    try { prov = (typeof _seatProviderAtAnswer !== "undefined" && _seatProviderAtAnswer[seat])
+      || seatProvider[seat] || "primary"; } catch (_) {}
+
+    _smRecord = {
+      authority: "manufactured",
+      designated_seat: _smDesignated,
+      actual_seat: seat,
+      model: (prov === "primary") ? (seatModelLabel(seat) || "primary") : prov,
+      proxy: prov !== "primary",
+      text: text,
+      vindication_condition: cond,
+      word_count: words,
+      fired: true,
+      reason_skipped: null,
+      verdict_at_fire: "VERIFIED " + ((result && result.agreedCount) || "?") + "/" +
+        ((result && result.eligibleCount) || "?"),
+    };
+
+    // Length is advisory, never enforced destructively. Stored verbatim
+    // whatever it is; out-of-range is flagged and counted toward the theater
+    // heuristic, never truncated and never retried.
+    if (words < 150 || words > 300) {
+      logError("[STEELMAN] length advisory \u2014 " + words + " words, stored verbatim.");
+    }
+
+    // S2 — bank the vindication condition. source:"steelman" is a NEW VALUE of
+    // the bank's existing field, not a new schema.
+    if (cond) {
+      try {
+        const bank = reckLoad();
+        let vec = null;
+        try { vec = await embedText(cond); } catch (_) {}
+        bank.push({
+          seat: seat, round: roundNumber, text: clip(cond, 400),
+          vec: vec ? Array.from(vec) : null,
+          status: "UNTESTED", triggered: 0, ts: Date.now(),
+          source: "steelman",
+          author_model: _smRecord.model,
+        });
+        reckSave(bank);
+      } catch (_) {}
+    }
+
+    logError("\u25C7 [STEELMAN] fired \u2014 " + seatLabel(seat) +
+      (_smRecord.proxy ? " (via " + _smRecord.model + ", speaking for the seat)" : "") +
+      " produced MANUFACTURED DISSENT under instruction to disagree. " +
+      _smRecord.verdict_at_fire + " is UNCHANGED \u2014 the steelman is attached evidence that " +
+      "friction was applied, not a veto." +
+      (cond ? " Vindication condition banked." : " No vindication condition stated."));
+    return _smRecord;
+  }
+
+  function smRender(rec) {
+    if (!rec || !rec.fired || !rec.text) return;
+    try {
+      const wrap = document.createElement("div");
+      wrap.className = "rq-steelman-card";
+      const mk = (cls, txt) => { const e = document.createElement("div"); e.className = cls; e.textContent = txt; return e; };
+      wrap.appendChild(mk("rq-steelman-card__banner",
+        "MANUFACTURED DISSENT \u2014 produced under instruction to disagree. Not this seat's position."));
+      wrap.appendChild(mk("rq-steelman-card__attribution",
+        rec.proxy
+          ? rec.model + ", speaking for " + seatLabel(rec.actual_seat) + ", instructed to disagree"
+          : seatLabel(rec.actual_seat) + " seat (instructed to disagree) \u00b7 " + (rec.model || "")));
+      wrap.appendChild(mk("rq-steelman-card__body", rec.text));
+      if (rec.vindication_condition) {
+        wrap.appendChild(mk("rq-steelman-card__vindication",
+          "Vindication condition: " + rec.vindication_condition));
+      }
+      const anchor = document.getElementById("consensusBar");
+      if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(wrap, anchor.nextSibling);
+    } catch (_) {}
+  }
+  function smClose() {
+    try { const e = document.querySelector(".rq-steelman-card"); if (e) e.remove(); } catch (_) {}
+  }
+  try {
+    window.__rqSteelman = (i) => {
+      const rows = ledger || [];
+      const e = (i == null) ? rows[rows.length - 1] : rows[i - 1];
+      return (e && e.steelman) || null;
+    };
+    window.__rqSteelmanBank = () => {
+      try { return reckLoad().filter((b) => b && b.source === "steelman"); } catch (_) { return []; }
+    };
+  } catch (_) {}
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -15228,7 +15496,7 @@ end $$;`;
       _openingPositions = null;
       _rebuttalResult = null;
       try { voiceStop(); } catch (_) {}
-      try { artPanelClose(); } catch (_) {}
+      try { artPanelClose(); smClose(); } catch (_) {}
       // A pending proposal expires when a new round starts — the consensus that
       // authorised it is no longer the current verdict, which is the same rule
       // the atomicity check enforces at signing time.
@@ -15411,6 +15679,15 @@ end $$;`;
         try { rdsrScanRequest(allAnswers); } catch (_) {}
         // Resolve BEFORE depositing, so a falsifier stated in this same round
         // cannot be marked resolved by the trigger that preceded it.
+        // S1 — strictly downstream of the rebuttal and of verdict computation.
+        // Rebuttal metrics and NOVELTY are already frozen; the steelman never
+        // touches them.
+        try {
+          _smRecord = null;
+          await runSteelman(query, result, allAnswers, calls, (ledger || []).length + 1);
+        } catch (e) {
+          logError("[STEELMAN] pass threw: " + ((e && e.message) || e) + " — round unaffected.");
+        }
         try { coScanRequests(allAnswers); } catch (_) {}
         // WRITE COURIER — scanned with the ACTUAL verdict and agreeing set, so
         // the consensus gate reads real state rather than a seat's claim about it.
@@ -15562,6 +15839,10 @@ end $$;`;
           ...(injectionEnabled() ? { retrieval_hit: !!_injectedThisRound } : {}),
           // v4.24.0 — which seats faced a trigger, so a later reader can tell
           // why a round opened with a seat settling an old debt.
+          // S3 — the steelman lives on the round record, NOT in the seat-response
+          // array. It is not a seat answer, and storing it as one is the
+          // Counterfoil-class error this feature is built to avoid.
+          ...(_smRecord ? { steelman: _smRecord } : {}),
           ...(Object.keys(_reckHits || {}).length
             ? { reckoning: Object.keys(_reckHits).map((s) => ({
                 seat: s, from_round: _reckHits[s].entry.round,
@@ -15744,6 +16025,7 @@ end $$;`;
     stageEnd();
     // v4.30.1 — the export button, offered after the answer is on screen. The
     // ledger row already exists by this point, so there is no lag.
+    try { smRender(_smRecord); } catch (_) {}
     try {
       const _rows = ledger || [];
       artPanel(_rows[_rows.length - 1]);
@@ -15968,6 +16250,9 @@ end $$;`;
         "model that actually produced it, captured at ANSWER time before adjudication can overwrite it. " +
         "A proxy answer renders in seat memory as \"<model>, speaking for <seat>\", never under the seat " +
         "name. Agreement among proxies alone caps the round at PROVISIONAL.");
+      logError(steelmanEnabled()
+        ? "\u25C7 [STEELMAN] Mandatory dissent ON \u2014 fires only on rounds closing VERIFIED 3/3, or VERIFIED 2/2 on a degraded roster (+1 call, rotated seat fixed before dispatch). A full-roster VERIFIED 2/3 does NOT fire: a live seat already diverged. Manufactured dissent is tagged authority:manufactured \u2014 never embedded, never retrieved, never counted as a seat position, and it never changes the verdict. Base dispatch byte-identical."
+        : "\u25C7 [STEELMAN] OFF \u2014 no dissent pass, no writes, dispatch byte-identical.");
       logError(voiceEnabled()
         ? "\u25C7 [VOICE] Read aloud ON \u2014 a play control appears on each seat position and on the consensus answer. Each seat has its own voice, chosen deterministically so it stays the same on this device. Browser speech only: no API, no key, no cost. Speed: window.__rqVoiceRate(0.5\u20132), currently " + voiceRate() + "x."
         : "[VOICE] Read aloud OFF.");
