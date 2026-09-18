@@ -83,5 +83,23 @@ console.log("\n--- toggle ---");
 t("defaults ON", steelmanEnabled(), true);
 STORE["rq_steelman"]="off"; t("explicit off is respected", steelmanEnabled(), false);
 
+console.log("\n--- v4.35.2: the pass that never fired ---");
+// Round 103: "[STEELMAN] pass threw: calls is not defined — round unaffected."
+// runSteelman is invoked from dispatch() and was handed `calls`, which is local
+// to runLiveCouncil. Every eligible round since the feature shipped threw.
+// The round WAS unaffected, which is exactly why it went unnoticed — the pass
+// is best-effort and its error handling did what it promised. A feature that
+// fails safely still fails.
+tt("the call site no longer references a variable outside its scope",
+   !/runSteelman\(query, result, allAnswers, calls,/.test(src));
+tt("handles are carried out on the result instead",
+   /_calls: calls,/.test(src) && /result && result\._calls/.test(src));
+tt("and the verified path is the one that carries them",
+   /trust: hasPrimaryVoice \? "verified" : "provisional",[\s\S]{0,1600}_calls: calls,/.test(src));
+tt("other return paths fail safe via the empty-array default",
+   /\(result && result\._calls\) \|\| \[\]/.test(src));
+tt("the reason for carrying rather than hoisting is recorded",
+   /how the next consumer\s+\/\/ gets a stale roster|gets a stale roster/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
