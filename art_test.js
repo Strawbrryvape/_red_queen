@@ -162,6 +162,49 @@ tt("and says which part is complete", /The rest are complete/.test(part[0].body)
 tt("the join uses the stable index-aligned key, not the rendered label",
    /rawNames\[i\]/.test(src) && /the label is for reading, not keying/.test(src));
 
+console.log("\n--- v4.35.1: the self-contradicting export (surprise-audit finding) ---");
+// artSignature received every seat that ANSWERED and printed them under a
+// CONFIRMING SEATS heading. A 2/3 round read "2 of 3 seats agreed" directly
+// above three named confirmers. Attendance rendered as confirmation.
+FT = null;
+const cfAll=[{declared_seat:"gemini",proxy:false},{declared_seat:"kimi",proxy:false},{declared_seat:"claude",proxy:false}];
+const known = (await artBuild({t:1,prompt:"q",outcome:"verified",counts:"2/3",verdict:"v",
+  agreed_seats:["gemini","kimi"],counterfoils:cfAll,
+  positions:[{seat:"gemini",text:"a"},{seat:"kimi",text:"b"},{seat:"claude",text:"c"}]}))[0].body;
+tt("a known agreeing set lists ONLY the confirmers",
+   /CONFIRMING SEATS\n  - gemini\n  - kimi\n/.test(known));
+tt("and names the non-confirmer separately",
+   /ANSWERED BUT DID NOT CONFIRM\n  - claude/.test(known));
+// claude must not appear in the CONFIRMING block itself — only in the
+// separate non-confirming block below it.
+const confirmBlock = known.split("ANSWERED BUT DID NOT CONFIRM")[0];
+tt("so the count and the list no longer disagree",
+   /2 of 3 seats agreed/.test(known) && !/claude/.test(confirmBlock.split("CONFIRMING SEATS")[1] || ""));
+const legacy = (await artBuild({t:1,prompt:"q",outcome:"verified",counts:"2/3",verdict:"v",
+  counterfoils:cfAll,
+  positions:[{seat:"gemini",text:"a"},{seat:"kimi",text:"b"},{seat:"claude",text:"c"}]}))[0].body;
+// The phrase appears once, inside the sentence explaining why the heading was
+// NOT used. What matters is that no heading claims confirmation.
+tt("a legacy partial round does NOT claim confirmation",
+   !/\n---\nCONFIRMING SEATS/.test(legacy) && /SEATS THAT ANSWERED/.test(legacy) &&
+   /deliberately NOT headed CONFIRMING SEATS/.test(legacy));
+tt("and says which two facts it cannot join",
+   /WHICH ones is not recoverable/.test(legacy) && /attendance, not confirmation/.test(legacy));
+const unanimous = (await artBuild({t:1,prompt:"q",outcome:"verified",counts:"3/3",verdict:"v",
+  counterfoils:cfAll,
+  positions:[{seat:"gemini",text:"a"},{seat:"kimi",text:"b"},{seat:"claude",text:"c"}]}))[0].body;
+tt("a unanimous round is safe either way", /CONFIRMING SEATS/.test(unanimous));
+tt("the agreeing set is persisted going forward", /agreed_seats: result\._agreed\.map/.test(src));
+
+console.log("\n--- v4.35.1: P7-F3 predictions are object-level ---");
+tt("the instruction demands the answer itself", /STATED AS THE ANSWER ITSELF/.test(src));
+tt("and forbids describing the answer's genre",
+   /Do NOT describe what your answer will be like, its genre/.test(src));
+tt("with a worked contrast so the distinction is unambiguous",
+   /scores as a miss/.test(src) && /is a position/.test(src) && /tradeoffs/.test(src));
+tt("the inflation mechanism is documented, not just the rule",
+   /category mismatch inflates/.test(src) && /plan-vs-instance/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
 })();
