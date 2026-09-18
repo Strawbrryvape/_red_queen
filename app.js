@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v4.34.1-audit-fixes";
+  const RQ_BUILD = "v5.0.0-plastic-organ";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4612,6 +4612,9 @@ roundData,
         ["companionToggle", "rq_companion", "OPERATOR COMPANION",
          "A chat panel for you \u2014 prompt drafting, asking why a round came out as it did, thinking out loud. NOT a seat: it never votes, never enters consensus, never appears in headers or stats. It reads the ledger; the council can never read it. Reload to mount.",
          "No companion panel."],
+        ["organToggle", "rq_plastic_organ_a", "PLASTIC ORGAN (A)",
+         "\u26A0 SLICE 1 \u2014 EVIDENCE LAYER ONLY. Computes a 16-d governance vector and writes sha256-chained receipts. It routes nothing, gates nothing, and affects no retrieval in this build. Tri-state via localStorage rq_plastic_organ_a = shadow|live; the toggle sets shadow. Receipts: window.__rqOrganReceipts(), chain check: __rqOrganVerify().",
+         "No vector, no receipts, no local model; dispatch byte-identical."],
         ["steelmanToggle", "rq_steelman", "STEELMAN",
          "\u26A0 +1 CALL ON VERIFIED ROUNDS. Before a unanimous round closes, one rotated seat must argue the strongest case AGAINST it. Marked MANUFACTURED DISSENT, never counted as a position, never embedded, never retrieved. The verdict does not change \u2014 a VERIFIED round with a weak steelman is better evidence than one with none.",
          "Unanimous rounds close unchallenged. \u2018Solid\u2019 and \u2018unchallenged\u2019 look identical."],
@@ -6021,6 +6024,21 @@ roundData,
       _agreed: agreed,       // (pairSimilarity needs .text, not the labels)
       agreedNames: _agreedNames,
       eligibleNames: _eligibleNames,
+      // v4.35.2 — THE STEELMAN HAS NEVER FIRED. runSteelman is invoked from
+      // dispatch() and was passed `calls`, which is local to runLiveCouncil.
+      // Every eligible round since the feature shipped logged
+      // "[STEELMAN] pass threw: calls is not defined — round unaffected."
+      //
+      // The round WAS unaffected, which is why it went unnoticed: the pass is
+      // best-effort after the verdict and its own error handling did exactly
+      // what it promised. A feature that fails safely still fails, and "round
+      // unaffected" is not "feature working".
+      //
+      // Carried out on the result rather than hoisting `calls` to dispatch
+      // scope: the seat-call handles belong to the dispatch that made them, and
+      // widening their scope to satisfy one consumer is how the next consumer
+      // gets a stale roster.
+      _calls: calls,
     };
   }
 
@@ -10859,7 +10877,21 @@ end $$;`;
         const predictionPrompt =
           "You are the " + seat.name + " seat in the Red Queen council. " +
           "Before the council answers, predict:\n" +
-          "1. Your own final position, in 2-3 sentences.\n" +
+          // v4.35.1 — OBJECT LEVEL, NOT META LEVEL (P7-F3 amendment).
+          // "Predict your own final position" invited descriptions of the
+          // answer's genre — "I will argue this is nuanced and depends on
+          // context" — rather than the answer. The scorer then compares a
+          // DESCRIPTION against an ANSWER, and that category mismatch inflates
+          // every divergence score structurally. The audit round attributed
+          // half of a 0.665 divergence to exactly this plan-vs-instance
+          // artifact, and the August cascade is what a systematically inflated
+          // surprise metric looks like in production.
+          "1. Your own final position, STATED AS THE ANSWER ITSELF, in 2-3 sentences. " +
+          "Write the position you would actually give \u2014 the claim, the number, the " +
+          "recommendation. Do NOT describe what your answer will be like, its genre, or " +
+          "its qualities. \"I will weigh several factors and note the tradeoffs\" is a " +
+          "description and scores as a miss; \"The floor should stay at 0.600 because " +
+          "lowering it admits near-duplicates\" is a position.\n" +
           (fullCouncil
             ? "2. The likely consensus outcome — one sentence, or the single word DIVIDED.\n"
             : "2. Consensus prediction SKIPPED — council size < 3 (2-seat rule).\n") +
@@ -13639,6 +13671,27 @@ end $$;`;
   // receipt so a reader knows what touched the bytes.
   const RQ_CO_TRANSFORM = "strip-tags-v1";
 
+  // v4.35.3 — XML IS NOT HTML, AND strip-tags ATE IT.
+  //
+  // Rounds 104-105: an arXiv Atom feed came back as 612 characters of empty
+  // markdown links. Every <entry> — title, authors, abstract, dates — was
+  // stripped, leaving the feed shell. Three seats then spent two full rounds
+  // reasoning about whether an empty result meant "no such paper" or "broken
+  // query", when the real answer was "the transform deleted the payload".
+  //
+  // The Kimi seat got closest unaided: "when an empty result contradicts
+  // well-established prior knowledge, the empty result is evidence about the
+  // query, not about the world." It was right that the instrument was at
+  // fault; it could not see WHICH instrument.
+  //
+  // strip-tags-v1 is an HTML de-tagger. Applied to XML it removes exactly the
+  // elements that carry the content. Structured feeds keep their tags and are
+  // labelled honestly on the receipt, so a seat knows what it is reading.
+  const RQ_CO_XML_RE = /^\s*<\?xml|^\s*<(feed|rss|entry|records|result)\b/i;
+  function coIsStructured(text, ctype) {
+    return /xml|atom|rss/i.test(String(ctype || "")) || RQ_CO_XML_RE.test(String(text || ""));
+  }
+
   // v4.26.0 — JSON-AWARE TRUNCATION (Kimi seat). "strip-tags-v1 is harmless on
   // JSON, but truncating at a structural boundary would make excerpts
   // parseable." Cuts back to the last complete element rather than mid-token,
@@ -13670,6 +13723,11 @@ end $$;`;
   function coExtract(html, ctype) {
     try {
       const raw = String(html || "");
+      // Structured feeds pass through intact. Collapsing whitespace only —
+      // a seat can read Atom, and it cannot read the hole where Atom was.
+      if (coIsStructured(raw, ctype)) {
+        return raw.replace(/>\s+</g, ">\n<").replace(/[ \t]{2,}/g, " ").trim();
+      }
       if (!/html/i.test(String(ctype || "")) && !/^\s*</.test(raw)) return raw;   // already text/JSON
       return raw
         .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -13855,8 +13913,24 @@ end $$;`;
   }
 
   // Last tier before giving up. Opt-in, and it declares itself on the receipt.
+  // v4.35.3 — hosts known to send permissive CORS headers. Round 105 shows
+  // export.arxiv.org going through the proxy anyway, which added a third party,
+  // an extra hop, and the HTML transform that destroyed the payload. A host that
+  // answers directly should never be proxied: every proxy hop is one more link
+  // from the source and one more place for content to be lost.
+  const RQ_CO_DIRECT_OK = /(^|\.)(export\.arxiv\.org|api\.github\.com|raw\.githubusercontent\.com|hn\.algolia\.com|hacker-news\.firebaseio\.com|api\.crossref\.org|registry\.npmjs\.org|api\.stackexchange\.com|crates\.io)$/i;
+  function coPrefersDirect(url) {
+    try { return RQ_CO_DIRECT_OK.test(new URL(url).host); } catch (_) { return false; }
+  }
+
   async function coProxyTry(url, firstFailure) {
     if (!courierProxyEnabled()) return firstFailure;
+    if (coPrefersDirect(url)) {
+      logError("[COURIER] NOT retrying " + clip(url, 60) + " through the proxy \u2014 this host sends " +
+        "permissive CORS headers, so a direct failure is a real failure and proxying would only add a " +
+        "third party and an HTML transform that destroys structured feeds. Reporting the direct result.");
+      return firstFailure;
+    }
     if (!/cors_or_network|http_40[0-9]/.test(String(firstFailure.reason || ""))) return firstFailure;
     logError("[COURIER] " + clip(url, 60) + " refused directly \u2014 retrying through the read proxy. " +
       "\u26A0 The URL is being sent to a third party (r.jina.ai). No key or credential is involved; " +
@@ -13904,7 +13978,8 @@ end $$;`;
       }
       const body = await res.text();
       if (!res.ok) return { url: url, via: "direct", http: res.status, ok: false, reason: "http_" + res.status };
-      return { url: url, finalUrl: res.url || url, via: "direct", http: res.status, text: coExtract(body, ctype), ok: true };
+      return { url: url, finalUrl: res.url || url, via: "direct", http: res.status,
+               text: coExtract(body, ctype), structured: coIsStructured(body, ctype), ok: true };
     } catch (e) {
       const msg = String((e && e.message) || e);
       // Council request 3: report what is actually distinguishable rather than
@@ -13985,7 +14060,8 @@ end $$;`;
         " | http=" + (r.http == null ? "n/a" : r.http) +
         " | chars=" + text.length + " | doc_total_chars=" + totalLen +
         " | offset=" + req.offset + "\u2013" + end + " | remaining=" + remaining +
-        " | sha256=" + digest + " | transform=" + (r.via === "paste" ? "none" : RQ_CO_TRANSFORM) +
+        " | sha256=" + digest + " | transform=" +
+        (r.via === "paste" ? "none" : (r.structured ? "none (structured feed, tags preserved)" : RQ_CO_TRANSFORM)) +
         (r.via === "proxy" ? " | VIA_THIRD_PARTY_PROXY=r.jina.ai (the host refused a direct read; this " +
           "text was extracted by a third party and is one more link from the source than a direct fetch)" : "") +
         (r.rewrittenFrom ? " | REWRITTEN_FROM=" + r.rewrittenFrom +
@@ -14703,13 +14779,51 @@ end $$;`;
 
   // Deterministic signature block. Claude's mechanism: it LISTS confirming
   // seats, it does not summarise or reconcile them.
+  // v4.35.1 — THE SELF-CONTRADICTING EXPORT. This was passed every seat that
+  // ANSWERED and printed them under a CONFIRMING SEATS heading. On a 2/3 round
+  // the file then read "2 of 3 seats agreed" directly above a list of three
+  // confirmers. Attendance was being rendered as confirmation.
+  //
+  // The agreeing set is only recorded from this build forward, so there are two
+  // honest cases and the block must never blur them:
+  //   KNOWN   — list exactly the seats that agreed, under CONFIRMING SEATS.
+  //   UNKNOWN — a pre-v4.35.1 round with partial agreement. The confirming
+  //             subset is unrecoverable, so the heading becomes SEATS THAT
+  //             ANSWERED and the block says which two facts it cannot join.
+  // A unanimous round is safe either way: everyone who answered confirmed.
   function artSignature(e, seats) {
     const cf = e.counterfoils || [];
-    const lines = seats.map((s) => {
+    const known = Array.isArray(e.agreed_seats) && e.agreed_seats.length ? e.agreed_seats : null;
+    const counts = String(e.counts || "");
+    const m = /^(\d+)\s*\/\s*(\d+)$/.exec(counts);
+    const partial = m ? (parseInt(m[1], 10) < parseInt(m[2], 10)) : false;
+
+    const fmt = (s) => {
       const c = cf.find((x) => x && x.declared_seat === s);
-      return "  - " + s + (c && c.proxy ? "  [answered via " + (c.actual_model || c.actual_provider) + ", NOT the seat itself]" : "");
-    });
-    return "\n\n---\nCONFIRMING SEATS\n" + lines.join("\n") +
+      return "  - " + s + (c && c.proxy
+        ? "  [answered via " + (c.actual_model || c.actual_provider) + ", NOT the seat itself]" : "");
+    };
+
+    if (known) {
+      const nonConfirming = seats.filter((s) => known.indexOf(s) === -1);
+      return "\n\n---\nCONFIRMING SEATS\n" + known.map(fmt).join("\n") +
+        (nonConfirming.length
+          ? "\n\nANSWERED BUT DID NOT CONFIRM\n" + nonConfirming.map(fmt).join("\n")
+          : "") +
+        "\n\nThis block is assembled deterministically from the round record. " +
+        "No text above it was generated by this tool; every word is a seat's own.\n";
+    }
+
+    if (partial) {
+      return "\n\n---\nSEATS THAT ANSWERED\n" + seats.map(fmt).join("\n") +
+        "\n\n\u26A0 " + counts + " of these seats agreed, but WHICH ones is not recoverable: this " +
+        "round predates per-seat agreement recording, so the list above is attendance, not " +
+        "confirmation. It is deliberately NOT headed CONFIRMING SEATS, because naming a confirming " +
+        "subset this record cannot substantiate would be the export asserting something it does not " +
+        "know.\n";
+    }
+
+    return "\n\n---\nCONFIRMING SEATS\n" + seats.map(fmt).join("\n") +
       "\n\nThis block is assembled deterministically from the round record. " +
       "No text above it was generated by this tool; every word is a seat's own.\n";
   }
@@ -15404,6 +15518,220 @@ end $$;`;
     };
   } catch (_) {}
 
+  // ---------- Plastic Organ — Component A data layer (rq_plastic_organ_a) ----------
+  // Spec v1.3.1. Slice 1: receipts only. Nothing here is wired into dispatch.
+  // See the v4.35.0 header for what this slice deliberately excludes.
+  const RQ_ORGAN_KEY      = "rq_organ_receipts_v1";
+  const RQ_ORGAN_VEC_KEY  = "rq_organ_vector_v1";
+  const RQ_ORGAN_MAX      = 500;     // §4.5 cap; oldest-first eviction
+  const RQ_ORGAN_DIM      = 16;      // §2 — the 16-d governance vector
+
+  // §4.4 — CLOSED SET. An unknown cause is a bug, refused at the writer.
+  const RQ_ORGAN_CAUSES = [
+    "genesis", "fixed_rule_update", "state_ema_update", "operator_approved_update",
+    "rollback", "freeze", "kill_purge", "baseline_reset",
+    // v1.3 R42(a) — reversible, funding-state.
+    "eval_halt", "eval_halt_resume",
+    // v1.3.1 R45-P3(iii) — reversible, substrate-failure. Distinct from
+    // eval_halt (operator declined) and kill_purge (irreversible) so chain
+    // tooling can always tell the three apart.
+    "eval_infra_halt", "eval_infra_halt_resume",
+  ];
+
+  // §10.1 — tri-state. OFF is the default and means byte-identical dispatch.
+  function organMode() {
+    const v = localStorage.getItem("rq_plastic_organ_a");
+    return (v === "shadow" || v === "live") ? v : "off";
+  }
+  function organEnabled() { return organMode() !== "off"; }
+
+  // §4.2 — ftDigest is EXPLICITLY FORBIDDEN as a receipt digest. It is FNV and
+  // non-cryptographic by its own comment in this file. Receipts are the
+  // Round-95 evidentiary layer and must not inherit a digest that announces it
+  // is not cryptographic. p2Sha256 (Web Crypto) is the only permitted source,
+  // and a null return from it refuses the write rather than downgrading.
+  let _organSig = null;          // cached client-identity digest, session-scoped
+  let _organSelfTest = null;     // null = untested, true/false = result
+
+  // §4.2 — the self-test. p2Sha256 returns null without crypto.subtle (some
+  // file:// contexts), and a receipt with a null digest is worse than no
+  // receipt: it looks like evidence and is not.
+  async function organSelfTest() {
+    if (_organSelfTest !== null) return _organSelfTest;
+    try {
+      const d = await p2Sha256("organ-selftest");
+      _organSelfTest = !!d;
+    } catch (_) { _organSelfTest = false; }
+    if (!_organSelfTest) {
+      logError("[ORGAN] Web Crypto unavailable (crypto.subtle absent) — secure context required; " +
+        "plastic organ inert, no receipts written.");
+    }
+    return _organSelfTest;
+  }
+
+  // §4.2 — client-identity digest. Named honestly at the computation site
+  // because the spec requires the comment to say exactly this: it is NOT
+  // hardware attestation, a determined operator can forge it, and it exists to
+  // make receipts non-portable across installs and tamper-evident under casual
+  // editing. It never leaves the device.
+  async function organSignature() {
+    if (_organSig) return _organSig;
+    try {
+      const secret = (typeof p2SecretRaw === "function" ? p2SecretRaw() : "") || "";
+      const ua = (navigator && navigator.userAgent) || "";
+      const plat = (navigator && navigator.platform) || "";
+      _organSig = await p2Sha256(secret + "|" + ua + "|" + plat + "|" + RQ_BUILD);
+    } catch (_) { _organSig = null; }
+    return _organSig;
+  }
+
+  function organLoad() {
+    try { const v = JSON.parse(localStorage.getItem(RQ_ORGAN_KEY) || "[]"); return Array.isArray(v) ? v : []; }
+    catch (_) { return []; }
+  }
+  function organSave(rows) {
+    try {
+      if (rows.length > RQ_ORGAN_MAX) {
+        const drop = rows.length - RQ_ORGAN_MAX;
+        rows.splice(0, drop);
+        // §4.3 windowed verification — oldest-first eviction breaks the genesis
+        // anchor BY DESIGN, so verification reports its own window rather than
+        // silently skipping the evicted prefix and overstating itself.
+        if (!_organTrimWarned) {
+          _organTrimWarned = true;
+          logError("[ORGAN] receipt cap " + RQ_ORGAN_MAX + " reached — trimming oldest-first. Chain " +
+            "verification is WINDOWED from here: genesis is no longer reachable in local storage. " +
+            "Export before further trimming if the full chain matters. Said once this session.");
+        }
+      }
+      localStorage.setItem(RQ_ORGAN_KEY, JSON.stringify(rows));
+    } catch (e) {
+      logError("[ORGAN] receipt persist failed (" + ((e && e.message) || e) + ") — this session's " +
+        "receipts are in memory only and the chain will show a break on reload.");
+    }
+  }
+  let _organTrimWarned = false;
+
+  // §4.1 — canonical digest input for Component A: stable key order, 6-decimal
+  // float serialization. Fixed here; changing it invalidates every prior chain.
+  function organCanonical(state) {
+    try {
+      const v = (state && Array.isArray(state.v)) ? state.v.map((x) => Number(x).toFixed(6)) : [];
+      return JSON.stringify({ v: v, updated_rounds: (state && state.updated_rounds) || 0,
+                              last_round_t: (state && state.last_round_t) || null });
+    } catch (_) { return "null"; }
+  }
+
+  // §4.2 — delta on UNIT-NORMALIZED copies. An unnormalized L2 would make the
+  // 0.05 gating threshold meaningless against Component B's unscaled EMA, so
+  // this is a directional change measure comparable across both components.
+  // Fixed by the spec; may not change without a lineage bump.
+  function organL2Delta(prior, post) {
+    try {
+      const norm = (u) => {
+        const n = Math.sqrt(u.reduce((a, x) => a + x * x, 0));
+        return n === 0 ? u.map(() => 0) : u.map((x) => x / n);
+      };
+      const a = norm(prior || []), b = norm(post || []);
+      let s = 0;
+      for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        const d = (b[i] || 0) - (a[i] || 0);
+        s += d * d;
+      }
+      return Math.round(Math.sqrt(s) * 1e6) / 1e6;
+    } catch (_) { return 0; }
+  }
+
+  function organVectorLoad() {
+    try {
+      const v = JSON.parse(localStorage.getItem(RQ_ORGAN_VEC_KEY) || "null");
+      if (v && Array.isArray(v.v) && v.v.length === RQ_ORGAN_DIM) return v;
+    } catch (_) {}
+    return { v: new Array(RQ_ORGAN_DIM).fill(0), updated_rounds: 0, last_round_t: null };
+  }
+  function organVectorSave(s) {
+    try { localStorage.setItem(RQ_ORGAN_VEC_KEY, JSON.stringify(s)); } catch (_) {}
+  }
+
+  // THE WRITER. Refuses on: organ off, failed self-test, unknown cause, null
+  // digest. §4.3 chain assertion is checked and logged, never silently repaired.
+  async function organWrite(component, cause, priorState, postState, extra) {
+    if (!organEnabled()) return null;
+    if (RQ_ORGAN_CAUSES.indexOf(cause) === -1) {
+      logError("[ORGAN] REFUSED — unknown mutation_cause \"" + cause + "\". The enum is closed (\u00a74.4); " +
+        "an unknown cause is a bug, not a new state. Nothing written.");
+      return null;
+    }
+    if (!(await organSelfTest())) return null;
+    try {
+      const dPrior = await p2Sha256(organCanonical(priorState));
+      const dPost  = await p2Sha256(organCanonical(postState));
+      if (!dPrior || !dPost) {
+        // §4.2 — never written. A null digest is a chain break, not a pass.
+        logError("[ORGAN] digest returned null — receipt NOT written. A receipt with a null digest " +
+          "would look like evidence and be none.");
+        return null;
+      }
+      const rows = organLoad();
+      // §4.3 — each receipt's prior digest must equal the previous same-component
+      // receipt's post digest.
+      const prev = rows.filter((r) => r && r.component === component).pop();
+      if (prev && prev.state_digest_post !== ("sha256:" + dPrior)) {
+        logError("[ORGAN] chain break — expected " + prev.state_digest_post + ", state is sha256:" +
+          dPrior + ". Recorded, NOT repaired: a silently-mended chain is worse than a visible break.");
+      }
+      const rec = {
+        receipt_id: (function () {
+          try { return crypto.randomUUID(); } catch (_) { return String(Date.now()) + Math.random().toString(16).slice(2); }
+        })(),
+        round_id: (typeof RQ_SESSION_ID !== "undefined" ? RQ_SESSION_ID : "sess") + "_d" +
+          ((ledger || []).length + 1),
+        component: component,
+        state_digest_prior: "sha256:" + dPrior,
+        state_digest_post: "sha256:" + dPost,
+        l2_norm_delta: organL2Delta(priorState && priorState.v, postState && postState.v),
+        mutation_cause: cause,
+        tripwire_status: "not_evaluated",     // slice 1: tripwires are a later slice
+        organ_lineage: {
+          model_version: component === "A" ? "fixed-rule-v1" : "unset",
+          adapter_version: "none",            // §3.6 — v1 has no adapter
+          training_window: "n/a",             // no training exists
+        },
+        signature: await organSignature(),
+        extra: Object.assign({ ledger_t: (postState && postState.last_round_t) || null }, extra || {}),
+        ts: Date.now(),
+      };
+      rows.push(rec);
+      organSave(rows);
+      return rec;
+    } catch (e) {
+      logError("[ORGAN] receipt write failed: " + ((e && e.message) || e) + " — round unaffected.");
+      return null;
+    }
+  }
+
+  // §4.3 — WINDOWED verification. Reports its own window and whether genesis is
+  // reachable, rather than verifying a prefix it no longer holds.
+  function organVerifyChain(component) {
+    const rows = organLoad().filter((r) => r && (!component || r.component === component));
+    if (!rows.length) { logError("[ORGAN] no receipts to verify."); return null; }
+    let breaks = 0;
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i].state_digest_prior !== rows[i - 1].state_digest_post) breaks++;
+    }
+    const genesis = rows.some((r) => r.mutation_cause === "genesis");
+    logError("[ORGAN] chain verified over " + rows.length + " retained receipt(s) (genesis reachable: " +
+      (genesis ? "yes" : "no") + ") \u2014 " + (breaks ? breaks + " BREAK(S) found." : "no breaks.") +
+      (genesis ? "" : " The evicted prefix is NOT covered by this result."));
+    return { retained: rows.length, breaks: breaks, genesis_reachable: genesis };
+  }
+
+  try {
+    window.__rqOrganReceipts = () => organLoad();
+    window.__rqOrganVerify = organVerifyChain;
+    window.__rqOrganVector = () => organVectorLoad();
+  } catch (_) {}
+
   // ---------- Dispatch ----------
   let busy = false;
   // Per-round state set in dispatch and read further down the call chain.
@@ -15684,7 +16012,8 @@ end $$;`;
         // touches them.
         try {
           _smRecord = null;
-          await runSteelman(query, result, allAnswers, calls, (ledger || []).length + 1);
+          await runSteelman(query, result, allAnswers, (result && result._calls) || [],
+        (ledger || []).length + 1);
         } catch (e) {
           logError("[STEELMAN] pass threw: " + ((e && e.message) || e) + " — round unaffected.");
         }
@@ -15781,6 +16110,14 @@ end $$;`;
           prompt: query,
           outcome: divided ? "divided" : (result.trust || "unknown"),
           counts: result.agreedCount != null ? `${result.agreedCount}/${result.eligibleCount}` : "",
+          // v4.35.1 — WHICH seats agreed, not just how many. Only the count was
+          // stored, so the export could not tell a confirming seat from a seat
+          // that merely answered — and listed all of them under a CONFIRMING
+          // SEATS heading on a 2/3 round. An export whose seat accounting
+          // disagrees with itself is not usable as evidence.
+          ...(result && Array.isArray(result._agreed) && result._agreed.length
+            ? { agreed_seats: result._agreed.map((a) => a && a.name).filter(Boolean) }
+            : {}),
           verdict: divided ? null : clip(result.text, 600),
           // v4.31.4 — the export needs to know WHICH seat spoke, or it cannot
           // find that seat's verbatim text in the full-text store. v4.31.3 read
@@ -16250,6 +16587,27 @@ end $$;`;
         "model that actually produced it, captured at ANSWER time before adjudication can overwrite it. " +
         "A proxy answer renders in seat memory as \"<model>, speaking for <seat>\", never under the seat " +
         "name. Agreement among proxies alone caps the round at PROVISIONAL.");
+      // §10.2 — exact boot strings. The feature-class line records the operator
+      // fork override on the record, because the council's verdict was fork and
+      // the build proceeded anyway.
+      (function () {
+        const m = organMode();
+        if (m === "off") {
+          logError("\u25C7 [ORGAN] Plastic organ OFF \u2014 no vector, no receipts, no local model; dispatch " +
+            "byte-identical. Toggle: localStorage rq_plastic_organ_a = \"shadow\"|\"live\".");
+        } else {
+          logError("\u25C6 [ORGAN] Feature class: prompt-and-routing-level plasticity (operator ruling " +
+            "2026-09-14 \u2014 fork override: the organ is built). SLICE 1 of the v1.3.1 spec: receipts " +
+            "and vector store only. The seam, retrieval influence, tripwires and the kill suite are NOT " +
+            "in this build \u2014 nothing routes, nothing is gated, no retrieval is affected.");
+          logError(m === "shadow"
+            ? "\u25D0 [ORGAN-A] Claim-ledger vector SHADOW \u2014 computing and receipting the 16-d " +
+              "governance vector; no retrieval/routing influence. Governance tooling, not a " +
+              "substrate-change claim."
+            : "\u25C6 [ORGAN-A] Claim-ledger vector LIVE \u2014 flag set, but the seam is not built in " +
+              "slice 1, so behaviour is identical to SHADOW. No retrieval is affected by this build.");
+        }
+      })();
       logError(steelmanEnabled()
         ? "\u25C7 [STEELMAN] Mandatory dissent ON \u2014 fires only on rounds closing VERIFIED 3/3, or VERIFIED 2/2 on a degraded roster (+1 call, rotated seat fixed before dispatch). A full-roster VERIFIED 2/3 does NOT fire: a live seat already diverged. Manufactured dissent is tagged authority:manufactured \u2014 never embedded, never retrieved, never counted as a seat position, and it never changes the verdict. Base dispatch byte-identical."
         : "\u25C7 [STEELMAN] OFF \u2014 no dissent pass, no writes, dispatch byte-identical.");
