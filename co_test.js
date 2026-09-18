@@ -17,6 +17,10 @@ eval([grab(/  const clip = .*/), grab(/  function ftDigest\(s\) \{[\s\S]*?\n  \}
       grab(/  function coPendSet\(v\) \{[\s\S]*?\n  \}/),
       grab(/  function coScanRequests\(answers\) \{[\s\S]*?\n  \}/),
       grab(/  const RQ_CO_TRANSFORM = .*/).replace(/^\s*const /,"var "),
+      grab(/  const RQ_CO_XML_RE = .*/).replace(/^\s*const /,"var "),
+      grab(/  function coIsStructured\(text, ctype\) \{[\s\S]*?\n  \}/),
+      grab(/  const RQ_CO_DIRECT_OK = .*/).replace(/^\s*const /,"var "),
+      grab(/  function coPrefersDirect\(url\) \{[\s\S]*?\n  \}/),
       grab(/  function coExtract\(html, ctype\) \{[\s\S]*?\n  \}/),
       grab(/  const RQ_CO_REWRITES = \[[\s\S]*?\n  \];/).replace(/^\s*const /,"var "),
       grab(/  function coRewrite\(url\) \{[\s\S]*?\n  \}/),
@@ -25,7 +29,7 @@ eval([grab(/  const clip = .*/), grab(/  function ftDigest\(s\) \{[\s\S]*?\n  \}
       grab(/  function coParseRequest\(raw\) \{[\s\S]*?\n  \}/),
       grab(/  const RQ_CO_INSTRUCTION =[\s\S]*?through the URL\.";/).replace(/^\s*const /,"var ")].join("\n") +
      "\nglobalThis.coScanRequests=coScanRequests;globalThis.coExtract=coExtract;globalThis.coPendGet=coPendGet;" +
-     "globalThis.coRewrite=coRewrite;globalThis.coTruncate=coTruncate;globalThis.coParseRequest=coParseRequest;globalThis.STANDING=RQ_CO_STANDING;globalThis.INSTR=RQ_CO_INSTRUCTION;");
+     "globalThis.coIsStructured=coIsStructured;globalThis.coPrefersDirect=coPrefersDirect;globalThis.coRewrite=coRewrite;globalThis.coTruncate=coTruncate;globalThis.coParseRequest=coParseRequest;globalThis.STANDING=RQ_CO_STANDING;globalThis.INSTR=RQ_CO_INSTRUCTION;");
 
 let p=0,f=0;
 const t=(n,g,w)=>{const ok=JSON.stringify(g)===JSON.stringify(w);ok?(p++,console.log("  PASS  "+n)):(f++,console.log("  FAIL  "+n+"  got "+JSON.stringify(g)));};
@@ -211,6 +215,37 @@ tt("if the proxy also fails, the ORIGINAL failure is reported",
    /the read proxy also failed/.test(src));
 tt("the dependency risk is acknowledged in source",
    /can go down, rate-limit, or start\s+\/\/\s+charging|degrades to direct\+paste/.test(src));
+
+console.log("\n--- v4.35.3: XML is not HTML, and strip-tags ate it ---");
+// Rounds 104-105: an arXiv Atom feed arrived as 612 chars of empty markdown
+// links. Every <entry> was stripped. Three seats spent two rounds reasoning
+// about whether an empty result meant "no such paper" or "broken query" when
+// the real answer was "the transform deleted the payload".
+const atom = '<?xml version="1.0"?><feed><title>Query</title><entry>' +
+  '<title>Nonuniqueness of weak solutions</title><author><name>Buckmaster</name></author>' +
+  '<summary>We prove nonuniqueness.</summary></entry></feed>';
+const kept = coExtract(atom, "application/atom+xml");
+tt("entry content survives the transform",
+   /Buckmaster/.test(kept) && /Nonuniqueness/.test(kept) && /We prove/.test(kept));
+tt("and the tags survive, so a seat can parse it", /<entry>/.test(kept));
+tt("XML is detected by content even without a content-type",
+   coIsStructured(atom, "") === true);
+tt("RSS counts too", coIsStructured('<rss version="2.0"><channel/></rss>',"") === true);
+tt("HTML is still stripped", !/<p>|script/.test(coExtract("<html><body><script>x()</script><p>T</p></body></html>","text/html")));
+tt("plain text still passes through", coExtract("just text","text/plain") === "just text");
+
+console.log("\n--- v4.35.3: CORS-open hosts are never proxied ---");
+tt("export.arxiv.org prefers direct", coPrefersDirect("https://export.arxiv.org/api/query?x=1"));
+tt("so does the GitHub API", coPrefersDirect("https://api.github.com/repos/a/b"));
+tt("an arbitrary host does NOT", coPrefersDirect("https://example.com/page") === false);
+tt("a lookalike subdomain does not match",
+   coPrefersDirect("https://export.arxiv.org.evil.com/x") === false);
+tt("the proxy is skipped for those hosts, with the reason logged",
+   /NOT retrying/.test(src) && /a direct failure is a real failure/.test(src));
+tt("and the cost of an extra hop is stated",
+   /one more link\s+\/\/ from the source|one more link from the source/.test(src));
+tt("the receipt declares when tags were preserved",
+   /structured feed, tags preserved/.test(src));
 
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
