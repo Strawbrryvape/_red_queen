@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v5.0.0-plastic-organ";
+  const RQ_BUILD = "v5.0.2-organ-toggle";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -4612,9 +4612,21 @@ roundData,
         ["companionToggle", "rq_companion", "OPERATOR COMPANION",
          "A chat panel for you \u2014 prompt drafting, asking why a round came out as it did, thinking out loud. NOT a seat: it never votes, never enters consensus, never appears in headers or stats. It reads the ledger; the council can never read it. Reload to mount.",
          "No companion panel."],
+        // v5.0.2 — TRI-STATE, using the v3.9.10 cycling mechanism. Shipped with
+        // five elements, which took the BINARY path and wrote "on" — a value
+        // organMode() does not recognise, so it read back as OFF. The button
+        // would have said ON while the organ was off: precisely the
+        // "control that lies about state" the F0 comment below warns against.
+        //
+        // `read` is organMode() itself rather than raw localStorage, so the
+        // button can never disagree with the module about what is running.
         ["organToggle", "rq_plastic_organ_a", "PLASTIC ORGAN (A)",
-         "\u26A0 SLICE 1 \u2014 EVIDENCE LAYER ONLY. Computes a 16-d governance vector and writes sha256-chained receipts. It routes nothing, gates nothing, and affects no retrieval in this build. Tri-state via localStorage rq_plastic_organ_a = shadow|live; the toggle sets shadow. Receipts: window.__rqOrganReceipts(), chain check: __rqOrganVerify().",
-         "No vector, no receipts, no local model; dispatch byte-identical."],
+         "\u26A0 SLICE 1 \u2014 EVIDENCE LAYER ONLY. Computes a 16-d governance vector and writes sha256-chained receipts. It routes nothing, gates nothing, and affects no retrieval in this build. Receipts: window.__rqOrganReceipts(), chain check: __rqOrganVerify().",
+         "No vector, no receipts, no local model; dispatch byte-identical.",
+         { read: () => organMode(), cycle: [
+           ["off", "Plastic organ OFF \u2014 no vector, no receipts, dispatch byte-identical."],
+           ["shadow", "SHADOW \u2014 the 16-d vector is computed and receipted every round. Nothing is routed and no retrieval changes. This is the state to run before slice 2 exists."],
+           ["live", "LIVE \u2014 flag set, but the seam is NOT built in slice 1, so behaviour is identical to SHADOW. It becomes meaningful only when the retrieval seam lands."]] }],
         ["steelmanToggle", "rq_steelman", "STEELMAN",
          "\u26A0 +1 CALL ON VERIFIED ROUNDS. Before a unanimous round closes, one rotated seat must argue the strongest case AGAINST it. Marked MANUFACTURED DISSENT, never counted as a position, never embedded, never retrieved. The verdict does not change \u2014 a VERIFIED round with a weak steelman is better evidence than one with none.",
          "Unanimous rounds close unchallenged. \u2018Solid\u2019 and \u2018unchallenged\u2019 look identical."],
@@ -15206,26 +15218,56 @@ end $$;`;
 
   let _voiceQueue = [];
   let _voiceWatchdog = null;
+  let _voiceSeq = 0;             // invalidates late callbacks from a cancelled run
 
-  // v4.32.1 — ANDROID WATCHDOG. Chrome stops speech at roughly fifteen seconds
-  // unless pause/resume is called, and it does so SILENTLY — a long verdict just
-  // ends mid-sentence with no error and no onend. The workaround is ugly and is
-  // the documented one: poke the engine on a timer while it is speaking.
+  // v5.0.1 — CHUNKING. THE FIRST-SENTENCE CUT.
   //
-  // Cleared in voiceStop, so a cancelled utterance cannot leave a timer running
-  // against a dead queue.
-  function voiceKeepAlive() {
-    try { clearInterval(_voiceWatchdog); } catch (_) {}
-    _voiceWatchdog = setInterval(() => {
-      try {
-        const s = window.speechSynthesis;
-        if (!s || !s.speaking) { clearInterval(_voiceWatchdog); _voiceWatchdog = null; return; }
-        s.pause(); s.resume();
-      } catch (_) { try { clearInterval(_voiceWatchdog); } catch (__) {} _voiceWatchdog = null; }
-    }, 10000);
+  // Chrome's default TTS engine truncates a single utterance at roughly
+  // 200-300 characters on many Android devices, not only on iOS. A council
+  // answer is 2,000+ characters, so playback stopped after the first sentence
+  // every time, on every seat.
+  //
+  // I dismissed this fix earlier in the build on the reasoning that the limit
+  // was iOS-specific. It is not. The watchdog shipped instead cannot help: it
+  // fires at fifteen seconds and the cut happens in three.
+  //
+  // Split on sentence boundaries where possible, hard-split only when a single
+  // sentence exceeds the cap, and never mid-word.
+  const RQ_VOICE_CHUNK = 200;
+  function voiceChunks(text) {
+    const out = [];
+    const sentences = String(text || "").match(/[^.!?\n]+[.!?]*\s*/g) || [String(text || "")];
+    let buf = "";
+    sentences.forEach((s) => {
+      if ((buf + s).length <= RQ_VOICE_CHUNK) { buf += s; return; }
+      if (buf) { out.push(buf.trim()); buf = ""; }
+      if (s.length <= RQ_VOICE_CHUNK) { buf = s; return; }
+      // One sentence longer than the cap: split on word boundaries so the
+      // listener never hears a word cut in half.
+      let rest = s;
+      while (rest.length > RQ_VOICE_CHUNK) {
+        let cut = rest.lastIndexOf(" ", RQ_VOICE_CHUNK);
+        if (cut < RQ_VOICE_CHUNK * 0.5) cut = RQ_VOICE_CHUNK;   // no space found; hard cut
+        out.push(rest.slice(0, cut).trim());
+        rest = rest.slice(cut);
+      }
+      buf = rest;
+    });
+    if (buf.trim()) out.push(buf.trim());
+    return out.filter(Boolean);
   }
 
+  // v5.0.1 — the pause/resume watchdog is REMOVED, not disabled.
+  //
+  // It existed to survive Chrome's ~15s cutoff on long utterances. With
+  // chunking, no utterance runs long enough to reach that cutoff, so the
+  // workaround has nothing left to do — and pause()/resume() is itself
+  // unreliable on Android, where it can terminate speech on some engines.
+  // A workaround that is no longer needed and can cause the fault it was
+  // meant to prevent is worse than absent.
+
   function voiceStop() {
+    _voiceSeq++;                   // orphans every pending onend from the old run
     try { clearInterval(_voiceWatchdog); } catch (_) {}
     _voiceWatchdog = null;
     try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (_) {}
@@ -15246,18 +15288,35 @@ end $$;`;
     if (!clean) { logError("[VOICE] nothing readable in that position after stripping scaffolding."); return false; }
     voiceStop();
     try {
-      const u = new SpeechSynthesisUtterance(clean);
       const v = voiceForSeat(seat);
-      if (v) { u.voice = v; u.lang = v.lang; }
-      u.rate = voiceRate();
+      const rate = voiceRate();
+      const chunks = voiceChunks(clean);
+      const seq = ++_voiceSeq;      // any callback from an older run is ignored
+      _voiceQueue = chunks.slice();
       if (btn) { btn.classList.add("is-playing"); btn.textContent = "\u25a0"; }
-      u.onend = () => { if (btn) { btn.classList.remove("is-playing"); btn.textContent = "\u25b6"; } };
-      u.onerror = () => {
+      const done = () => {
         if (btn) { btn.classList.remove("is-playing"); btn.textContent = "\u25b6"; }
-        logError("[VOICE] playback failed \u2014 the round is unaffected.");
       };
-      window.speechSynthesis.speak(u);
-      voiceKeepAlive();
+      const speakNext = (i) => {
+        // A cancelled or superseded run must not resurrect itself from a
+        // pending onend. The sequence check is what makes stop actually stop.
+        if (seq !== _voiceSeq) return;
+        if (i >= chunks.length) { done(); return; }
+        const u = new SpeechSynthesisUtterance(chunks[i]);
+        if (v) { u.voice = v; u.lang = v.lang; }
+        u.rate = rate;
+        u.onend = () => speakNext(i + 1);
+        u.onerror = () => {
+          if (seq !== _voiceSeq) return;
+          // Report once and stop, rather than grinding through every remaining
+          // chunk against an engine that has already failed.
+          done();
+          logError("[VOICE] playback failed at part " + (i + 1) + " of " + chunks.length +
+            " \u2014 the round is unaffected.");
+        };
+        window.speechSynthesis.speak(u);
+      };
+      speakNext(0);
       return true;
     } catch (e) {
       logError("[VOICE] " + ((e && e.message) || e));
