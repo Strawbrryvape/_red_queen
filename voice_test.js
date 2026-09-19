@@ -13,8 +13,10 @@ eval([grab(/  const RQ_VOICE_RATE_K = .*/).replace(/^\s*const /,"var "),
       grab(/  function voiceRate\(\) \{[\s\S]*?\n  \}/),
       "var _voices=[];function voiceLoad(){return _voices;}",
       grab(/  function voiceForSeat\(seat\) \{[\s\S]*?\n  \}/),
-      grab(/  function voiceClean\(text\) \{[\s\S]*?\n  \}/)].join("\n") +
-     "\nglobalThis.voiceClean=voiceClean;globalThis.voiceForSeat=voiceForSeat;" +
+      grab(/  function voiceClean\(text\) \{[\s\S]*?\n  \}/),
+      grab(/  const RQ_VOICE_CHUNK = .*/).replace(/^\s*const /,"var "),
+      grab(/  function voiceChunks\(text\) \{[\s\S]*?\n  \}/)].join("\n") +
+     "\nglobalThis.voiceChunks=voiceChunks;globalThis.CHUNK=RQ_VOICE_CHUNK;globalThis.voiceClean=voiceClean;globalThis.voiceForSeat=voiceForSeat;" +
      "globalThis.voiceRate=voiceRate;globalThis.setVoices=(v)=>{_voices=v;};");
 
 let p=0,f=0;
@@ -62,17 +64,46 @@ tt("a missing speechSynthesis is reported, not silently ignored",
    /this browser has no speech synthesis/.test(src));
 tt("flag defaults OFF", /localStorage\.getItem\("rq_voice"\) === "on"/.test(src));
 
-console.log("\n--- v4.32.1: Android-specific defects ---");
-// Chrome stops speech at ~15s unless poked, and does it SILENTLY — a long
-// verdict ends mid-sentence with no error and no onend.
-tt("a keep-alive watchdog exists", /function voiceKeepAlive\(\)/.test(src));
-tt("it pokes the engine below the 15s cutoff", /\}, 10000\);/.test(src));
-tt("it clears itself once speech ends", /if \(!s \|\| !s\.speaking\) \{ clearInterval/.test(src));
-tt("and voiceStop clears it, so no timer runs against a dead queue",
-   /function voiceStop\(\) \{\s*try \{ clearInterval\(_voiceWatchdog\)/.test(src));
-tt("speech stops when the tab is backgrounded",
+console.log("\n--- v4.32.1 -> v5.0.1: the Android story, superseded ---");
+// v4.32.1 added a pause/resume watchdog for Chrome's ~15s cutoff. v5.0.1
+// removed it: with chunking no utterance reaches 15s, and pause()/resume() can
+// itself terminate speech on some Android engines. The superseding is asserted
+// rather than the assertions being deleted, so a later reader can see the
+// workaround existed and why it went.
+tt("the watchdog is gone", !/setInterval\([\s\S]{0,200}pause\(\); s\.resume\(\)/.test(src));
+tt("speech still stops when the tab is backgrounded",
    /visibilitychange/.test(src) && /document\.hidden/.test(src));
-tt("the silent-failure reason is documented", /and it does so SILENTLY/.test(src));
+tt("chunking replaced it as the real fix",
+   /RQ_VOICE_CHUNK/.test(src) && /THE FIRST-SENTENCE CUT/.test(src));
+
+console.log("\n--- v5.0.1: THE FIRST-SENTENCE CUT ---");
+// Chrome's default TTS engine truncates a single utterance around 200-300
+// chars on many Android devices, not only iOS. A council answer is 2,000+, so
+// playback stopped after the first sentence on every seat. The 15s watchdog
+// could not help: the cut happens in three seconds.
+const long = "My position is that the floor should stay at 0.600. Lowering it admits near-duplicates that crowd out relevant rounds. The council divided on this twice, and both times the argument was about recall rather than precision. I would change my mind given a measured trial.";
+const ch = voiceChunks(long);
+tt("a long answer is split", ch.length > 1);
+tt("every chunk is under the engine cap", ch.every(c => c.length <= CHUNK));
+tt("splitting is lossless",
+   ch.join(" ").replace(/\s+/g," ").trim() === long.replace(/\s+/g," ").trim());
+tt("it prefers sentence boundaries", /\.$/.test(ch[0]));
+tt("a short answer stays a single chunk", voiceChunks("Short answer.").length === 1);
+// text with no punctuation at all must still respect the cap and not cut words
+const nopunc = voiceChunks("word ".repeat(120));
+tt("unpunctuated text still respects the cap", nopunc.every(c => c.length <= CHUNK));
+tt("and does not cut a word in half", nopunc.every(c => !/\bwor$|\bwo$/.test(c)));
+t("empty input yields nothing", voiceChunks(""), []);
+
+console.log("\n--- the queue cannot resurrect itself ---");
+tt("a sequence counter invalidates late callbacks", /if \(seq !== _voiceSeq\) return;/.test(src));
+tt("and stop increments it", /_voiceSeq\+\+;\s*\/\/ orphans every pending onend/.test(src));
+tt("an error stops the run rather than grinding through remaining chunks",
+   /rather than grinding through every remaining\s+\/\/ chunk|playback failed at part/.test(src));
+
+console.log("\n--- the watchdog is removed, not disabled ---");
+tt("voiceKeepAlive no longer exists", !/function voiceKeepAlive/.test(src));
+tt("and the removal is explained", /A workaround that is no longer needed and can cause the fault/.test(src));
 
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
