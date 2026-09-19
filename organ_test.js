@@ -123,6 +123,35 @@ tt("signature is named as client-identity, NOT hardware attestation",
    /hardware attestation/.test(src) && /determined operator can forge it/i.test(src));
 tt("flag defaults OFF", /\(v === "shadow" \|\| v === "live"\) \? v : "off"/.test(src));
 
+console.log("\n--- v5.0.2: the toggle must not lie about state ---");
+// Shipped with a 5-element tuple, which took the BINARY path and wrote "on" —
+// a value organMode() does not recognise. The button would have read ON while
+// the organ was OFF. Exactly the failure the v3.9.10 F0 comment warns about.
+tt("the organ tuple has the tri-state cycling element",
+   /\["organToggle", "rq_plastic_organ_a"[\s\S]{0,1400}\{ read: \(\) => organMode\(\), cycle:/.test(src));
+tt("read is organMode itself, not raw localStorage",
+   /read: \(\) => organMode\(\)/.test(src));
+tt("the cycle is off -> shadow -> live",
+   /\["off",[\s\S]{0,240}\["shadow",[\s\S]{0,320}\["live",/.test(src));
+tt("so one tap from off lands on SHADOW", /\["off",[\s\S]{0,240}\["shadow"/.test(src));
+tt("and LIVE states plainly that slice 1 makes it identical to shadow",
+   /the seam is NOT built in slice 1, so behaviour is identical to SHADOW/.test(src));
+tt("the shipped defect is recorded, not quietly corrected",
+   /control that lies about state/.test(src));
+// state round-trip through the accessor
+STORE["rq_plastic_organ_a"]="shadow"; t("shadow reads back", organMode(), "shadow");
+STORE["rq_plastic_organ_a"]="live";   t("live reads back", organMode(), "live");
+STORE["rq_plastic_organ_a"]="on";     t("a stale binary value reads as off", organMode(), "off");
+STORE["rq_plastic_organ_a"]="off";    t("off reads back", organMode(), "off");
+
+console.log("\n--- mobile ---");
+tt("the organ renders no UI of its own \u2014 nothing to break on a phone",
+   !/rq-organ-panel|organPanel/.test(src));
+tt("the toggle uses the same full-width rack styling as every other button",
+   /margin-top:10px;width:100%;opacity:0\.85;/.test(src));
+tt("a non-secure context refuses loudly rather than writing null digests",
+   /secure context required/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
 })();
