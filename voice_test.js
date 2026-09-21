@@ -12,11 +12,15 @@ eval([grab(/  const RQ_VOICE_RATE_K = .*/).replace(/^\s*const /,"var "),
       grab(/  function voiceEnabled\(\) \{.*\}/),
       grab(/  function voiceRate\(\) \{[\s\S]*?\n  \}/),
       "var _voices=[];function voiceLoad(){return _voices;}",
+      grab(/  const RQ_VOICE_SEAT_ORDER = .*/).replace(/^\s*const /,"var "),
+      grab(/  const RQ_VOICE_SEAT_PITCH = .*/).replace(/^\s*const /,"var "),
+      grab(/  function voiceSeatIndex\(seat\) \{[\s\S]*?\n  \}/),
       grab(/  function voiceForSeat\(seat\) \{[\s\S]*?\n  \}/),
+      grab(/  function voicePitchForSeat\(seat\) \{[\s\S]*?\n  \}/),
       grab(/  function voiceClean\(text\) \{[\s\S]*?\n  \}/),
       grab(/  const RQ_VOICE_CHUNK = .*/).replace(/^\s*const /,"var "),
       grab(/  function voiceChunks\(text\) \{[\s\S]*?\n  \}/)].join("\n") +
-     "\nglobalThis.voiceChunks=voiceChunks;globalThis.CHUNK=RQ_VOICE_CHUNK;globalThis.voiceClean=voiceClean;globalThis.voiceForSeat=voiceForSeat;" +
+     "\nglobalThis.voiceChunks=voiceChunks;globalThis.CHUNK=RQ_VOICE_CHUNK;globalThis.voiceClean=voiceClean;globalThis.voiceForSeat=voiceForSeat;globalThis.voicePitchForSeat=voicePitchForSeat;" +
      "globalThis.voiceRate=voiceRate;globalThis.setVoices=(v)=>{_voices=v;};");
 
 let p=0,f=0;
@@ -104,6 +108,26 @@ tt("an error stops the run rather than grinding through remaining chunks",
 console.log("\n--- the watchdog is removed, not disabled ---");
 tt("voiceKeepAlive no longer exists", !/function voiceKeepAlive/.test(src));
 tt("and the removal is explained", /A workaround that is no longer needed and can cause the fault/.test(src));
+
+console.log("\n--- v5.0.5: every seat sounded the same ---");
+// The picker hashed the seat name modulo the voice count. With 3 or 4 voices
+// that COLLIDES — exactly the counts where three distinct seats should fit.
+// And a device with one English voice had nothing to vary at all.
+const SEATS=["gemini","kimi","claude"];
+const distinct=(n)=>{
+  setVoices(Array.from({length:n},(_,i)=>({name:"V"+i,lang:"en-US"})));
+  return new Set(SEATS.map(s=>voiceForSeat(s).name+"|"+voicePitchForSeat(s))).size;
+};
+[1,2,3,4,5,8].forEach(n=>t("three seats distinguishable with "+n+" voice(s)", distinct(n), 3));
+setVoices([{name:"V0",lang:"en-US"},{name:"V1",lang:"en-US"},{name:"V2",lang:"en-US"}]);
+tt("with exactly three voices, each seat gets its own",
+   new Set(SEATS.map(s=>voiceForSeat(s).name)).size===3);
+tt("pitch differs per seat — the lever that works on a one-voice device",
+   new Set(SEATS.map(s=>voicePitchForSeat(s))).size===3);
+tt("a fallback-labelled seat still resolves to its own pitch",
+   voicePitchForSeat("Kimi [fallback: OpenRouter x]") === voicePitchForSeat("kimi"));
+tt("pitch is applied to the utterance", /u\.pitch = pitch;/.test(src));
+tt("the hash is gone", !/h % pool\.length/.test(src));
 
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
