@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v5.0.2-organ-toggle";
+  const RQ_BUILD = "v5.0.4-rdsr-labels";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -989,7 +989,39 @@
         (detail ? " — " + detail : " — no error body returned"));
     }
     const data = await res.json();
-    return data.content?.map((b) => b.text || "").join("") || "";
+    const text = data.content?.map((b) => b.text || "").join("") || "";
+    // v5.0.3 — TRUNCATION WAS SILENT ON THIS SEAT ALONE.
+    //
+    // Round 111: the speaking seat's L3 ended mid-sentence — "replace with
+    // 'the ledger records, and" — and nothing anywhere said so. The truncated
+    // text was stored, rendered, exported and embedded as a complete position.
+    //
+    // Gemini checks finishReason and auto-continues. Kimi checks finish_reason
+    // and throws. Claude checked nothing, so a cut answer was indistinguishable
+    // from a finished one. A seat that stops mid-clause is not a short answer;
+    // it is a missing one wearing the shape of an answer.
+    //
+    // Not auto-continued here: that is the Gemini continuation loop's job and
+    // wiring a second one on a different provider is a bigger change than the
+    // defect warrants. Declared instead, with the marker carried INTO the text
+    // so a later reader of the ledger sees it too — a drawer line alone would
+    // not survive into the export or the embedding.
+    try {
+      const stop = data.stop_reason || null;
+      if (stop === "max_tokens") {
+        logError("\u26A0 [CLAUDE] stop_reason=max_tokens \u2014 the answer was CUT at the " +
+          CLAUDE_MAX_TOKENS + "-token ceiling (" + text.length + " chars returned). It is stored with " +
+          "a truncation marker rather than silently as a complete position. Raise CLAUDE_MAX_TOKENS if " +
+          "this repeats on substantive rounds.");
+        return text + "\n\n[TRUNCATED — this seat hit its output ceiling mid-answer. The text above is " +
+          "incomplete and its final sentence is cut. Do not read the ending as the seat's conclusion.]";
+      }
+      if (stop && stop !== "end_turn" && stop !== "stop_sequence") {
+        logError("[CLAUDE] stop_reason=" + stop + " (" + text.length + " chars) \u2014 not a normal " +
+          "completion; recorded so the round is not read as clean.");
+      }
+    } catch (_) {}
+    return text;
   }
 
   // ---------- Divergence detection (no-consensus, by design) ----------
@@ -6342,7 +6374,7 @@ roundData,
       // hydration cannot mutate the snapshot mid-flight. Entries are never
       // mutated after being written, so a shallow slice is sufficient.
       const entries = ledger.slice();
-      let hydrated = 0, idbWarned = false;
+      let hydrated = 0, idbMisses = 0;
       const rounds = [];
       for (let ei = 0; ei < entries.length; ei++) {
         const e = entries[ei];
@@ -6367,9 +6399,16 @@ roundData,
                 const map = await readFullText(e.t);            // IDB path
                 const raw = rawSeatForPosition(e, pi);
                 if (map && typeof map[raw] === "string") ft = map[raw];
-                else if (!map && !idbWarned) {
-                  idbWarned = true;
-                  logError("[SNAPSHOT] fullText store unavailable — exporting clips only.");
+                else if (!map) {
+                  // v5.0.3 — THE MESSAGE WAS STRONGER THAN THE OBSERVATION.
+                  // readFullText returning null for ONE round was reported as
+                  // "fullText store unavailable", which says the store is broken
+                  // when the store is usually fine and simply has no record for
+                  // that round — rounds predating F1, or rounds whose detached
+                  // write failed. Round 111's snapshot: 110 rounds, 62 with full
+                  // text, and a message implying the other 48 were lost to a
+                  // fault rather than never written.
+                  idbMisses++;
                 }
               } catch (_) {}
             }
@@ -6397,7 +6436,13 @@ roundData,
       downloadJson(filename, text);
       try { sessionStorage.setItem("rq_snapshot_done_session", "1"); } catch (_) {}
       logError("[SNAPSHOT] export complete — " + rounds.length + " rounds (" + hydrated +
-        " with full text), " + text.length + " chars → " + filename);
+        " with full text), " + text.length + " chars \u2192 " + filename +
+        (idbMisses
+          ? ". " + idbMisses + " position(s) had no verbatim record and exported as clips \u2014 " +
+            "rounds predating the full-text ledger, or whose detached write did not land. This is a " +
+            "gap in the archive, NOT a broken store: the " + hydrated + " hydrated above came from the " +
+            "same IndexedDB in the same pass."
+          : ""));
       maybeShowSnapshotBanner();
     } catch (e) {
       logError("[SNAPSHOT] export threw: " + ((e && e.message) || e));
@@ -7646,7 +7691,7 @@ roundData,
     // A bare label is skipped entirely. A label WITH content on the same line has
     // the label stripped, because the content after it IS the position — see
     // csFirstLineMeta, which applies this before scoring.
-    if (/^[*#>\-\u2022\s]*L[1-4]\b[^\n:]{0,20}:\s*$/i.test(bare)) return true;
+    if (/^[*#>\-\u2022\s]*L[1-4]\b[^\n:]{0,40}:\s*$/i.test(bare)) return true;
     // (c-2) v4.21.1 — ANY bare "<short phrase>:" with nothing after it.
     // Live 2026-08-27: a seat opened "**My position:**" on its own line and Gate
     // 1 scored that as its position — against two seats that had written real
@@ -7696,7 +7741,7 @@ roundData,
       // line: "L1 POSITION: Decoupling sessions..." scores as "Decoupling
       // sessions...". Without this, every seat's first line begins with the
       // same three words and Gate 1 measures the instruction, not the answer.
-      const _rdsrStrip = l.replace(/^[*#>\-\u2022\s]*L[1-4]\b[^\n:]{0,20}:\s*/i, "").trim();
+      const _rdsrStrip = l.replace(/^[*#>\-\u2022\s]*L[1-4]\b[^\n:]{0,40}:\s*/i, "").trim();
       if (_rdsrStrip && _rdsrStrip !== l && _rdsrStrip.length >= 20) {
         return { line: _rdsrStrip, skipped: skipped };
       }
@@ -11117,14 +11162,31 @@ end $$;`;
   // Why it gets its own flag rather than riding the falsifier ask: it changes
   // the SHAPE of every answer, not just its tail. Rounds run with it are not
   // comparable to rounds without, and that has to be a deliberate choice.
+  // v5.0.4 — SELF-DESCRIBING HEADERS. The bare "L1" / "L2" labels meant
+  // nothing to a reader who had not been told the scheme — including the
+  // operator, who built it and still had to look it up. A UI legend was the
+  // obvious fix and the wrong one: it would not survive into the export, the
+  // ledger, or a position pasted into an email. The parenthetical rides in the
+  // text itself, so the artifact explains itself wherever it ends up.
+  //
+  // ⚠ THE REGEX HAD TO WIDEN, and I first wrote a comment claiming it did
+  // not. " POSITION (what I hold)" is 23 characters and the pattern allowed 20,
+  // so the detector would have reported "NO seat returned the four-level
+  // structure" on every armed round while the seats returned it perfectly.
+  // That is the same false-negative that shipped in v4.16.0 and again in
+  // v4.17.1 — third time for this one detector. The suite caught it; reading
+  // did not.
   const RQ_RDSR_ASK =
-    "Structure your answer in four labelled levels, in this order:\n" +
-    "L1 POSITION: what you hold.\n" +
-    "L2 ATTACK: the strongest argument AGAINST your own L1 — argue it as an opponent would, " +
+    "Structure your answer in four labelled levels, in this order. Write the labels exactly as " +
+    "shown, parentheses included \u2014 a later reader may see this answer with no explanation of " +
+    "the scheme attached:\n" +
+    "L1 POSITION (what I hold): your position.\n" +
+    "L2 ATTACK (the strongest case against my own L1): argue it as an opponent would, " +
     "not as a caveat you can dismiss.\n" +
-    "L3 DEFENCE: answer your own L2, or concede it. If L2 defeats L1, say so and revise L1 — " +
-    "reversing yourself here is a success of this process, not a failure of your reasoning.\n" +
-    "L4 FALSIFIER: what would change your mind, beginning with FALSIFIER: on its own line.";
+    "L3 DEFENCE (answering my own L2): answer it, or concede it. If L2 defeats L1, say so and " +
+    "revise L1 \u2014 reversing yourself here is a success of this process, not a failure of your " +
+    "reasoning.\n" +
+    "L4 FALSIFIER (what would change my mind): begin with FALSIFIER: on its own line.";
   // v4.17.1 — MARKDOWN-TOLERANT. The first version anchored on ^L1 with no
   // allowance for decoration, and seats bold their section headers by default.
   // Live 2026-08-23: a round returned a textbook four-level answer and the
@@ -11137,9 +11199,9 @@ end $$;`;
   // the label float mid-sentence: it is still anchored to line start, so prose
   // mentioning "my L1 position" cannot match.
   const RQ_RDSR_DECOR = "^(?:[ \\t]*[*#>\\-\\u2022]{1,4})*[ \\t]*";
-  const RQ_RDSR_L1_RE = new RegExp(RQ_RDSR_DECOR + "L1\\b[^\\n:]{0,20}:", "im");
+  const RQ_RDSR_L1_RE = new RegExp(RQ_RDSR_DECOR + "L1\\b[^\\n:]{0,40}:", "im");
   const RQ_RDSR_L3_RE = new RegExp(
-    RQ_RDSR_DECOR + "L3\\b[^\\n:]{0,20}:([\\s\\S]{0,600}?)(?:\\n[ \\t]*[*#>\\-]{0,4}[ \\t]*L4\\b|$)", "im");
+    RQ_RDSR_DECOR + "L3\\b[^\\n:]{0,40}:([\\s\\S]{0,600}?)(?:\\n[ \\t]*[*#>\\-]{0,4}[ \\t]*L4\\b|$)", "im");
 
   function rdsrEnabled() { return localStorage.getItem("rq_rdsr") === "on"; }
 
@@ -16022,7 +16084,18 @@ end $$;`;
         // gate, every test round mints three new falsifiers while retiring at
         // most three, so the backlog would grow under automation rather than
         // drain. This one condition is what makes autonomous testing converge.
-        ((falsifierAskEnabled() && !_noteRound && !_indexicalRound && !isFalsifierTestRound(query))
+        // v5.0.4 — NOT WHEN RDSR IS ARMED. L4 already asks for a falsifier, so
+        // an armed round was asking each seat for two and getting two
+        // near-identical restatements: six across three seats where three would
+        // do. It also doubled what the reckoning bank ingested, quietly
+        // inflating the trigger surface with duplicates of the same condition.
+        //
+        // The ask is SUPPRESSED rather than L4 being dropped, because L4 sits
+        // inside the argument it belongs to — after the seat has attacked and
+        // defended its own position — which is a better place to state a
+        // falsifier than before it has made one.
+        ((falsifierAskEnabled() && !_noteRound && !_indexicalRound && !isFalsifierTestRound(query)
+          && !(rdsrEnabled() || (_rdsrArm && _rdsrArm.armed)))
           ? ("\n\n" + RQ_FALSIFIER_ASK) : "") +
         // ERCL — appended only when testimony is actually present, so an ordinary
         // round is byte-identical. Seats must be TOLD the ranking; leaving them to
