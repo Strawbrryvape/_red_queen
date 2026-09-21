@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v5.0.4-rdsr-labels";
+  const RQ_BUILD = "v5.0.5-inventory-voices";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -14291,6 +14291,76 @@ end $$;`;
     }
     return null;
   }
+  // v5.0.5 — CODE INVENTORY for large source files.
+  //
+  // The operator wanted to hand the council its own app.js to decide which
+  // features to upgrade or remove. The raw file is ~235K tokens: sent to every
+  // seat plus rebuttal and steelman that is ~1.6M input tokens a round, and
+  // every free fallback seat has an 8K-32K window, so any degraded roster would
+  // truncate or reject it outright.
+  //
+  // More to the point, "which features should go" is a FEATURE-level question
+  // and sixteen thousand lines is the wrong view for it. So a large source file
+  // is reduced to a map: every section header, its line span and size, and the
+  // flag and default-state it is governed by. The council reviews the map and
+  // names sections it wants to read in full.
+  //
+  // Nothing is summarised by a model: this is mechanical extraction from the
+  // file's own section markers, so the map cannot editorialise about what it
+  // describes.
+  const RQ_CODE_INVENTORY_OVER = 60000;   // chars; below this, attach verbatim as before
+  function attCodeInventory(src, name) {
+    const lines = String(src || "").split("\n");
+    const heads = [];
+    lines.forEach((l, i) => {
+      const m = /^\s*\/\/\s*-{6,}\s*(.+?)\s*-{6,}\s*$/.exec(l);
+      if (m) heads.push({ title: m[1], start: i + 1 });
+    });
+    if (!heads.length) return null;
+    // Flag keys, so each section can be matched to what governs it.
+    const flags = {};
+    const flagRe = /\["(\w+Toggle)",\s*"(rq_\w+)",\s*"([^"]+)"/g;
+    let fm;
+    const whole = String(src);
+    while ((fm = flagRe.exec(whole)) !== null) flags[fm[2]] = fm[3];
+    const out = [];
+    heads.forEach((h, idx) => {
+      const end = idx + 1 < heads.length ? heads[idx + 1].start - 1 : lines.length;
+      const body = lines.slice(h.start - 1, end).join("\n");
+      // A feature READS its own flag via getItem; the settings rack merely
+      // LISTS every flag. Matching any mention attributed the whole rack to
+      // whichever section happened to contain it — the first version reported
+      // the model-liveness test as governed by ledger snapshot, ledger search
+      // and the arc flags. For a keep-or-remove decision a map that
+      // misattributes ownership is worse than no map, so only reads count.
+      const keys = Array.from(new Set((body.match(/getItem\(\s*"(rq_[a-z0-9_]+)"/gi) || [])
+        .map((x) => x.replace(/^getItem\(\s*"|"$/gi, "")))).filter((k) => flags[k]);
+      // DEFAULT STATE DELIBERATELY NOT REPORTED. The first version guessed it
+      // from code patterns and labelled the concept comparator "default OFF"
+      // when it defaults LIVE. For a keep-or-remove review that is the single
+      // most dangerous error available — "it is off anyway, cut it" — and the
+      // operator's real current settings are already visible in the rack. A
+      // map should only state what it can read reliably from the file.
+      // Version strings inside the build-stamp line itself are the CURRENT
+      // build, not a modification date, and would make that section read as
+      // freshly changed every release.
+      const dates = (body.replace(/RQ_BUILD = "[^"]*"/, "").match(/v\d+\.\d+\.\d+/g) || []);
+      out.push("\u2022 " + h.title + "  [lines " + h.start + "\u2013" + end + ", " + (end - h.start + 1) +
+        " lines" + (keys.length ? "; flag: " + keys.map((k) => flags[k]).join(", ") : "; no toggle \u2014 always runs") +
+        (dates.length ? "; last touched " + dates[dates.length - 1] : "") + "]");
+    });
+    const build = (whole.match(/RQ_BUILD = "([^"]+)"/) || [])[1] || "unknown";
+    return "CODE INVENTORY \u2014 " + name + " (build " + build + ", " + lines.length + " lines, " +
+      heads.length + " sections)\n" +
+      "This is a mechanical map extracted from the file's own section markers, NOT a summary. It " +
+      "lists every section with its size and the flag it reads, if any. It does NOT state whether a " +
+      "flag is currently on \u2014 that is in the operator's settings, and guessing it from code would " +
+      "invite removing a feature on the belief it is already off. The full source " +
+      "was deliberately not attached: at ~" + Math.round(whole.length / 4000) + "K tokens it would " +
+      "exceed every fallback seat's context window. To read a section in full, name it and the " +
+      "operator will attach it.\n\n" + out.join("\n");
+  }
+
   function attStripDocxXml(xml) {
     return String(xml || "")
       .replace(/<\/w:p>/g, "\n")
@@ -14340,7 +14410,21 @@ end $$;`;
         let text = null;
         if (attIsPdf(f)) text = await attReadPdf(f);
         else if (attIsDocx(f)) text = await attReadDocx(f);
-        else if (attIsText(f)) text = await f.text();
+        else if (attIsText(f)) {
+          text = await f.text();
+          // Large source file: attach the map rather than the raw text.
+          if (/\.(js|ts|py|java)$/i.test(f.name) && text.length > RQ_CODE_INVENTORY_OVER) {
+            const inv = attCodeInventory(text, f.name);
+            if (inv) {
+              logError("[ATTACH] " + f.name + " is " + text.length.toLocaleString() + " chars (~" +
+                Math.round(text.length / 4000) + "K tokens) \u2014 too large for every seat, and far past " +
+                "any fallback window. Attached as a CODE INVENTORY instead: " + inv.split("\n").length +
+                " lines, every section listed with size, flag and default. Ask the council which sections " +
+                "it wants in full.");
+              text = inv;
+            }
+          }
+        }
         else {
           // Unknown type: try text, and if it looks binary, say so rather than
           // attaching mojibake that a seat would try to read.
@@ -14351,7 +14435,11 @@ end $$;`;
           text = t;
         }
         let truncated = false;
-        if (text.length > RQ_ATT_PER_FILE) { text = text.slice(0, RQ_ATT_PER_FILE); truncated = true; }
+        // An inventory is a map; clipping it would silently drop sections from
+        // the end, which is where the newest features live. Allowed up to the
+        // total cap instead of the per-file one.
+        const _cap = /^CODE INVENTORY/.test(text) ? RQ_ATT_MAX_CHARS : RQ_ATT_PER_FILE;
+        if (text.length > _cap) { text = text.slice(0, _cap); truncated = true; }
         _attachments.push({
           name: f.name, kind: attIsPdf(f) ? "pdf" : attIsDocx(f) ? "docx" : "text",
           chars: text.length, text: text,
@@ -15254,15 +15342,44 @@ end $$;`;
 
   // Deterministic per seat: same seat, same device, same voice every time.
   // Falls back to the default voice rather than failing if the device has few.
+  // v5.0.5 — EVERY SEAT SOUNDED THE SAME. Two defects in the picker.
+  //
+  // (1) It hashed the seat name modulo the voice count. With 3 or 4 voices
+  //     available that COLLIDES — gemini and kimi both land on index 0 when
+  //     there are three voices, which is the exact number needed for three
+  //     distinct seats. A hash spreads well over many buckets and badly over
+  //     three; this was the wrong tool for a fixed, tiny set.
+  // (2) Many Android devices expose only one English voice. The picker then
+  //     had nothing to vary and no fallback, so all three were identical.
+  //
+  // Fixed seat order replaces the hash, guaranteeing distinct voices whenever
+  // three exist. And pitch now varies per seat regardless, because pitch is
+  // supported by every engine and is the only lever left when a device offers
+  // a single voice. Deterministic either way: a seat sounds the same every
+  // round on the same device.
+  const RQ_VOICE_SEAT_ORDER = ["gemini", "kimi", "claude"];
+  const RQ_VOICE_SEAT_PITCH = { gemini: 1.0, kimi: 0.72, claude: 1.28 };
+
+  function voiceSeatIndex(seat) {
+    const i = RQ_VOICE_SEAT_ORDER.indexOf(String(seat || "").toLowerCase().split(" ")[0]);
+    return i === -1 ? 0 : i;
+  }
+
   function voiceForSeat(seat) {
     const list = _voices.length ? _voices : voiceLoad();
     if (!list.length) return null;
     const en = list.filter((v) => /^en/i.test(v.lang || ""));
     const pool = en.length ? en : list;
-    let h = 0;
-    const s = String(seat || "");
-    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-    return pool[h % pool.length];
+    // Spread across the pool rather than taking 0,1,2 — on a device with
+    // eight voices, adjacent entries are often the same voice in two regional
+    // variants, which sound nearly identical.
+    const step = Math.max(1, Math.floor(pool.length / RQ_VOICE_SEAT_ORDER.length));
+    return pool[(voiceSeatIndex(seat) * step) % pool.length];
+  }
+
+  function voicePitchForSeat(seat) {
+    const k = RQ_VOICE_SEAT_ORDER[voiceSeatIndex(seat)];
+    return RQ_VOICE_SEAT_PITCH[k] || 1.0;
   }
 
   // Strip the scaffolding a listener does not want read aloud. Markdown symbols
@@ -15352,6 +15469,7 @@ end $$;`;
     try {
       const v = voiceForSeat(seat);
       const rate = voiceRate();
+      const pitch = voicePitchForSeat(seat);
       const chunks = voiceChunks(clean);
       const seq = ++_voiceSeq;      // any callback from an older run is ignored
       _voiceQueue = chunks.slice();
@@ -15367,6 +15485,7 @@ end $$;`;
         const u = new SpeechSynthesisUtterance(chunks[i]);
         if (v) { u.voice = v; u.lang = v.lang; }
         u.rate = rate;
+        u.pitch = pitch;                  // the guaranteed differentiator
         u.onend = () => speakNext(i + 1);
         u.onerror = () => {
           if (seq !== _voiceSeq) return;
