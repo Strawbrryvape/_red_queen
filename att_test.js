@@ -9,12 +9,14 @@ eval([grab(/  const RQ_ATT_MAX_CHARS[\s\S]*?const RQ_PDFJS_WORKER = .*/).replace
       grab(/  function attIsPdf\(f\) \{.*\}/),
       grab(/  function attIsDocx\(f\) \{.*\}/),
       grab(/  function attIsImage\(f\) \{[\s\S]*?\n  \}/),
+      grab(/  const RQ_CODE_INVENTORY_OVER = .*/).replace(/^\s*const /,"var "),
+      grab(/  function attCodeInventory\(src, name\) \{[\s\S]*?\n  \}/),
       grab(/  function attStripDocxXml\(xml\) \{[\s\S]*?\n  \}/),
       grab(/  function attBlock\(\) \{[\s\S]*?\n  \}/)].join("\n")
      .replace("let _attachments = [];","") +
      "\nvar _attachments=[];globalThis.setAtt=(a)=>{_attachments=a;};" +
      "globalThis.attBlock=attBlock;globalThis.attIsImage=attIsImage;globalThis.attIsPdf=attIsPdf;" +
-     "globalThis.attIsDocx=attIsDocx;globalThis.attIsText=attIsText;globalThis.attStripDocxXml=attStripDocxXml;");
+     "globalThis.attIsDocx=attIsDocx;globalThis.attIsText=attIsText;globalThis.attStripDocxXml=attStripDocxXml;globalThis.attCodeInventory=attCodeInventory;");
 
 let p=0,f=0;
 const t=(n,g,w)=>{const ok=JSON.stringify(g)===JSON.stringify(w);ok?(p++,console.log("  PASS  "+n)):(f++,console.log("  FAIL  "+n+"  got "+JSON.stringify(g)));};
@@ -81,6 +83,27 @@ tt("truncation is declared, never bridged",
    /the remainder is NOT summarised/i.test(src));
 tt("images are measured, not read \u2014 the decision is documented",
    /THE IMAGE DECISION|CANNOT see it/.test(src));
+
+console.log("\n--- v5.0.5: the code inventory ---");
+// The full app.js is ~235K tokens: ~1.6M input tokens a round across seats,
+// rebuttal and steelman, and past every fallback window. "Which features
+// should go" is a feature-level question, so large source becomes a map.
+const inv = attCodeInventory(src, "app.js");
+tt("the real app.js produces an inventory", !!inv && /^CODE INVENTORY/.test(inv));
+tt("it is a fraction of the raw size", inv.length < src.length * 0.02);
+tt("it fits a small fallback window (under ~4K tokens)", inv.length < 16000);
+tt("every section header is listed",
+   inv.split("\n").filter(l=>l.startsWith("\u2022")).length === (src.match(/^\s*\/\/\s*-{6,}.+-{6,}\s*$/gm)||[]).length);
+tt("it says it is a mechanical map, not a summary", /mechanical map/.test(inv) && /NOT a summary/.test(inv));
+tt("and says why the full source was withheld", /exceed every fallback seat's context window/.test(inv));
+// the attribution defect that was caught before shipping
+const liv = inv.split("\n").find(l=>/liveness/i.test(l)) || "";
+tt("a section containing the settings RACK is not attributed every flag",
+   !/LEDGER SNAPSHOT/.test(liv));
+tt("flags are matched on READS, not mere mentions", /getItem\\\(\\s\*"\(rq_/.test(src) || /only reads count/.test(src));
+tt("current on/off state is deliberately NOT inferred",
+   /DEFAULT STATE DELIBERATELY NOT REPORTED/.test(src) && /It does NOT state whether a/.test(src));
+tt("a small source file is still attached verbatim", /text\.length > RQ_CODE_INVENTORY_OVER/.test(src));
 
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
