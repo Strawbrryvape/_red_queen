@@ -56,7 +56,7 @@ tt("L2 demands a real attack, not a dismissible caveat",
    /not as a caveat you can dismiss/.test(RQ_RDSR_ASK));
 tt("L3 makes reversing a SUCCESS, removing the incentive to defend badly",
    /reversing yourself here is a success of this process/.test(RQ_RDSR_ASK));
-tt("L4 reuses the existing falsifier convention", /beginning with FALSIFIER:/.test(RQ_RDSR_ASK));
+tt("L4 reuses the existing falsifier convention", /begin with FALSIFIER:/.test(RQ_RDSR_ASK));
 
 console.log("\n--- v4.17.1: markdown decoration must not defeat detection ---");
 // Live 2026-08-23: a textbook four-level answer was reported as "NO seat
@@ -89,6 +89,34 @@ tt("a hypothetical concession is NOT a reversal",
    !R("One could concede the point without abandoning it."));
 tt("the false-positive risk is documented",
    /A false reversal makes the feature look successful when it\s+\/\/ is not|false reversal makes the feature look successful/.test(src));
+
+console.log("\n--- v5.0.4: self-describing headers ---");
+// Bare "L1"/"L2" meant nothing to a reader with no key — including the operator
+// who built it. Fixed in the TEXT rather than the UI so the explanation travels
+// into the export, the ledger, and a position pasted into an email.
+[["long label","L1 POSITION (what I hold): x"],
+ ["bolded long label","**L1 POSITION (what I hold):** x"],
+ ["heading + long label","## L1 POSITION (what I hold): x"],
+ ["bullet + bold + long","- **L1 POSITION (what I hold):** x"],
+ ["the old short label still works","L1 POSITION: x"]].forEach(([n,txt])=>{
+  tt("parses: "+n, rdsrScan([{name:"k",text:txt+"\nL2: a\nL3: b\nL4: c"}]).structured.length===1);
+});
+tt("prose mentioning L1 still does NOT parse",
+   rdsrScan([{name:"k",text:"I revise my L1 position: it was wrong."}]).structured.length===0);
+tt("a reversal inside a long-labelled L3 is still caught",
+   rdsrScan([{name:"k",text:"L1: x\n**L3 DEFENCE (answering my own L2):** I concede that, L2 defeats L1.\n**L4:** z"}]).reversed.length===1);
+tt("the instruction tells seats WHY the labels are spelled out",
+   /a later reader may see this answer with no explanation of/.test(src));
+tt("and the regex widening is recorded rather than claimed away",
+   /THE REGEX HAD TO WIDEN/.test(src) && /third time for this one detector/.test(src));
+
+console.log("\n--- v5.0.4: one falsifier per seat, not two ---");
+tt("the standalone ask is suppressed when RDSR is armed",
+   /&& !\(rdsrEnabled\(\) \|\| \(_rdsrArm && _rdsrArm\.armed\)\)/.test(src));
+tt("L4 is kept rather than the ask, and the reason is given",
+   /L4 sits\s+\/\/ inside the argument it belongs to|inside the argument it belongs to/.test(src));
+tt("the duplicate-banking cost is named",
+   /doubled what the reckoning bank ingested/.test(src));
 
 console.log("\n--- shape ---");
 tt("zero new API calls", !/rdsrScan[\s\S]{0,800}fetch\(/.test(src));
