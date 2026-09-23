@@ -129,5 +129,24 @@ tt("a fallback-labelled seat still resolves to its own pitch",
 tt("pitch is applied to the utterance", /u\.pitch = pitch;/.test(src));
 tt("the hash is gone", !/h % pool\.length/.test(src));
 
+console.log("\n--- v5.0.6: the verdict speaks in the voice of the seat holding the mic ---");
+// SOLE returned no speakerSeat, so the button fell back to "council" and spoke
+// in Gemini's voice whichever seat answered.
+tt("a SOLE round names its speaker",
+   /trust: "sole",\s*speakerSeat: seatLabel\(eligible\[0\]\.name\)/.test(src));
+tt("\"council\" would have resolved to Gemini's pitch — the defect",
+   voicePitchForSeat("council") === voicePitchForSeat("gemini"));
+tt("the speaking seat's own label resolves to its own pitch",
+   voicePitchForSeat("Kimi") === voicePitchForSeat("kimi") &&
+   voicePitchForSeat("Kimi") !== voicePitchForSeat("gemini"));
+tt("the verdict button is labelled with whose voice it uses",
+   /"\\u25b6 Listen \\u00b7 " \+ who/.test(src));
+tt("the fallback suffix is stripped from the label",
+   /split\(" \["\)\[0\]/.test(src));
+tt("idle resets restore the label instead of a bare glyph",
+   (src.match(/dataset\.label \|\| "\\u25b6"/g) || []).length >= 2);
+tt("while playing it says what is playing",
+   /replace\("\\u25b6 Listen", "\\u25a0 Stop"\)/.test(src));
+
 console.log("\n"+p+" passed, "+f+" failed");
 process.exit(f?1:0);
