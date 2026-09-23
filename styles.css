@@ -2109,3 +2109,20 @@ body:has(.agent.consensus) .consensus-bar {
 @media (max-width: 600px) {
   .rq-steelman-card { font-size: 0.88em; padding: 14px; }
 }
+
+
+/* v5.0.6 — the verdict's Listen button is now a labelled control naming the
+   speaking seat, not a bare glyph. Sized to be seen and tapped on a phone. */
+.rq-voice-btn.is-consensus {
+  display: inline-block;
+  margin: 0 0 10px 0;
+  padding: 6px 14px;
+  font-size: 0.78em;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+.rq-voice-btn.is-consensus.is-playing { color: var(--kimi); border-color: var(--kimi); }
+@media (max-width: 600px) {
+  .rq-voice-btn.is-consensus { padding: 9px 16px; font-size: 0.84em; }
+}
