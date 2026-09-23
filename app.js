@@ -14,7 +14,7 @@
   // the live site ran a pre-v3.2 build for days while GitHub had v3.3. The
   // tell was the divided-round log wording ("FAILED by design" = old build,
   // "FAILED by lexical threshold" = v3.2+). This stamp ends that guessing.
-  const RQ_BUILD = "v5.0.5-inventory-voices";
+  const RQ_BUILD = "v5.0.6-verdict-voice";
   try { console.log("%c[Red Queen] build " + RQ_BUILD, "color:#c0392b;font-weight:bold;font-size:13px"); } catch (_) {}
 
   // ---------- Elements ----------
@@ -5879,7 +5879,13 @@ roundData,
 
     if (eligible.length === 1) {
       logError(`SOLE VOICE round — only one eligible answer (${seatLabel(eligible[0].name)}). No cross-model verification occurred; treat as a single model's opinion, not Council consensus.`);
-      return { text: eligible[0].text.trim(), divided: false, answers: eligible, trust: "sole" };
+      // v5.0.6 — a SOLE round names its speaker. It returned none, so the
+      // read-aloud button fell back to "council" and spoke in Gemini's voice
+      // whichever seat actually answered — a Kimi-only round read aloud as
+      // Gemini. The one seat that answered IS the speaker; that is the whole
+      // meaning of SOLE.
+      return { text: eligible[0].text.trim(), divided: false, answers: eligible, trust: "sole",
+               speakerSeat: seatLabel(eligible[0].name) };
     }
 
     // v4.12.1 — dispatch is complete; freeze the delivered-prompt record before
@@ -15453,7 +15459,7 @@ end $$;`;
     _voiceQueue = [];
     try {
       document.querySelectorAll(".rq-voice-btn.is-playing").forEach((b) => {
-        b.classList.remove("is-playing"); b.textContent = "\u25b6";
+        b.classList.remove("is-playing"); b.textContent = b.dataset.label || "\u25b6";
       });
     } catch (_) {}
   }
@@ -15473,9 +15479,15 @@ end $$;`;
       const chunks = voiceChunks(clean);
       const seq = ++_voiceSeq;      // any callback from an older run is ignored
       _voiceQueue = chunks.slice();
-      if (btn) { btn.classList.add("is-playing"); btn.textContent = "\u25a0"; }
+      if (btn) {
+        btn.classList.add("is-playing");
+        // A labelled button says what is playing and how to stop it, rather
+        // than collapsing to a bare stop glyph mid-verdict.
+        btn.textContent = btn.dataset.label
+          ? btn.dataset.label.replace("\u25b6 Listen", "\u25a0 Stop") : "\u25a0";
+      }
       const done = () => {
-        if (btn) { btn.classList.remove("is-playing"); btn.textContent = "\u25b6"; }
+        if (btn) { btn.classList.remove("is-playing"); btn.textContent = btn.dataset.label || "\u25b6"; }
       };
       const speakNext = (i) => {
         // A cancelled or superseded run must not resurrect itself from a
@@ -16649,8 +16661,16 @@ end $$;`;
       consensusText.appendChild(_body);
       try {
         if (voiceEnabled()) {
+          // v5.0.6 — the verdict button is LABELLED with the seat whose voice
+          // it uses. It was a bare play glyph, easy to miss and silent about
+          // which seat was speaking. On SOLE, 2/3 and 3/3 alike the voice is
+          // the seat holding the mic, so the label says whose that is.
+          const who = String(result.speakerSeat || "").split(" [")[0] || "Council";
           const vb = voiceButton(result.speakerSeat || "council", () => String(answer || ""));
           vb.classList.add("is-consensus");
+          vb.textContent = "\u25b6 Listen \u00b7 " + who;
+          vb.dataset.label = "\u25b6 Listen \u00b7 " + who;
+          vb.setAttribute("aria-label", "Read the verdict aloud in " + who + "'s voice");
           consensusText.insertBefore(vb, _body);
         }
       } catch (_) {}
